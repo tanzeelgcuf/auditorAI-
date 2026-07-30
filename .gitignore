@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+target/
+vendor/
+
+# Build outputs
+.next/
+dist/
+build/
+*.exe
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+*.lcov
+
+# Database
+*.sqlite
+*.db
+
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Docker
+docker-compose.override.yml
+
+# Generated
+services/api/db/queries/*.go
+packages/shared-types/*.ts

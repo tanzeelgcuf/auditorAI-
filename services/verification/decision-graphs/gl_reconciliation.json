@@ -1,0 +1,55 @@
+{
+  "nodes": [
+    {
+      "id": "input",
+      "type": "inputNode",
+      "name": "request"
+    },
+    {
+      "id": "variance-check",
+      "type": "decisionTableNode",
+      "name": "Tolerance Evaluation",
+      "content": {
+        "inputs": [
+          { "id": "variance_cents", "field": "variance_cents" },
+          { "id": "tolerance_cents", "field": "tolerance_cents" }
+        ],
+        "outputs": [
+          { "id": "severity", "field": "severity" },
+          { "id": "exceeds_tolerance", "field": "exceeds_tolerance" }
+        ],
+        "rules": [
+          {
+            "variance_cents": "[0..tolerance_cents]",
+            "severity": "info",
+            "exceeds_tolerance": "false"
+          },
+          {
+            "variance_cents": "(tolerance_cents..tolerance_cents*10]",
+            "severity": "low",
+            "exceeds_tolerance": "true"
+          },
+          {
+            "variance_cents": "(tolerance_cents*10..tolerance_cents*100]",
+            "severity": "medium",
+            "exceeds_tolerance": "true"
+          },
+          {
+            "variance_cents": "(tolerance_cents*100..]",
+            "severity": "high",
+            "exceeds_tolerance": "true"
+          }
+        ]
+      }
+    },
+    {
+      "id": "output",
+      "type": "outputNode",
+      "name": "result"
+    }
+  ],
+  "edges": [
+    { "id": "e1", "sourceId": "input", "targetId": "variance-check" },
+    { "id": "e2", "sourceId": "variance-check", "targetId": "output" }
+  ]
+}

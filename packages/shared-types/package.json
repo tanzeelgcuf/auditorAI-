@@ -1,0 +1,16 @@
+{
+  "name": "@ai-auditor/shared-types",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared TypeScript types for AI Auditor (generated from Go/proto)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "generate": "echo 'TODO: generate from proto/Go types'",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

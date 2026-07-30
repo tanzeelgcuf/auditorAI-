@@ -1,0 +1,52 @@
+// proto/ingestion.proto
+syntax = "proto3";
+
+package ingestion;
+
+service IngestionService {
+    rpc ProcessDocument(ProcessDocumentRequest) returns (ProcessDocumentResponse);
+    rpc GetProcessingStatus(StatusRequest) returns (StatusResponse);
+}
+
+message ProcessDocumentRequest {
+    string document_id = 1;
+    string client_book_id = 2;
+    string storage_key = 3;
+    string doc_type = 4; // invoice | bank_statement | gl_export
+}
+
+message ProcessDocumentResponse {
+    repeated ExtractedEntity entities = 1;
+}
+
+message ExtractedEntity {
+    string entity_type = 1;       // invoice_line_item | bank_transaction | gl_entry
+    int64 amount_cents = 2;
+    string currency = 3;
+    string transaction_date = 4;
+    string counterparty = 5;
+    string description = 6;
+    string gl_account_code = 7;
+    int32 page_number = 8;
+    BoundingBox bbox = 9;
+    double confidence = 10;
+    string source_format = 11;    // ocr | structured
+    string entity_subtype = 12;   // standard | credit_note | refund | void
+}
+
+message BoundingBox {
+    double x = 1;
+    double y = 2;
+    double width = 3;
+    double height = 4;
+}
+
+message StatusRequest {
+    string document_id = 1;
+}
+
+message StatusResponse {
+    string document_id = 1;
+    string status = 2;
+    int32 progress = 3;
+}

@@ -1,0 +1,53 @@
+// proto/verification.proto
+syntax = "proto3";
+
+package verification;
+
+service VerificationService {
+    rpc EvaluateReconciliation(ReconciliationRequest) returns (ReconciliationResult);
+    rpc BatchEvaluate(BatchReconciliationRequest) returns (BatchReconciliationResult);
+}
+
+message ReconciliationRequest {
+    string client_book_id = 1;
+    int64 invoice_amount_cents = 2;
+    int64 bank_amount_cents = 3;
+    int64 gl_amount_cents = 4;
+    int32 tolerance_cents = 5;
+}
+
+message ReconciliationResult {
+    int64 variance_cents = 1;
+    bool exceeds_tolerance = 2;
+    string calculation_formula = 3;
+    string rule_id = 4;
+    string rule_version = 5;
+    string severity = 6; // info | low | medium | high
+}
+
+message BatchReconciliationRequest {
+    string client_book_id = 1;
+    repeated GroupReconciliation groups = 2;
+}
+
+message GroupReconciliation {
+    string group_id = 1;
+    int64 invoice_total_cents = 2;
+    int64 bank_total_cents = 3;
+    int64 gl_total_cents = 4;
+    int32 tolerance_cents = 5;
+}
+
+message BatchReconciliationResult {
+    repeated GroupResult results = 1;
+}
+
+message GroupResult {
+    string group_id = 1;
+    int64 variance_cents = 2;
+    bool exceeds_tolerance = 3;
+    string calculation_formula = 4;
+    string rule_id = 5;
+    string rule_version = 6;
+    string severity = 7;
+}
