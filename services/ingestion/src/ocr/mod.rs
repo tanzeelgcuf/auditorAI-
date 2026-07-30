@@ -1,4 +1,8 @@
-// services/ingestion/src/ocr/mod.rs
+pub mod doctr;
+pub mod structured;
+
+pub use doctr::DoctrBackend;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -60,4 +64,51 @@ pub enum OcrError {
 pub trait OcrBackend: Send + Sync {
     async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError>;
     fn name(&self) -> &'static str;
+}
+
+// ── Format detection ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedFormat {
+    Ocr,
+    Csv,
+    Xlsx,
+    Ofx,
+}
+
+pub struct FormatDetector;
+
+impl FormatDetector {
+    pub fn from_extension(path: &str) -> DetectedFormat {
+        let lower = path.to_lowercase();
+        if lower.ends_with(".csv") {
+            return DetectedFormat::Csv;
+        }
+        if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+            return DetectedFormat::Xlsx;
+        }
+        if lower.ends_with(".ofx") || lower.ends_with(".qfx") {
+            return DetectedFormat::Ofx;
+        }
+        DetectedFormat::Ocr
+    }
+
+    pub fn from_content(data: &[u8]) -> DetectedFormat {
+        if data.starts_with(b"OFXHEADER") || data.starts_with(b"<?xml") {
+            return DetectedFormat::Ofx;
+        }
+        let check_len = std::cmp::min(data.len(), 2048);
+        if check_len > 0 && data[..check_len].contains(&b',') {
+            return DetectedFormat::Csv;
+        }
+        DetectedFormat::Ocr
+    }
+
+    pub fn detect(path: &str, content: &[u8]) -> DetectedFormat {
+        let ext = Self::from_extension(path);
+        if ext != DetectedFormat::Ocr {
+            return ext;
+        }
+        Self::from_content(content)
+    }
 }

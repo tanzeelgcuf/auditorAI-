@@ -19,11 +19,17 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1.35", features = ["serde"] }
 aws-sdk-s3 = "1.0"
+aws-config = "1.0"
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 nats = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+regex = "1"
+sha2 = "0.10"
+
+[build-dependencies]
+tonic-build = "0.10"
 
 [dev-dependencies]
 proptest = "1.0"

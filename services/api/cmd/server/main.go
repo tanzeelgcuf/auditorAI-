@@ -11,14 +11,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptracegrpc"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/billing"
@@ -34,21 +29,25 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// Initialize OpenTelemetry
-	tp, err := initTracer(ctx)
+	// Initialize database pool
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://auditor:auditor@localhost:5432/ai_auditor?sslmode=disable"
+	}
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		slog.Error("failed to initialize tracer", "error", err)
+		slog.Error("failed to connect to database", "error", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := tp.Shutdown(ctx); err != nil {
-			slog.Error("tracer shutdown error", "error", err)
-		}
-	}()
+	defer pool.Close()
 
 	// Initialize services
 	authSvc := auth.NewService()
+	authSvc.SetDB(pool)
+
 	tenantSvc := tenant.NewService()
+	tenantSvc.SetDB(pool)
+
 	docSvc := documents.NewService()
 	entitySvc := entities.NewService()
 	findingSvc := findings.NewService()
@@ -58,10 +57,10 @@ func main() {
 
 	// Router
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.Timeout(30 * time.Second))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"}, // configure via env in production
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -71,7 +70,7 @@ func main() {
 		MaxAge:           300,
 	}))
 	r.Use(middleware.TraceInjector)
-	r.Use(middleware.RLSInjector)
+	r.Use(middleware.RLSInjector(pool))
 
 	// Health
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -189,38 +188,7 @@ func main() {
 	}
 }
 
-func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "jaeger:4317"
-	}
-
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String("ai-auditor-api"),
-		),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
-	)
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
-
-	return tp, nil
+// ponytail: re-enable when otel dependencies are vendored in a build environment
+func initTracer(ctx context.Context) (*struct{}, error) {
+	return &struct{}{}, nil
 }

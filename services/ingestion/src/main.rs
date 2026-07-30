@@ -6,10 +6,11 @@ mod bbox;
 
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{info, error};
+use tracing::info;
 use clap::Parser;
 
-use crate::grpc::{IngestionServiceImpl, ingestion_service_server::IngestionServiceServer};
+use crate::grpc::ingestion_service::ingestion_service_server::IngestionServiceServer;
+use crate::grpc::IngestionServiceImpl;
 use crate::ocr::OcrBackend;
 
 #[derive(Parser, Debug)]
@@ -45,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let js = nc.jetstream()?;
 
     // Create service implementation
-    let svc = IngestionServiceImpl::new(ocr_backend, js);
+    let svc = IngestionServiceImpl::new(ocr_backend, js).await;
 
     // Start gRPC server
     let addr = args.grpc_addr.parse()?;

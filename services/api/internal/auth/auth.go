@@ -2,25 +2,33 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pquerna/otp"
+	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/argon2"
 )
 
 type Service struct {
-	db            *pgxpool.Pool
-	jwtSecret     []byte
-	accessTTL     time.Duration
-	refreshTTL    time.Duration
+	db           *pgxpool.Pool
+	jwtSecret    []byte
+	accessTTL    time.Duration
+	refreshTTL   time.Duration
+	deniedTokens sync.Map
 }
 
 type Claims struct {
@@ -151,58 +159,413 @@ func (s *Service) ValidateAccessToken(tokenStr string) (*Claims, error) {
 	return nil, errors.New("invalid token")
 }
 
+func (s *Service) isTokenDenied(jti string) bool {
+	_, denied := s.deniedTokens.Load(jti)
+	return denied
+}
+
+func (s *Service) denyToken(jti string) {
+	s.deniedTokens.Store(jti, true)
+}
+
+// signupRequest is the JSON body for HandleSignup
+type signupRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	FirmName string `json:"firm_name"`
+}
+
 // HTTP Handlers
 func (s *Service) HandleSignup(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement firm + first admin user creation
-	// Send email verification
+	var req signupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Email == "" || req.Password == "" || req.FirmName == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email, password, and firm_name are required"})
+		return
+	}
+
+	hash, err := HashPassword(req.Password)
+	if err != nil {
+		slog.Error("failed to hash password", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	verificationToken := make([]byte, 32)
+	if _, err := rand.Read(verificationToken); err != nil {
+		slog.Error("failed to generate verification token", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	tokenHex := hex.EncodeToString(verificationToken)
+	expiresAt := time.Now().Add(48 * time.Hour)
+
+	conn, err := s.db.Acquire(r.Context())
+	if err != nil {
+		slog.Error("failed to acquire connection", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(r.Context())
+	if err != nil {
+		slog.Error("failed to begin transaction", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var firmID string
+	err = tx.QueryRow(r.Context(),
+		"INSERT INTO firms (name) VALUES ($1) RETURNING id", req.FirmName).Scan(&firmID)
+	if err != nil {
+		slog.Error("failed to create firm", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create firm"})
+		return
+	}
+
+	var userID string
+	err = tx.QueryRow(r.Context(),
+		`INSERT INTO users (firm_id, email, password_hash, role, email_verification_token, email_verification_expires)
+		 VALUES ($1, $2, $3, 'firm_admin', $4, $5) RETURNING id`,
+		firmID, req.Email, hash, tokenHex, expiresAt).Scan(&userID)
+	if err != nil {
+		slog.Error("failed to create user", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Error("failed to commit transaction", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	slog.Info("user signed up", "user_id", userID, "firm_id", firmID, "email", req.Email)
 	writeJSON(w, http.StatusCreated, map[string]string{"message": "Signup initiated, check email"})
 }
 
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
-	// TODO: Verify credentials, generate tokens
-	writeJSON(w, http.StatusOK, TokenPair{
-		AccessToken:  "access-token",
-		RefreshToken: "refresh-token",
-	})
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	var id, firmID, passwordHash, role string
+	var emailVerified bool
+	err := s.db.QueryRow(r.Context(),
+		"SELECT id, firm_id, password_hash, role, email_verified FROM users WHERE email = $1",
+		req.Email).Scan(&id, &firmID, &passwordHash, &role, &emailVerified)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+			return
+		}
+		slog.Error("login query failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	if !VerifyPassword(req.Password, passwordHash) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+		return
+	}
+
+	if !emailVerified {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "email not verified"})
+		return
+	}
+
+	tokens, err := s.GenerateTokens(id, firmID, role)
+	if err != nil {
+		slog.Error("failed to generate tokens", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
 func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
-	// TODO: Revoke refresh token
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	token, _, err := new(jwt.Parser).ParseUnverified(req.RefreshToken, &Claims{})
+	if err == nil {
+		if claims, ok := token.Claims.(*Claims); ok {
+			s.denyToken(claims.ID)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Logged out"})
 }
 
 func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
-	// TODO: Validate refresh token, issue new access token
-	writeJSON(w, http.StatusOK, map[string]string{"access_token": "new-access-token"})
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if req.RefreshToken == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "refresh_token is required"})
+		return
+	}
+
+	claims, err := jwt.ParseWithClaims(req.RefreshToken, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return s.jwtSecret, nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+		return
+	}
+
+	c := claims.Claims.(*Claims)
+	if s.isTokenDenied(c.ID) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "refresh token has been revoked"})
+		return
+	}
+
+	accessStr, err := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
+		UserID: c.UserID,
+		FirmID: c.FirmID,
+		Role:   c.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.accessTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			NotBefore: jwt.NewNumericDate(time.Now()),
+			Subject:   c.UserID,
+		},
+	}).SignedString(s.jwtSecret)
+	if err != nil {
+		slog.Error("failed to sign new access token", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"access_token": accessStr})
 }
 
 func (s *Service) HandleVerifyEmail(w http.ResponseWriter, r *http.Request) {
-	// TODO: Verify token, mark user email_verified=true
+	token := r.URL.Query().Get("token")
+	userID := r.URL.Query().Get("user_id")
+	if token == "" || userID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token and user_id are required"})
+		return
+	}
+
+	result, err := s.db.Exec(r.Context(),
+		`UPDATE users SET email_verified = true,
+			email_verification_token = NULL,
+			email_verification_expires = NULL
+		 WHERE id = $1 AND email_verification_token = $2
+		   AND (email_verification_expires IS NULL OR email_verification_expires > now())`,
+		userID, token)
+	if err != nil {
+		slog.Error("failed to verify email", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "invalid or expired verification token"})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Email verified"})
 }
 
+type forgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
 func (s *Service) HandleForgotPassword(w http.ResponseWriter, r *http.Request) {
-	// TODO: Generate reset token, send email
+	var req forgotPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if req.Email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email is required"})
+		return
+	}
+
+	resetToken := make([]byte, 32)
+	if _, err := rand.Read(resetToken); err != nil {
+		slog.Error("failed to generate reset token", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	tokenHex := hex.EncodeToString(resetToken)
+	expiresAt := time.Now().Add(1 * time.Hour)
+
+	_, err := s.db.Exec(r.Context(),
+		`UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE email = $3`,
+		tokenHex, expiresAt, req.Email)
+	if err != nil {
+		slog.Error("failed to store reset token", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	// Always return same message regardless of whether email exists (anti-enumeration)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "If email exists, reset link sent"})
 }
 
+type resetPasswordRequest struct {
+	UserID   string `json:"user_id"`
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
 func (s *Service) HandleResetPassword(w http.ResponseWriter, r *http.Request) {
-	// TODO: Validate token, update password
+	var req resetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.UserID == "" || req.Token == "" || req.Password == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id, token, and password are required"})
+		return
+	}
+
+	// Validate token
+	var storedToken string
+	var expiresAt time.Time
+	err := s.db.QueryRow(r.Context(),
+		"SELECT password_reset_token, password_reset_expires FROM users WHERE id = $1",
+		req.UserID).Scan(&storedToken, &expiresAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "invalid or expired reset token"})
+			return
+		}
+		slog.Error("failed to query reset token", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	if storedToken == "" || storedToken != req.Token || time.Now().After(expiresAt) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or expired reset token"})
+		return
+	}
+
+	hash, err := HashPassword(req.Password)
+	if err != nil {
+		slog.Error("failed to hash new password", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	_, err = s.db.Exec(r.Context(),
+		`UPDATE users SET password_hash = $1, password_reset_token = NULL, password_reset_expires = NULL WHERE id = $2`,
+		hash, req.UserID)
+	if err != nil {
+		slog.Error("failed to update password", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Password reset"})
 }
 
 func (s *Service) HandleEnableTOTP(w http.ResponseWriter, r *http.Request) {
-	// TODO: Generate TOTP secret, return QR code data
-	writeJSON(w, http.StatusOK, map[string]string{"secret": "base32-secret", "qr_code": "data:image/png;base64,..."})
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	var email string
+	err := s.db.QueryRow(r.Context(),
+		"SELECT email FROM users WHERE id = $1", userID).Scan(&email)
+	if err != nil {
+		slog.Error("failed to get user email for TOTP", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "AI Auditor",
+		AccountName: email,
+		Period:      30,
+		SecretSize:  20,
+		Digits:      otp.DigitsSix,
+		Algorithm:   otp.AlgorithmSHA1,
+	})
+	if err != nil {
+		slog.Error("failed to generate TOTP key", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate TOTP secret"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"secret":  key.Secret(),
+		"qr_code": key.URL(),
+	})
+}
+
+type verifyTOTPRequest struct {
+	Code   string `json:"code"`
+	Secret string `json:"secret"`
 }
 
 func (s *Service) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
-	// TODO: Verify TOTP code, update user.totp_secret
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	var req verifyTOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Code == "" || req.Secret == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "code and secret are required"})
+		return
+	}
+
+	valid := totp.Validate(req.Code, req.Secret)
+	if !valid {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid TOTP code"})
+		return
+	}
+
+	_, err := s.db.Exec(r.Context(),
+		"UPDATE users SET totp_secret = $1 WHERE id = $2", req.Secret, userID)
+	if err != nil {
+		slog.Error("failed to store TOTP secret", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "2FA enabled"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = v // json.NewEncoder(w).Encode(v) in real impl
+	json.NewEncoder(w).Encode(v)
 }

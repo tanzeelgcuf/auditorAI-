@@ -1,11 +1,11 @@
-// services/ingestion/src/grpc/mod.rs
-use tonic::{Request, Response, Status};
-use uuid::Uuid;
-use crate::ocr::{ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest, ProcessDocumentResponse};
-use crate::preprocess;
-use crate::structured::detect_format;
+use crate::ocr::{
+    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError,
+    ProcessDocumentRequest,
+};
 use std::sync::Arc;
+
 use nats::jetstream::JetStream;
+use tonic::{Request, Response, Status};
 
 pub mod ingestion_service {
     tonic::include_proto!("ingestion");
@@ -13,29 +13,77 @@ pub mod ingestion_service {
 
 use ingestion_service::{
     ingestion_service_server::IngestionService,
+    BoundingBox as GrpcBoundingBox,
+    ExtractedEntity as GrpcExtractedEntity,
     ProcessDocumentRequest as GrpcProcessRequest,
     ProcessDocumentResponse as GrpcProcessResponse,
-    ExtractedEntity as GrpcExtractedEntity,
-    BoundingBox as GrpcBoundingBox,
 };
+
+fn ocr_error_to_status(e: OcrError) -> Status {
+    match e {
+        OcrError::NotFound(msg) => Status::not_found(msg),
+        OcrError::UnsupportedFormat(msg) => Status::invalid_argument(msg),
+        OcrError::ProcessingFailed(msg) => Status::internal(msg),
+        OcrError::S3Error(msg) => Status::internal(format!("storage error: {msg}")),
+        OcrError::SidecarError(msg) => Status::unavailable(format!("sidecar unavailable: {msg}")),
+        OcrError::ParsingError(msg) => Status::invalid_argument(format!("parse error: {msg}")),
+    }
+}
 
 pub struct IngestionServiceImpl {
     ocr_backend: Arc<dyn OcrBackend>,
     structured_backends: std::collections::HashMap<String, Arc<dyn OcrBackend>>,
     js: JetStream,
+    s3_client: Arc<aws_sdk_s3::Client>,
+    bucket: String,
 }
 
 impl IngestionServiceImpl {
-    pub fn new(ocr_backend: Arc<dyn OcrBackend>, js: JetStream) -> Self {
+    pub async fn new(ocr_backend: Arc<dyn OcrBackend>, js: JetStream) -> Self {
+        let config = aws_config::load_from_env().await;
+        let s3_client = Arc::new(aws_sdk_s3::Client::new(&config));
+        let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
+
         let mut structured = std::collections::HashMap::new();
-        structured.insert("csv".to_string(), Arc::new(crate::ocr::structured::CsvParser::new(std::collections::HashMap::new())) as Arc<dyn OcrBackend>);
-        structured.insert("xlsx".to_string(), Arc::new(crate::ocr::structured::XlsxParser::new(std::collections::HashMap::new())) as Arc<dyn OcrBackend>);
-        structured.insert("ofx".to_string(), Arc::new(crate::ocr::structured::OfxParser) as Arc<dyn OcrBackend>);
+        structured.insert(
+            "csv".to_string(),
+            Arc::new(crate::ocr::structured::CsvParser::new(
+                std::collections::HashMap::new(),
+                s3_client.clone(),
+                bucket.clone(),
+            )) as Arc<dyn OcrBackend>,
+        );
+        structured.insert(
+            "xlsx".to_string(),
+            Arc::new(crate::ocr::structured::XlsxParser::new(
+                std::collections::HashMap::new(),
+                s3_client.clone(),
+                bucket.clone(),
+            )) as Arc<dyn OcrBackend>,
+        );
+        structured.insert(
+            "ofx".to_string(),
+            Arc::new(crate::ocr::structured::OfxParser::new(
+                s3_client.clone(),
+                bucket.clone(),
+            )) as Arc<dyn OcrBackend>,
+        );
 
         Self {
             ocr_backend,
             structured_backends: structured,
             js,
+            s3_client,
+            bucket,
+        }
+    }
+
+    fn backend_key(format: DetectedFormat) -> Option<&'static str> {
+        match format {
+            DetectedFormat::Csv => Some("csv"),
+            DetectedFormat::Xlsx => Some("xlsx"),
+            DetectedFormat::Ofx => Some("ofx"),
+            DetectedFormat::Ocr => None,
         }
     }
 
@@ -50,13 +98,14 @@ impl IngestionServiceImpl {
             gl_account_code: e.gl_account_code.clone().unwrap_or_default(),
             page_number: e.page_number,
             bbox: Some(GrpcBoundingBox {
-                x: e.bbox.x,
-                y: e.bbox.y,
-                width: e.bbox.width,
-                height: e.bbox.height,
+                x: e.bbox.x as f64,
+                y: e.bbox.y as f64,
+                width: e.bbox.width as f64,
+                height: e.bbox.height as f64,
             }),
-            confidence: e.confidence,
+            confidence: e.confidence as f64,
             source_format: e.source_format.clone(),
+            entity_subtype: String::new(),
         }
     }
 }
@@ -69,9 +118,9 @@ impl IngestionService for IngestionServiceImpl {
     ) -> Result<Response<GrpcProcessResponse>, Status> {
         let req = request.into_inner();
 
-        let document_id = Uuid::parse_str(&req.document_id)
+        let document_id = uuid::Uuid::parse_str(&req.document_id)
             .map_err(|_| Status::invalid_argument("invalid document_id"))?;
-        let client_book_id = Uuid::parse_str(&req.client_book_id)
+        let client_book_id = uuid::Uuid::parse_str(&req.client_book_id)
             .map_err(|_| Status::invalid_argument("invalid client_book_id"))?;
 
         let process_req = ProcessDocumentRequest {
@@ -81,40 +130,52 @@ impl IngestionService for IngestionServiceImpl {
             client_book_id,
         };
 
-        // Detect format and route to appropriate backend
-        // In real impl, download from S3 first and sniff content
-        let format = detect_format(&req.storage_key, &[]).unwrap_or("ocr");
-
-        let response = if let Some(backend) = self.structured_backends.get(format) {
-            backend.process(&process_req).await
-        } else {
-            // Preprocess image for OCR
-            // Download from S3, preprocess, then OCR
-            self.ocr_backend.process(&process_req).await
-        };
-
-        match response {
-            Ok(resp) => {
-                let entities: Vec<GrpcExtractedEntity> = resp.entities.iter()
-                    .map(Self::convert_entity)
-                    .collect();
-
-                // Publish completion event to NATS
-                let event = serde_json::json!({
-                    "document_id": req.document_id,
-                    "client_book_id": req.client_book_id,
-                    "entity_count": entities.len(),
-                    "status": "completed"
-                });
-                let _ = self.js.publish("ingestion.completed", event.to_string().into());
-
-                Ok(Response::new(GrpcProcessResponse { entities }))
-            }
-            Err(e) => {
-                let _ = self.js.publish("ingestion.failed", format!("{}: {}", req.document_id, e).into());
-                Err(Status::internal(e.to_string()))
+        // Detect format by extension first; if ambiguous, content-sniff from S3
+        let mut format = FormatDetector::from_extension(&req.storage_key);
+        if format == DetectedFormat::Ocr {
+            // download first bytes for content sniff
+            match crate::ocr::structured::download_from_s3(
+                &self.s3_client,
+                &self.bucket,
+                &req.storage_key,
+            )
+            .await
+            {
+                Ok(data) => {
+                    let sniff_len = data.len().min(2048);
+                    format = FormatDetector::from_content(&data[..sniff_len]);
+                }
+                Err(e) => return Err(ocr_error_to_status(e)),
             }
         }
+
+        // Route to backend
+        let response = match Self::backend_key(format) {
+            Some(key) => {
+                if let Some(backend) = self.structured_backends.get(key) {
+                    backend.process(&process_req).await.map_err(ocr_error_to_status)
+                } else {
+                    self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)
+                }
+            }
+            None => {
+                self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)
+            }
+        }?;
+
+        let entities: Vec<GrpcExtractedEntity> =
+            response.entities.iter().map(Self::convert_entity).collect();
+
+        // Publish completion event
+        let event = serde_json::json!({
+            "document_id": req.document_id,
+            "client_book_id": req.client_book_id,
+            "entity_count": entities.len(),
+            "status": "completed"
+        });
+        let _ = self.js.publish("ingestion.completed", event.to_string().into());
+
+        Ok(Response::new(GrpcProcessResponse { entities }))
     }
 
     async fn get_processing_status(
@@ -122,7 +183,6 @@ impl IngestionService for IngestionServiceImpl {
         request: Request<ingestion_service::StatusRequest>,
     ) -> Result<Response<ingestion_service::StatusResponse>, Status> {
         let req = request.into_inner();
-        // In real impl, check status from DB or cache
         Ok(Response::new(ingestion_service::StatusResponse {
             document_id: req.document_id,
             status: "completed".to_string(),
@@ -134,12 +194,74 @@ impl IngestionService for IngestionServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ocr::{DoctrBackend, OcrBackend};
 
-    #[tokio::test]
-    async fn test_format_detection() {
-        assert_eq!(crate::structured::detect_format("test.pdf", &[]).unwrap(), "ocr");
-        assert_eq!(crate::structured::detect_format("test.csv", &[]).unwrap(), "csv");
-        assert_eq!(crate::structured::detect_format("test.ofx", &[]).unwrap(), "ofx");
+    #[test]
+    fn test_format_detection() {
+        assert_eq!(FormatDetector::from_extension("test.pdf"), DetectedFormat::Ocr);
+        assert_eq!(FormatDetector::from_extension("test.csv"), DetectedFormat::Csv);
+        assert_eq!(FormatDetector::from_extension("test.ofx"), DetectedFormat::Ofx);
+        assert_eq!(FormatDetector::from_extension("test.xlsx"), DetectedFormat::Xlsx);
+        assert_eq!(FormatDetector::from_extension("test.xls"), DetectedFormat::Xlsx);
+        assert_eq!(FormatDetector::from_extension("test.qfx"), DetectedFormat::Ofx);
+    }
+
+    #[test]
+    fn test_content_detection_ofx() {
+        assert_eq!(
+            FormatDetector::from_content(b"OFXHEADER:100\nDATA:OFXSGML"),
+            DetectedFormat::Ofx
+        );
+        assert_eq!(
+            FormatDetector::from_content(b"<?xml version=\"1.0\"?>\n<OFX>"),
+            DetectedFormat::Ofx
+        );
+    }
+
+    #[test]
+    fn test_content_detection_csv() {
+        assert_eq!(
+            FormatDetector::from_content(b"date,amount,description\n2024-01-15,100,foo"),
+            DetectedFormat::Csv
+        );
+    }
+
+    #[test]
+    fn test_error_to_status_not_found() {
+        let e = OcrError::NotFound("doc missing".into());
+        let s = ocr_error_to_status(e);
+        assert_eq!(s.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn test_error_to_status_sidecar() {
+        let e = OcrError::SidecarError("connection refused".into());
+        let s = ocr_error_to_status(e);
+        assert_eq!(s.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn test_convert_entity() {
+        let e = ExtractedEntity {
+            entity_type: "invoice_line_item".into(),
+            amount_cents: 15000,
+            currency: "USD".into(),
+            transaction_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15),
+            counterparty: Some("Acme Corp".into()),
+            description: Some("Widgets".into()),
+            gl_account_code: Some("4000".into()),
+            page_number: 1,
+            bbox: crate::ocr::BoundingBox {
+                x: 0.1,
+                y: 0.2,
+                width: 0.3,
+                height: 0.4,
+            },
+            confidence: 0.95,
+            source_format: "ocr".into(),
+        };
+        let g = IngestionServiceImpl::convert_entity(&e);
+        assert_eq!(g.amount_cents, 15000);
+        assert_eq!(g.description, "Widgets");
+        assert_eq!(g.bbox.unwrap().x, 0.1);
     }
 }

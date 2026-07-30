@@ -2,13 +2,12 @@ package middleware
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sony/gobreaker"
 
@@ -18,10 +17,11 @@ import (
 type contextKey string
 
 const (
-	UserIDKey      contextKey = "user_id"
-	FirmIDKey      contextKey = "firm_id"
+	UserIDKey       contextKey = "user_id"
+	FirmIDKey       contextKey = "firm_id"
 	AssignedBooksKey contextKey = "assigned_books"
-	RoleKey        contextKey = "role"
+	RoleKey         contextKey = "role"
+	connKey         contextKey = "rls_conn"
 )
 
 // Authenticator validates JWT and sets user context
@@ -58,8 +58,8 @@ func Authenticator(authSvc *auth.Service) func(http.Handler) http.Handler {
 // RequireRole ensures user has at least the required role
 func RequireRole(requiredRole string) func(http.Handler) http.Handler {
 	roleHierarchy := map[string]int{
-		"staff":       1,
-		"firm_admin":  2,
+		"staff":      1,
+		"firm_admin": 2,
 	}
 
 	requiredLevel := roleHierarchy[requiredRole]
@@ -83,34 +83,75 @@ func RequireRole(requiredRole string) func(http.Handler) http.Handler {
 	}
 }
 
-// RLSInjector sets PostgreSQL session variables for Row Level Security
-func RLSInjector(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		firmID := r.Context().Value(FirmIDKey)
-		userID := r.Context().Value(UserIDKey)
+// RLSInjector sets PostgreSQL session variables and stores assigned books in context.
+// Acquires a dedicated DB connection for the request, sets app.current_firm and
+// app.assigned_books, and puts the connection in context for handlers to use.
+func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			firmID := r.Context().Value(FirmIDKey)
+			userID := r.Context().Value(UserIDKey)
+			role := r.Context().Value(RoleKey)
 
-		if firmID == nil || userID == nil {
-			// Not authenticated yet — let Authenticator handle it
-			next.ServeHTTP(w, r)
-			return
-		}
+			if firmID == nil || userID == nil || role == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
 
-		// In a real app, fetch assigned books from DB (cached per-request)
-		// For now, we'll use a placeholder - the actual implementation
-		// would query user_book_assignments table
-		assignedBooks := getAssignedBooks(r.Context(), firmID.(string), userID.(string))
+			firmIDStr := firmID.(string)
+			userIDStr := userID.(string)
+			roleStr := role.(string)
 
-		ctx := context.WithValue(r.Context(), FirmIDKey, firmID)
-		ctx = context.WithValue(ctx, AssignedBooksKey, assignedBooks)
+			assignedBooks, err := getAssignedBooks(r.Context(), db, firmIDStr, userIDStr, roleStr)
+			if err != nil {
+				slog.Error("failed to get assigned books", "error", err)
+				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to load permissions")
+				return
+			}
 
-		// Set Postgres session variables via middleware that wraps the DB connection
-		// This is handled by the database middleware that wraps each query
+			conn, err := db.Acquire(r.Context())
+			if err != nil {
+				slog.Error("failed to acquire connection for RLS", "error", err)
+				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to acquire database connection")
+				return
+			}
 
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+			_, err = conn.Exec(r.Context(), "SELECT set_config('app.current_firm', $1, true)", firmIDStr)
+			if err != nil {
+				conn.Release()
+				slog.Error("failed to set app.current_firm", "error", err)
+				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to set session context")
+				return
+			}
+
+			booksStr := strings.Join(assignedBooks, ",")
+			_, err = conn.Exec(r.Context(), "SELECT set_config('app.assigned_books', $1, true)", booksStr)
+			if err != nil {
+				conn.Release()
+				slog.Error("failed to set app.assigned_books", "error", err)
+				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to set session context")
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), AssignedBooksKey, assignedBooks)
+			ctx = context.WithValue(ctx, connKey, conn)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+			conn.Release()
+		})
+	}
 }
 
-// GetAssignedBooks retrieves the list of book IDs a user is assigned to
+// GetConn returns the RLS-wired DB connection from context, or nil.
+// Handlers protected by RLSInjector should use this connection for queries.
+func GetConn(ctx context.Context) *pgxpool.Conn {
+	if c, ok := ctx.Value(connKey).(*pgxpool.Conn); ok {
+		return c
+	}
+	return nil
+}
+
+// GetAssignedBooks retrieves the list of book IDs from context.
 func GetAssignedBooks(ctx context.Context) []string {
 	if books := ctx.Value(AssignedBooksKey); books != nil {
 		return books.([]string)
@@ -118,7 +159,7 @@ func GetAssignedBooks(ctx context.Context) []string {
 	return nil
 }
 
-// GetFirmID retrieves the firm ID from context
+// GetFirmID retrieves the firm ID from context.
 func GetFirmID(ctx context.Context) string {
 	if id := ctx.Value(FirmIDKey); id != nil {
 		return id.(string)
@@ -126,7 +167,7 @@ func GetFirmID(ctx context.Context) string {
 	return ""
 }
 
-// GetUserID retrieves the user ID from context
+// GetUserID retrieves the user ID from context.
 func GetUserID(ctx context.Context) string {
 	if id := ctx.Value(UserIDKey); id != nil {
 		return id.(string)
@@ -134,13 +175,19 @@ func GetUserID(ctx context.Context) string {
 	return ""
 }
 
+// GetRole retrieves the user's role from context.
+func GetRole(ctx context.Context) string {
+	if r := ctx.Value(RoleKey); r != nil {
+		return r.(string)
+	}
+	return ""
+}
+
 // TraceInjector propagates OpenTelemetry trace context
 func TraceInjector(next http.Handler) http.Handler {
-	return middleware.RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// OpenTelemetry propagation is handled by the otelhttp wrapper
-		// This just ensures request ID is available
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		next.ServeHTTP(w, r)
-	}))
+	})
 }
 
 // CircuitBreaker wraps a downstream call with gobreaker
@@ -150,7 +197,6 @@ func CircuitBreaker(name string, settings gobreaker.Settings) func(http.Handler)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, err := cb.Execute(func() (interface{}, error) {
-				// Create a response recorder to capture the response
 				rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 				next.ServeHTTP(rec, r)
 				if rec.statusCode >= 500 {
@@ -170,19 +216,48 @@ func CircuitBreaker(name string, settings gobreaker.Settings) func(http.Handler)
 // RateLimiter provides per-firm rate limiting (placeholder - real impl uses Traefik/Kong)
 func RateLimiter(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Rate limiting enforced at Traefik/Kong layer
-		// This is a no-op placeholder for local dev
 		next.ServeHTTP(w, r)
 	})
 }
 
-// getAssignedBooks fetches assigned book IDs for a user
-// In production, this should be cached per-request
-func getAssignedBooks(ctx context.Context, firmID, userID string) []string {
-	// TODO: Implement actual DB query to user_book_assignments
-	// For firm_admin, return all books in the firm
-	// For staff, return only assigned books
-	return []string{} // placeholder
+// getAssignedBooks fetches assigned book UUIDs for a user.
+// firm_admin gets ALL books in their firm; staff gets only user_book_assignments.
+func getAssignedBooks(ctx context.Context, db *pgxpool.Pool, firmID, userID, role string) ([]string, error) {
+	if role == "firm_admin" {
+		rows, err := db.Query(ctx, "SELECT id::text FROM client_books WHERE firm_id = $1", firmID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		var books []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
+			}
+			books = append(books, id)
+		}
+		return books, rows.Err()
+	}
+
+	// staff: only assigned books
+	rows, err := db.Query(ctx,
+		"SELECT client_book_id::text FROM user_book_assignments WHERE user_id = $1", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var books []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		books = append(books, id)
+	}
+	return books, rows.Err()
 }
 
 // responseRecorder captures status code
@@ -199,11 +274,12 @@ func (r *responseRecorder) WriteHeader(code int) {
 // writeProblem writes an RFC 7807 problem+json response
 func writeProblem(w http.ResponseWriter, r *http.Request, typ, title string, status int, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(statusCode(status))
-	// JSON encoding would go here
-	_ = detail // suppress unused for now
-}
-
-func statusCode(status int) int {
-	return status
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"type":     typ,
+		"title":    title,
+		"status":   status,
+		"detail":   detail,
+		"instance": r.URL.Path,
+	})
 }
