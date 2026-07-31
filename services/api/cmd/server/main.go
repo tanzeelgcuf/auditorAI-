@@ -18,6 +18,7 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/billing"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/documents"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/entities"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/findings"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/mcp"
@@ -41,6 +42,18 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Initialize pipeline event client (NATS JetStream)
+	var pipelineClient *pipeline.EventClient
+	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
+		pc, err := pipeline.NewEventClient(natsURL)
+		if err != nil {
+			slog.Warn("NATS unavailable — pipeline events disabled", "error", err)
+		} else {
+			pipelineClient = pc
+			defer pc.Close()
+		}
+	}
+
 	// Initialize services
 	authSvc := auth.NewService()
 	authSvc.SetDB(pool)
@@ -49,8 +62,12 @@ func main() {
 	tenantSvc.SetDB(pool)
 
 	docSvc := documents.NewService()
+	docSvc.SetDB(pool)
+	docSvc.SetPipeline(pipelineClient)
+
 	entitySvc := entities.NewService()
 	findingSvc := findings.NewService()
+	findingSvc.SetDB(pool)
 	reviewSvc := review.NewService()
 	billingSvc := billing.NewService()
 	mcpSvc := mcp.NewService()
