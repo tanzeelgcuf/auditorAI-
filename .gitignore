@@ -2,6 +2,9 @@
 node_modules/
 target/
 vendor/
+.venv/
+__pycache__/
+*.pyc
 
 # Build outputs
 .next/

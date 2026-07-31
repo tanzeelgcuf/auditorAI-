@@ -1,164 +1,25 @@
 # services/agent-runtime/graph/link.py
 # Cross-linking algorithm — fuzzy matches entities across document types.
-# This is retrieval/scoring, NOT financial calculation. No arithmetic on monetary values.
+# This is retrieval/scoring, NOT financial calculation.
 # Follows docs 06 §2 + 09 §1: bounded combinatorial group matching.
 
 import structlog
 import jellyfish
-from typing import Optional, Iterator
+from typing import Optional, List, Tuple
 from itertools import combinations
-from dataclasses import dataclass
+from datetime import date
 
-from .schema import ExtractedEntity, BookConfig, GraphState
+from .schema import ExtractedEntity, BookConfig, ReconciliationGroup, GraphState
 
 logger = structlog.get_logger()
 
 MAX_GROUP_SIZE = 5
 DATE_WINDOW_DAYS = 3
+COUNTERPARTY_THRESHOLD = 0.80
 
 
-@dataclass
-class MatchCandidate:
-    invoice_entities: list[ExtractedEntity]
-    bank_entities: list[ExtractedEntity]
-    gl_entities: list[ExtractedEntity]
-    confidence: float
-    is_exact: bool
-
-
-async def cross_link(state: GraphState, config: BookConfig) -> GraphState:
-    """Cross-link entities across document types.
-
-    Algorithm (doc 06 §2 + doc 09 §1):
-    1. Start from unmatched bank_transactions (or invoice_line_items)
-    2. Search for bounded combinatorial multi-set matches
-    3. Score by amount/date/counterparty proximity
-    4. Route to needs_review or auto_linked based on thresholds
-    """
-    logger.info("cross-linking entities", batch_id=str(state.batch_id))
-
-    if len(state.classified_entities) < 3:
-        logger.warning("too few entities to cross-link",
-                        count=len(state.classified_entities))
-        return state
-
-    # Separate entities by type
-    invoices = [e for e in state.classified_entities if e.entity_type == "invoice_line_item"]
-    banks = [e for e in state.classified_entities if e.entity_type == "bank_transaction"]
-    gls = [e for e in state.classified_entities if e.entity_type == "gl_entry"]
-
-    # Build candidate groups
-    groups = _build_reconciliation_groups(invoices, banks, gls, config)
-
-    # Score each group
-    scored = []
-    for group in groups:
-        score = _score_group(group, config)
-        if score > 0:
-            scored.append((group, score))
-
-    # Route based on thresholds
-    auto_linked = []
-    needs_review = []
-
-    for group, score in scored:
-        if score >= config.auto_link_threshold:
-            auto_linked.append(group)
-        elif score >= config.review_floor:
-            needs_review.append(group)
-
-    logger.info("cross-linking complete",
-                 auto_linked=len(auto_linked),
-                 needs_review=len(needs_review),
-                 total_candidates=len(scored))
-
-    return state
-
-
-def _build_reconciliation_groups(
-    invoices: list[ExtractedEntity],
-    banks: list[ExtractedEntity],
-    gls: list[ExtractedEntity],
-    config: BookConfig,
-) -> list[MatchCandidate]:
-    """Build candidate reconciliation groups using bounded combinatorial search.
-
-    For each unmatched bank_transaction, search for multi-sets of invoice_line_items
-    whose amounts sum within tolerance (up to MAX_GROUP_SIZE items).
-    """
-    candidates: list[MatchCandidate] = []
-
-    for bank in banks:
-        # Find single invoice matches (fast path)
-        for inv in invoices:
-            if _amounts_match(inv.amount_cents, bank.amount_cents, config.tolerance_cents):
-                for gl in gls:
-                    if _amounts_match(inv.amount_cents, gl.amount_cents, config.tolerance_cents):
-                        candidates.append(MatchCandidate(
-                            invoice_entities=[inv],
-                            bank_entities=[bank],
-                            gl_entities=[gl],
-                            confidence=0.0,  # computed later
-                            is_exact=True,
-                        ))
-
-        # Multi-invoice matches (combinatorial, bounded)
-        relevant_invs = [
-            inv for inv in invoices
-            if _dates_match(inv.transaction_date, bank.transaction_date)
-            and _counterparties_match(inv.counterparty, bank.counterparty)
-        ]
-
-        for size in range(2, min(MAX_GROUP_SIZE, len(relevant_invs)) + 1):
-            for combo in combinations(relevant_invs, size):
-                total = sum(e.amount_cents for e in combo)
-                if _amounts_match(total, bank.amount_cents, config.tolerance_cents):
-                    # Find matching GL entries
-                    for gl in gls:
-                        if _amounts_match(total, gl.amount_cents, config.tolerance_cents):
-                            candidates.append(MatchCandidate(
-                                invoice_entities=list(combo),
-                                bank_entities=[bank],
-                                gl_entities=[gl],
-                                confidence=0.0,
-                                is_exact=False,
-                            ))
-
-    # Deduplicate by entity IDs
-    return _deduplicate_candidates(candidates)
-
-
-def _score_group(group: MatchCandidate, config: BookConfig) -> float:
-    """Compute link confidence score: 0.0-1.0.
-
-    Weights (doc 06 §2):
-    - amount_match: 0.5
-    - date_proximity: 0.2
-    - counterparty_similarity: 0.3
-    """
-    if group.is_exact:
-        return 1.0
-
-    total_inv = sum(e.amount_cents for e in group.invoice_entities)
-    total_bank = sum(e.amount_cents for e in group.bank_entities)
-    total_gl = sum(e.amount_cents for e in group.gl_entities)
-
-    # Amount match score (0.5 weight)
-    amounts = [total_inv, total_bank, total_gl]
-    max_amt = max(abs(a) for a in amounts) if any(amounts) else 1
-    variances = [abs(total_inv - total_bank), abs(total_inv - total_gl), abs(total_bank - total_gl)]
-    avg_variance = sum(variances) / len(variances)
-    amount_score = max(0, 1.0 - (avg_variance / max_amt)) if max_amt > 0 else 0.0
-
-    # Date proximity score (0.2 weight)
-    dates = [e.transaction_date for e in group.invoice_entities + group.bank_entities + group.gl_entities if e.transaction_date]
-    date_score = _compute_date_score(dates) if len(dates) >= 2 else 0.0
-
-    # Counterparty similarity score (0.3 weight)
-    counterparties = [e.counterparty for e in group.invoice_entities + group.bank_entities + group.gl_entities if e.counterparty]
-    cp_score = _compute_counterparty_score(counterparties) if len(counterparties) >= 2 else 0.0
-
-    return 0.5 * amount_score + 0.2 * date_score + 0.3 * cp_score
+def _entity_key(e: ExtractedEntity) -> tuple:
+    return (str(e.id), e.entity_type)
 
 
 def _amounts_match(a: int, b: int, tolerance: int) -> bool:
@@ -177,46 +38,261 @@ def _counterparties_match(a: Optional[str], b: Optional[str]) -> bool:
     """Check if counterparty names could match using Jaro-Winkler."""
     if a is None or b is None:
         return True
-    return jellyfish.jaro_winkler_similarity(a.lower(), b.lower()) >= 0.8
+    return jellyfish.jaro_winkler_similarity(a.lower(), b.lower()) >= COUNTERPARTY_THRESHOLD
 
 
-def _compute_date_score(dates: list) -> float:
-    """Compute date proximity score within the window."""
+def _compute_date_score(dates: List[date]) -> float:
+    """Compute date proximity score within the window (1.0 at exact match → 0 at window edge)."""
     if len(dates) < 2:
         return 0.0
     sorted_dates = sorted(dates)
     max_gap = (sorted_dates[-1] - sorted_dates[0]).days
     if max_gap == 0:
         return 1.0
-    return max(0, 1.0 - (max_gap / DATE_WINDOW_DAYS))
+    return max(0.0, 1.0 - (max_gap / DATE_WINDOW_DAYS))
 
 
-def _compute_counterparty_score(names: list[str]) -> float:
+def _compute_counterparty_score(names: List[Optional[str]]) -> float:
     """Compute average Jaro-Winkler similarity across counterparty pairs."""
-    if len(names) < 2:
+    present = [n for n in names if n]
+    if len(present) < 2:
         return 0.0
     scores = []
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            if names[i] and names[j]:
-                scores.append(jellyfish.jaro_winkler_similarity(
-                    names[i].lower(), names[j].lower()
-                ))
+    for i in range(len(present)):
+        for j in range(i + 1, len(present)):
+            scores.append(jellyfish.jaro_winkler_similarity(
+                present[i].lower(), present[j].lower()
+            ))
     return sum(scores) / len(scores) if scores else 0.0
 
 
-def _deduplicate_candidates(candidates: list[MatchCandidate]) -> list[MatchCandidate]:
+def _score_group(
+    invoice_entities: List[ExtractedEntity],
+    bank_entities: List[ExtractedEntity],
+    gl_entities: List[ExtractedEntity],
+    config: BookConfig,
+    is_exact: bool,
+) -> float:
+    """Compute link confidence score 0.0-1.0.
+
+    Weights (doc 06 §2): amount 0.5, date 0.2, counterparty 0.3.
+    """
+    if is_exact:
+        return 1.0
+
+    total_inv = sum(e.amount_cents for e in invoice_entities)
+    total_bank = sum(e.amount_cents for e in bank_entities)
+    total_gl = sum(e.amount_cents for e in gl_entities)
+
+    # Amount match score (0.5)
+    amounts = [total_inv, total_bank, total_gl]
+    max_amt = max(abs(a) for a in amounts) if any(amounts) else 1
+    variances = [
+        abs(total_inv - total_bank),
+        abs(total_inv - total_gl),
+        abs(total_bank - total_gl),
+    ]
+    avg_variance = sum(variances) / len(variances)
+    amount_score = max(0.0, 1.0 - (avg_variance / max_amt)) if max_amt > 0 else 0.0
+
+    # Date proximity (0.2)
+    dates = [
+        e.transaction_date
+        for e in invoice_entities + bank_entities + gl_entities
+        if e.transaction_date
+    ]
+    date_score = _compute_date_score(dates)
+
+    # Counterparty similarity (0.3)
+    counterparties = [
+        e.counterparty
+        for e in invoice_entities + bank_entities + gl_entities
+    ]
+    cp_score = _compute_counterparty_score(counterparties)
+
+    return 0.5 * amount_score + 0.2 * date_score + 0.3 * cp_score
+
+
+def build_candidate_groups(
+    invoices: List[ExtractedEntity],
+    banks: List[ExtractedEntity],
+    gls: List[ExtractedEntity],
+    config: BookConfig,
+) -> List[ReconciliationGroup]:
+    """Build candidate reconciliation groups using bounded combinatorial search.
+
+    doc 09 §1: groups, not 1:1:1 links. Handles:
+    - one bank payment covering N invoices (bounded by MAX_GROUP_SIZE)
+    - one invoice paid in N installments
+    - ambiguous ties (multiple equally-plausible groupings all surface)
+    """
+    candidates: List[ReconciliationGroup] = []
+
+    # Exclude voided entities from reconciliation entirely (doc 08 §5)
+    invoices = [e for e in invoices if e.entity_subtype != "void"]
+    banks = [e for e in banks if e.entity_subtype != "void"]
+    gls = [e for e in gls if e.entity_subtype != "void"]
+
+    # Pass 1: 1:1:1 exact fast path — filtered by date window + counterparty
+    # (doc 06 §2: candidate search constrains amount AND date AND counterparty)
+    for bank in banks:
+        for inv in invoices:
+            if not _dates_match(inv.transaction_date, bank.transaction_date):
+                continue
+            if not _counterparties_match(inv.counterparty, bank.counterparty):
+                continue
+            if not _amounts_match(inv.amount_cents, bank.amount_cents, config.tolerance_cents):
+                continue
+            for gl in gls:
+                if not _dates_match(inv.transaction_date, gl.transaction_date):
+                    continue
+                if not _counterparties_match(inv.counterparty, gl.counterparty):
+                    continue
+                if not _amounts_match(inv.amount_cents, gl.amount_cents, config.tolerance_cents):
+                    continue
+                candidates.append(ReconciliationGroup(
+                    client_book_id=config.id,
+                    invoice_entity_ids=[inv.id],
+                    bank_entity_ids=[bank.id],
+                    gl_entity_ids=[gl.id],
+                    link_confidence=1.0,
+                    status="needs_review",
+                ))
+
+    # Pass 2: many-to-one — one bank, N invoices summing to bank amount
+    for bank in banks:
+        relevant = [
+            inv for inv in invoices
+            if _dates_match(inv.transaction_date, bank.transaction_date)
+            and _counterparties_match(inv.counterparty, bank.counterparty)
+        ]
+        for size in range(2, min(MAX_GROUP_SIZE, len(relevant)) + 1):
+            for combo in combinations(relevant, size):
+                total = sum(e.amount_cents for e in combo)
+                if _amounts_match(total, bank.amount_cents, config.tolerance_cents):
+                    for gl in gls:
+                        if _amounts_match(total, gl.amount_cents, config.tolerance_cents):
+                            candidates.append(ReconciliationGroup(
+                                client_book_id=config.id,
+                                invoice_entity_ids=[e.id for e in combo],
+                                bank_entity_ids=[bank.id],
+                                gl_entity_ids=[gl.id],
+                                link_confidence=0.0,
+                                status="needs_review",
+                            ))
+
+    # Pass 3: one-to-many — one invoice, N banks summing to invoice amount.
+    # The date window applies between group members (banks against each other),
+    # not against the invoice date — installment payments legitimately span months.
+    for inv in invoices:
+        same_cp_banks = [
+            bank for bank in banks
+            if _counterparties_match(inv.counterparty, bank.counterparty)
+        ]
+        for size in range(2, min(MAX_GROUP_SIZE, len(same_cp_banks)) + 1):
+            for combo in combinations(same_cp_banks, size):
+                if not _combo_dates_within_window(combo):
+                    continue
+                total = sum(e.amount_cents for e in combo)
+                if _amounts_match(total, inv.amount_cents, config.tolerance_cents):
+                    for gl in gls:
+                        if _amounts_match(total, gl.amount_cents, config.tolerance_cents):
+                            candidates.append(ReconciliationGroup(
+                                client_book_id=config.id,
+                                invoice_entity_ids=[inv.id],
+                                bank_entity_ids=[e.id for e in combo],
+                                gl_entity_ids=[gl.id],
+                                link_confidence=0.0,
+                                status="needs_review",
+                            ))
+
+    return _deduplicate_candidates(candidates)
+
+
+def score_and_route(
+    candidates: List[ReconciliationGroup],
+    entities_by_id: dict,
+    config: BookConfig,
+) -> Tuple[List[ReconciliationGroup], List[ReconciliationGroup], List[ExtractedEntity]]:
+    """Score candidate groups and route to auto_linked / needs_review / unmatched.
+
+    Returns (auto_linked, needs_review, unmatched_entities).
+    """
+    # Normalize the entity map keys to strings (UUID objects and str both possible)
+    normalized = {}
+    for k, v in entities_by_id.items():
+        normalized[str(k)] = v
+
+    def lookup(eid) -> Optional[ExtractedEntity]:
+        return normalized.get(str(eid))
+
+    auto_linked: List[ReconciliationGroup] = []
+    needs_review: List[ReconciliationGroup] = []
+    matched_ids = set()
+
+    for group in candidates:
+        invs = [lookup(eid) for eid in group.invoice_entity_ids]
+        banks = [lookup(eid) for eid in group.bank_entity_ids]
+        gls = [lookup(eid) for eid in group.gl_entity_ids]
+        invs = [e for e in invs if e is not None]
+        banks = [e for e in banks if e is not None]
+        gls = [e for e in gls if e is not None]
+
+        if not invs or not banks or not gls:
+            continue
+
+        inv_total = sum(e.amount_cents for e in invs)
+        bank_total = sum(e.amount_cents for e in banks)
+        gl_total = sum(e.amount_cents for e in gls)
+        # Exact = all three grouped totals match within tolerance (any group size)
+        is_exact = (
+            _amounts_match(inv_total, bank_total, config.tolerance_cents)
+            and _amounts_match(inv_total, gl_total, config.tolerance_cents)
+        )
+
+        score = _score_group(invs, banks, gls, config, is_exact)
+        group.link_confidence = round(score, 4)
+
+        if score >= config.auto_link_threshold:
+            group.status = "auto_linked"
+            auto_linked.append(group)
+            for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:
+                matched_ids.add(str(eid))
+        elif score >= config.review_floor:
+            group.status = "needs_review"
+            needs_review.append(group)
+            for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:
+                matched_ids.add(str(eid))
+
+    # Unmatched = entities never appearing in any auto_linked/needs_review group
+    unmatched = [
+        e for e in normalized.values()
+        if str(e.id) not in matched_ids
+    ]
+
+    return auto_linked, needs_review, unmatched
+
+
+def _deduplicate_candidates(candidates: List[ReconciliationGroup]) -> List[ReconciliationGroup]:
     """Remove duplicate candidates (same entity ID sets)."""
     seen = set()
     unique = []
     for c in candidates:
         key = frozenset(
-            [(e.id, e.entity_type) for e in c.invoice_entities + c.bank_entities + c.gl_entities]
+            list(c.invoice_entity_ids) + list(c.bank_entity_ids) + list(c.gl_entity_ids)
         )
         if key not in seen:
             seen.add(key)
             unique.append(c)
     return unique
+
+
+def _combo_dates_within_window(entities: List[ExtractedEntity]) -> bool:
+    """Check that all dated entities in a combo fall within the date window of each other."""
+    dates = [e.transaction_date for e in entities if e.transaction_date]
+    if len(dates) < 2:
+        return True  # no dates = don't filter
+    return (max(dates) - min(dates)).days <= DATE_WINDOW_DAYS
 
 
 def _check_counterparty_alias(name_a: Optional[str], name_b: Optional[str]) -> bool:
@@ -226,3 +302,39 @@ def _check_counterparty_alias(name_a: Optional[str], name_b: Optional[str]) -> b
     if name_a and name_b and name_a.lower() == name_b.lower():
         return True
     return False
+
+
+def cross_link(state: GraphState, config: BookConfig) -> GraphState:
+    """LangGraph node: cross-link classified entities into reconciliation groups."""
+    logger.info("cross-linking entities", batch_id=str(state.get("batch_id")))
+
+    entities = state.get("classified_entities") or []
+    if not entities:
+        logger.warning("no classified entities to cross-link")
+        return state
+
+    entities_by_id = {str(e.id): e for e in entities}
+
+    invoices = [e for e in entities if e.entity_type == "invoice_line_item"]
+    banks = [e for e in entities if e.entity_type == "bank_transaction"]
+    gls = [e for e in entities if e.entity_type == "gl_entry"]
+
+    if not invoices or not banks or not gls:
+        logger.warning("missing entity types for linking",
+                       invoices=len(invoices), banks=len(banks), gls=len(gls))
+        state["groups"] = []
+        return state
+
+    candidates = build_candidate_groups(invoices, banks, gls, config)
+    auto_linked, needs_review, unmatched = score_and_route(candidates, entities_by_id, config)
+
+    state["groups"] = auto_linked + needs_review
+    state["unmatched"] = unmatched
+
+    logger.info("cross-linking complete",
+                auto_linked=len(auto_linked),
+                needs_review=len(needs_review),
+                unmatched=len(unmatched),
+                total_candidates=len(candidates))
+
+    return state

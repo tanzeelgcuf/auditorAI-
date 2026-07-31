@@ -1,60 +1,79 @@
 # services/agent-runtime/graph/schema.py
-from dataclasses import dataclass, field
-from typing import Optional
+# Pydantic models + LangGraph state (TypedDict).
+# This service is LLM extraction/classification/linking ONLY — never arithmetic.
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, TypedDict
 from datetime import date
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
-@dataclass
-class ExtractedEntity:
-    id: UUID
+class EntityType(str):
+    INVOICE = "invoice_line_item"
+    BANK = "bank_transaction"
+    GL = "gl_entry"
+
+
+class EntitySubtype(str):
+    STANDARD = "standard"
+    CREDIT_NOTE = "credit_note"
+    REFUND = "refund"
+    VOID = "void"
+
+
+class SourceFormat(str):
+    OCR = "ocr"
+    STRUCTURED = "structured"
+
+
+class ExtractedEntity(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
     client_book_id: UUID
     source_document_id: UUID
     entity_type: str  # invoice_line_item, bank_transaction, gl_entry
-    entity_subtype: str  # standard, credit_note, refund, void
+    entity_subtype: str = EntitySubtype.STANDARD
     amount_cents: int
-    currency: str
-    transaction_date: Optional[date]
-    counterparty: Optional[str]
-    description: Optional[str]
-    gl_account_code: Optional[str]
-    page_number: int
-    bbox: dict  # {x, y, width, height} normalized 0-1
-    extraction_confidence: float
-    source_format: str  # ocr, structured
+    currency: str = "USD"
+    transaction_date: Optional[date] = None
+    counterparty: Optional[str] = None
+    description: Optional[str] = None
+    gl_account_code: Optional[str] = None
+    page_number: int = 1
+    bbox: dict = Field(default_factory=dict)  # {x, y, width, height} normalized 0-1
+    extraction_confidence: float = 1.0
+    source_format: str = SourceFormat.OCR
 
 
-@dataclass
-class EntityLink:
-    id: UUID
+class EntityLink(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
     client_book_id: UUID
-    invoice_entity_id: Optional[UUID]
-    bank_entity_id: Optional[UUID]
-    gl_entity_id: Optional[UUID]
-    link_confidence: float
-    status: str  # auto_linked, needs_review, confirmed, rejected
+    invoice_entity_id: Optional[UUID] = None
+    bank_entity_id: Optional[UUID] = None
+    gl_entity_id: Optional[UUID] = None
+    link_confidence: float = 0.0
+    status: str = "needs_review"  # auto_linked, needs_review, confirmed, rejected
 
 
-@dataclass
-class ReconciliationGroup:
-    id: UUID
+class ReconciliationGroup(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
     client_book_id: UUID
-    link_confidence: float
-    status: str
+    invoice_entity_ids: List[UUID] = Field(default_factory=list)
+    bank_entity_ids: List[UUID] = Field(default_factory=list)
+    gl_entity_ids: List[UUID] = Field(default_factory=list)
+    link_confidence: float = 0.0
+    status: str = "needs_review"  # auto_linked, needs_review, unmatched
 
 
-@dataclass
-class BookConfig:
+class BookConfig(BaseModel):
     id: UUID
-    tolerance_cents: int
+    tolerance_cents: int = 1
     auto_link_threshold: float = 0.85
     review_floor: float = 0.50
     tolerance_mode: str = "fixed"  # fixed, percentage, greater_of
     tolerance_percentage: Optional[float] = None
 
 
-@dataclass
-class ReconciliationResult:
+class ReconciliationResult(BaseModel):
     variance_cents: int
     exceeds_tolerance: bool
     calculation_formula: str
@@ -63,13 +82,15 @@ class ReconciliationResult:
     severity: str  # info, low, medium, high
 
 
-@dataclass
-class GraphState:
-    """State that flows through the LangGraph nodes."""
+class GraphState(TypedDict, total=False):
+    """LangGraph state flowing through extract → classify → link → verify."""
     client_book_id: UUID
     batch_id: UUID
-    entities: list[ExtractedEntity] = field(default_factory=list)
-    classified_entities: list[ExtractedEntity] = field(default_factory=list)
-    reconciliation_groups: list[ReconciliationGroup] = field(default_factory=list)
-    results: list[ReconciliationResult] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    book_config: Optional[BookConfig]
+    entries: List[dict]  # raw OCR/structured input
+    entities: List[ExtractedEntity]  # extracted
+    classified_entities: List[ExtractedEntity]  # after classify pass
+    groups: List[ReconciliationGroup]
+    unmatched: List[ExtractedEntity]
+    results: List[ReconciliationResult]
+    errors: List[str]
