@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "AI Auditor",
+    "slug": "ai-auditor-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tanzeelgcuf.auditor"
+    },
+    "android": {
+      "package": "com.tanzeelgcuf.auditor",
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "plugins": ["expo-notifications"]
+  }
+}
