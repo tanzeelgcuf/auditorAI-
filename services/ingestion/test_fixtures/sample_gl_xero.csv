@@ -1,0 +1,11 @@
+Date,Transaction No.,Contact Name,Description,Account Code,Account,Amount
+2024-01-15,INV-2024-001,Acme Corp,Consulting services Jan,4000,Consulting Income,1500.00
+2024-02-01,INV-2024-002,Global Tech Inc,Software license,4200,Software Sales,250.00
+2024-02-15,INV-2024-003,Stationery World,Office supplies,4500,Supplies Income,89.99
+2024-03-01,CN-2024-004,Acme Corp,Credit note refund,4600,Refunds,-500.00
+2024-03-15,INV-2024-005,FleetLease LLC,Equipment lease,4100,Equipment Lease Income,3200.00
+2024-04-10,INV-2024-006,Acme Corp,Marketing services Apr,4000,Consulting Income,1200.00
+2024-05-05,INV-2024-007,DataWorks LLC,IT consulting,4300,Professional Services,475.50
+2024-05-20,INV-2024-008,Global Tech Inc,Cloud infrastructure,4200,Software Sales,1999.99
+2024-06-12,INV-2024-009,Stationery World,Legal retainer,4400,Retainer Income,642.75
+2024-06-30,INV-2024-010,Acme Corp,Audit support services,4000,Consulting Income,875.00

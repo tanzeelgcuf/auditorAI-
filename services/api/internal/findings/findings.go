@@ -335,6 +335,7 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		_ = src
 	}
 
+	middleware.RecordAccess(r.Context(), s.db, userID, bookID, "generate_report", reportID)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"id": reportID, "client_book_id": bookID,
 		"period_start": req.PeriodStart, "period_end": req.PeriodEnd,
@@ -375,6 +376,7 @@ func (s *Service) HandleGetReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	middleware.RecordAccess(r.Context(), s.db, middleware.GetUserID(r.Context()), bookID, "download_report", reportID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id": id, "client_book_id": bookID,
 		"period_start": periodStart, "period_end": periodEnd,
@@ -426,7 +428,7 @@ func (s *Service) HandleGetCitation(w http.ResponseWriter, r *http.Request) {
 
 	row := c.QueryRow(r.Context(),
 		`SELECT e.source_document_id::text, e.page_number, e.bbox,
-			f.rule_id, f.rule_version
+			f.rule_id, f.rule_version, f.client_book_id::text
 		 FROM audit_findings f
 		 JOIN reconciliation_group_members m ON m.reconciliation_group_id = f.reconciliation_group_id
 		 JOIN extracted_entities e ON e.id = m.extracted_entity_id
@@ -437,8 +439,8 @@ func (s *Service) HandleGetCitation(w http.ResponseWriter, r *http.Request) {
 	var sourceDoc string
 	var page int
 	var bboxJSON []byte
-	var ruleID, ruleVer string
-	if err := row.Scan(&sourceDoc, &page, &bboxJSON, &ruleID, &ruleVer); err != nil {
+	var ruleID, ruleVer, clientBookID string
+	if err := row.Scan(&sourceDoc, &page, &bboxJSON, &ruleID, &ruleVer, &clientBookID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "no citation for finding")
 			return
@@ -453,6 +455,7 @@ func (s *Service) HandleGetCitation(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(bboxJSON, &b)
 	}
 
+	middleware.RecordAccess(r.Context(), s.db, middleware.GetUserID(r.Context()), clientBookID, "view_finding", findingID)
 	writeJSON(w, http.StatusOK, cit{
 		SourceDocumentID: sourceDoc, PageNumber: page, BBox: &b,
 		RuleID: ruleID, RuleVersion: ruleVer,

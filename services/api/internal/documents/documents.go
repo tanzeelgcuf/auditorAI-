@@ -249,6 +249,7 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	// RLS on source_documents already scopes to assigned books; if the caller
 	// isn't assigned, the row never appears -> 404 (no existence leak).
 
+	middleware.RecordAccess(r.Context(), s.db, middleware.GetUserID(r.Context()), bookID, "view_document", docID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id": id, "client_book_id": bookID, "filename": filename,
 		"doc_type": docType, "ocr_status": status,
@@ -268,10 +269,10 @@ func (s *Service) HandlePresignedView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var storageKey string
+	var storageKey, clientBookID string
 	err := c.QueryRow(r.Context(),
-		`SELECT storage_key FROM source_documents WHERE id = $1 AND deleted_at IS NULL`, docID).
-		Scan(&storageKey)
+		`SELECT storage_key, client_book_id::text FROM source_documents WHERE id = $1 AND deleted_at IS NULL`, docID).
+		Scan(&storageKey, &clientBookID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "document not found")
@@ -283,5 +284,6 @@ func (s *Service) HandlePresignedView(w http.ResponseWriter, r *http.Request) {
 
 	// In production: generate a presigned S3/MinIO URL for the storage key.
 	// For now, return the key so the web app can resolve it.
+	middleware.RecordAccess(r.Context(), s.db, middleware.GetUserID(r.Context()), clientBookID, "view_document", docID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"storage_key": storageKey})
 }

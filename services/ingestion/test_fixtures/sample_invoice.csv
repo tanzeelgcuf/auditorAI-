@@ -4,3 +4,8 @@ date,amount,description,counterparty,currency
 2024-02-15,89.99,Office supplies,Stationery World,USD
 2024-03-01,-500.00,Credit note refund,Acme Corp,USD
 2024-03-15,3200.00,Equipment lease,FleetLease LLC,USD
+2024-04-10,1200.00,Marketing services Apr,Acme Corp,USD
+2024-05-05,475.50,IT consulting,DataWorks LLC,USD
+2024-05-20,1999.99,Cloud infrastructure,Global Tech Inc,USD
+2024-06-12,642.75,Legal retainer,Stationery World,USD
+2024-06-30,875.00,Audit support services,Acme Corp,USD

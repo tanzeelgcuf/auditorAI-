@@ -69,6 +69,7 @@ func main() {
 	findingSvc := findings.NewService()
 	findingSvc.SetDB(pool)
 	reviewSvc := review.NewService()
+	reviewSvc.SetDB(pool)
 	billingSvc := billing.NewService()
 	mcpSvc := mcp.NewService()
 
@@ -173,6 +174,7 @@ func main() {
 			r.Get("/team", tenantSvc.HandleListStaff)
 			r.Get("/settings", tenantSvc.HandleGetFirmSettings)
 			r.Patch("/settings", tenantSvc.HandleUpdateFirmSettings)
+			r.Post("/rotate-keys", tenantSvc.HandleRotateKeys)
 		})
 	})
 

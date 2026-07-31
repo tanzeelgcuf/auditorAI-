@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sony/gobreaker"
 
@@ -86,6 +87,18 @@ func RequireRole(requiredRole string) func(http.Handler) http.Handler {
 // RLSInjector sets PostgreSQL session variables and stores assigned books in context.
 // Acquires a dedicated DB connection for the request, sets app.current_firm and
 // app.assigned_books, and puts the connection in context for handlers to use.
+//
+// IMPORTANT: set_config is called with is_local=false (the session-level default).
+// The old `true` (is_local) form scoped the setting to the current transaction,
+// which under autocommit (no explicit BEGIN) is discarded on commit — the very
+// next statement ran without RLS. The session-level default persists for the
+// life of the dedicated connection; a RESET on release scrubs the GUCs before
+// the conn returns to the pool so no tenant context leaks into the next request.
+//
+// getAssignedBooks runs on the SAME dedicated connection, after current_firm is
+// set. Pool connections may carry no GUC (current_setting errors for a
+// non-superuser) or a LEAKED GUC from a prior request (cross-tenant rows); the
+// request-scoped conn avoids both.
 func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,13 +115,6 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			userIDStr := userID.(string)
 			roleStr := role.(string)
 
-			assignedBooks, err := getAssignedBooks(r.Context(), db, firmIDStr, userIDStr, roleStr)
-			if err != nil {
-				slog.Error("failed to get assigned books", "error", err)
-				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to load permissions")
-				return
-			}
-
 			conn, err := db.Acquire(r.Context())
 			if err != nil {
 				slog.Error("failed to acquire connection for RLS", "error", err)
@@ -116,7 +122,7 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				return
 			}
 
-			_, err = conn.Exec(r.Context(), "SELECT set_config('app.current_firm', $1, true)", firmIDStr)
+			_, err = conn.Exec(r.Context(), "SELECT set_config('app.current_firm', $1, false)", firmIDStr)
 			if err != nil {
 				conn.Release()
 				slog.Error("failed to set app.current_firm", "error", err)
@@ -124,9 +130,19 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				return
 			}
 
-			booksStr := strings.Join(assignedBooks, ",")
-			_, err = conn.Exec(r.Context(), "SELECT set_config('app.assigned_books', $1, true)", booksStr)
+			assignedBooks, err := getAssignedBooks(r.Context(), conn, firmIDStr, userIDStr, roleStr)
 			if err != nil {
+				_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
+				conn.Release()
+				slog.Error("failed to get assigned books", "error", err)
+				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to load permissions")
+				return
+			}
+
+			booksStr := strings.Join(assignedBooks, ",")
+			_, err = conn.Exec(r.Context(), "SELECT set_config('app.assigned_books', $1, false)", booksStr)
+			if err != nil {
+				_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
 				conn.Release()
 				slog.Error("failed to set app.assigned_books", "error", err)
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to set session context")
@@ -137,6 +153,7 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			ctx = context.WithValue(ctx, connKey, conn)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
+			_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
 			conn.Release()
 		})
 	}
@@ -222,7 +239,8 @@ func RateLimiter(next http.Handler) http.Handler {
 
 // getAssignedBooks fetches assigned book UUIDs for a user.
 // firm_admin gets ALL books in their firm; staff gets only user_book_assignments.
-func getAssignedBooks(ctx context.Context, db *pgxpool.Pool, firmID, userID, role string) ([]string, error) {
+// Runs on the RLS-wired request connection so the firm GUC scopes the reads.
+func getAssignedBooks(ctx context.Context, db queryer, firmID, userID, role string) ([]string, error) {
 	if role == "firm_admin" {
 		rows, err := db.Query(ctx, "SELECT id::text FROM client_books WHERE firm_id = $1", firmID)
 		if err != nil {
@@ -258,6 +276,11 @@ func getAssignedBooks(ctx context.Context, db *pgxpool.Pool, firmID, userID, rol
 		books = append(books, id)
 	}
 	return books, rows.Err()
+}
+
+// queryer abstracts the two connection types getAssignedBooks runs against.
+type queryer interface {
+	Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error)
 }
 
 // responseRecorder captures status code
