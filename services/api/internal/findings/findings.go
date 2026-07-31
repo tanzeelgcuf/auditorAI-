@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -332,15 +335,13 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate PDF via Typst (self-hosted per docs). Build a minimal Typst source
-	// and shell out to the typst binary if present; otherwise skip and return metadata.
+	// Generate PDF via Typst (self-hosted per docs). The rendered PDF is written to
+	// the local reports dir (S3 upload deferred — see go-live checklist).
 	pdfKey := ""
-	if typstAvailable() {
-		src := buildTypstSource(&pdfData)
-		pdfKey = fmt.Sprintf("reports/%s.pdf", reportID)
-		// In production: write src to temp file, run `typst compile`, upload PDF to S3.
-		// For now we record intent; the /citation endpoint already serves the traceability.
-		_ = src
+	if pdfPath, err := renderTypstReport(&pdfData, reportID); err != nil {
+		slog.Warn("typst render skipped", "error", err)
+	} else {
+		pdfKey = pdfPath
 	}
 
 	middleware.RecordAccess(r.Context(), s.db, userID, bookID, "generate_report", reportID)
@@ -528,10 +529,43 @@ func buildTypstSource(d *reportData) string {
 	return b.String()
 }
 
-func typstAvailable() bool {
-	// In production: exec.LookPath("typst"). For now report generation returns
-	// metadata only; PDF rendering is wired in when the typst binary is present.
-	return false
+// renderTypstReport writes the Typst source to a temp file, runs `typst compile`,
+// and moves the resulting PDF into the reports dir. Returns the relative storage
+// path (or "" and an error if typst is unavailable or the render fails).
+func renderTypstReport(d *reportData, reportID string) (string, error) {
+	typstBin, err := exec.LookPath("typst")
+	if err != nil {
+		return "", err // typst not installed — metadata-only report
+	}
+
+	src := buildTypstSource(d)
+
+	tmp, err := os.CreateTemp("", "report-*.typ")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(src); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+
+	reportsDir := os.Getenv("REPORTS_DIR")
+	if reportsDir == "" {
+		reportsDir = "reports"
+	}
+	if err := os.MkdirAll(reportsDir, 0o755); err != nil {
+		return "", err
+	}
+
+	pdfPath := filepath.Join(reportsDir, reportID+".pdf")
+	cmd := exec.Command(typstBin, "compile", tmp.Name(), pdfPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("typst compile: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	return pdfPath, nil
 }
 
 func contains(slice []string, item string) bool {

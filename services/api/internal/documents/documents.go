@@ -104,6 +104,20 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Malware scan (ClamAV) before the file enters the pipeline (doc 06 §5).
+	// Fail closed: if the scanner is unavailable, reject rather than accept unscanned.
+	if err := scanWithClamAV(r.Context(), data); err != nil {
+		if err == errInfected {
+			writeProblem(w, http.StatusUnprocessableEntity, "https://ai-auditor.dev/errors/malware",
+				"file failed malware scan")
+			return
+		}
+		slog.Warn("upload rejected: scan unavailable", "error", err)
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/scan-unavailable",
+			"file scanning is temporarily unavailable")
+		return
+	}
+
 	// Content hash for duplicate detection (doc 07 §3)
 	hash := sha256.Sum256(data)
 	contentHash := hex.EncodeToString(hash[:])
