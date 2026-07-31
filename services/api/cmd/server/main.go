@@ -14,6 +14,12 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/billing"
@@ -29,6 +35,17 @@ import (
 
 func main() {
 	ctx := context.Background()
+
+	// Initialize OpenTelemetry tracing (non-fatal if Jaeger unavailable)
+	if tp, err := initTracer(ctx); err == nil {
+		defer func() {
+			if err := tp.Shutdown(ctx); err != nil {
+				slog.Warn("tracer shutdown", "error", err)
+			}
+		}()
+	} else {
+		slog.Warn("tracing disabled", "error", err)
+	}
 
 	// Initialize database pool
 	dsn := os.Getenv("DATABASE_URL")
@@ -66,12 +83,15 @@ func main() {
 	docSvc.SetPipeline(pipelineClient)
 
 	entitySvc := entities.NewService()
+	entitySvc.SetDB(pool)
 	findingSvc := findings.NewService()
 	findingSvc.SetDB(pool)
 	reviewSvc := review.NewService()
 	reviewSvc.SetDB(pool)
 	billingSvc := billing.NewService()
+	billingSvc.SetDB(pool)
 	mcpSvc := mcp.NewService()
+	mcpSvc.SetDB(pool)
 
 	// Router
 	r := chi.NewRouter()
@@ -88,7 +108,6 @@ func main() {
 		MaxAge:           300,
 	}))
 	r.Use(middleware.TraceInjector)
-	r.Use(middleware.RLSInjector(pool))
 
 	// Health
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +136,8 @@ func main() {
 	// Protected routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Authenticator(authSvc))
+		// RLSInjector must run AFTER Authenticator sets firm/user/role in context.
+		r.Use(middleware.RLSInjector(pool))
 
 		// Tenant/Book management
 		r.Route("/v1/books", func(r chi.Router) {
@@ -130,7 +151,7 @@ func main() {
 
 		// Documents
 		r.Route("/v1/books/{bookId}/documents", func(r chi.Router) {
-			r.Post("/", docSvc.HandleUpload)
+			r.With(middleware.Idempotency(pool)).Post("/", docSvc.HandleUpload)
 			r.Get("/", docSvc.HandleList)
 			r.Get("/{docId}", docSvc.HandleGet)
 			r.Get("/{docId}/view", docSvc.HandlePresignedView)
@@ -152,7 +173,7 @@ func main() {
 		r.Post("/v1/findings/{findingId}/attachments", findingSvc.HandleAddAttachment)
 
 		// Reports
-		r.Post("/v1/books/{bookId}/reports", findingSvc.HandleGenerateReport)
+		r.With(middleware.Idempotency(pool)).Post("/v1/books/{bookId}/reports", findingSvc.HandleGenerateReport)
 		r.Get("/v1/reports/{reportId}", findingSvc.HandleGetReport)
 		r.Get("/v1/reports/{reportId}/citation/{findingId}", findingSvc.HandleGetCitation)
 
@@ -207,7 +228,23 @@ func main() {
 	}
 }
 
-// ponytail: re-enable when otel dependencies are vendored in a build environment
-func initTracer(ctx context.Context) (*struct{}, error) {
-	return &struct{}{}, nil
+// initTracer wires OpenTelemetry OTLP export to Jaeger (docker-compose jaeger service).
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "jaeger:4317"
+	}
+	exporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(endpoint), otlptracegrpc.WithInsecure())
+	if err != nil {
+		return nil, err
+	}
+	res, err := resource.New(ctx, resource.WithAttributes(semconv.ServiceName("ai-auditor-api")))
+	if err != nil {
+		return nil, err
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(res))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
+	return tp, nil
 }

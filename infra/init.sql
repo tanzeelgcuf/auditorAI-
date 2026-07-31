@@ -247,6 +247,15 @@ CREATE TABLE api_keys (
     revoked_at TIMESTAMPTZ
 );
 
+CREATE TABLE idempotency_keys (
+    key_hash TEXT PRIMARY KEY,
+    user_id UUID NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_body JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys (created_at);
+
 CREATE TABLE webhook_subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     firm_id UUID NOT NULL REFERENCES firms(id),

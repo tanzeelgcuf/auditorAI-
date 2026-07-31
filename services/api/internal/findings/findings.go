@@ -281,13 +281,20 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Gather findings for the period (created in range, for this book)
+	// Gather findings for the period. A finding belongs to the period if any of its
+	// reconciliation group members' entities carry a transaction_date in range
+	// (not created_at — that's ingestion time, not the business period).
 	rows, err := c.Query(r.Context(),
-		`SELECT id::text, rule_id, rule_version, calculated_variance_cents, tolerance_cents,
-			exceeds_tolerance, calculation_formula, severity, status
-		 FROM audit_findings
-		 WHERE client_book_id = $1 AND created_at >= $2 AND created_at < $3
-		 ORDER BY created_at DESC`, bookID, start, end.Add(24*time.Hour))
+		`SELECT DISTINCT f.id::text, f.rule_id, f.rule_version, f.calculated_variance_cents,
+			f.tolerance_cents, f.exceeds_tolerance, f.calculation_formula, f.severity, f.status,
+			f.created_at
+		 FROM audit_findings f
+		 JOIN reconciliation_group_members m ON m.reconciliation_group_id = f.reconciliation_group_id
+		 JOIN extracted_entities e ON e.id = m.extracted_entity_id
+		 WHERE f.client_book_id = $1
+		   AND e.transaction_date >= $2 AND e.transaction_date < $3
+		 ORDER BY f.created_at DESC`,
+		bookID, start, end.Add(24*time.Hour))
 	if err != nil {
 		slog.Error("failed to query findings for report", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "query failed")
@@ -295,14 +302,15 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var findingIDs []string
+	findingIDs := []string{}
 	var pdfData reportData
 	for rows.Next() {
 		var id, ruleID, ruleVer, formula, sev, st string
 		var variance, tolerance int64
 		var exceeds bool
+		var createdAt time.Time
 		if err := rows.Scan(&id, &ruleID, &ruleVer, &variance, &tolerance, &exceeds,
-			&formula, &sev, &st); err != nil {
+			&formula, &sev, &st, &createdAt); err != nil {
 			continue
 		}
 		findingIDs = append(findingIDs, id)
@@ -336,12 +344,17 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.RecordAccess(r.Context(), s.db, userID, bookID, "generate_report", reportID)
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
+	body, _ := middleware.EncodeJSON(map[string]interface{}{
 		"id": reportID, "client_book_id": bookID,
 		"period_start": req.PeriodStart, "period_end": req.PeriodEnd,
 		"generated_at": time.Now().Format(time.RFC3339),
 		"finding_ids": findingIDs, "pdf_storage_key": pdfKey,
 	})
+	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
+		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	w.Write(body)
 }
 
 func (s *Service) HandleGetReport(w http.ResponseWriter, r *http.Request) {

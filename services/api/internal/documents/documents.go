@@ -161,10 +161,16 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("document uploaded", "doc_id", docID, "book_id", bookID)
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
+	body, _ := middleware.EncodeJSON(map[string]interface{}{
 		"id": docID, "client_book_id": bookID, "filename": header.Filename,
 		"doc_type": docType, "ocr_status": "pending",
 	})
+	// Store idempotent response (non-fatal on failure — retry would reprocess)
+	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
+		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	w.Write(body)
 }
 
 func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {

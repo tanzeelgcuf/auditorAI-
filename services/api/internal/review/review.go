@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,7 +39,81 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "book not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": []interface{}{}, "next_cursor": nil})
+
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		status = "needs_review"
+	}
+
+	c := middleware.GetConn(r.Context())
+	if c == nil {
+		c2, err := s.db.Acquire(r.Context())
+		if err != nil {
+			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
+			return
+		}
+		defer c2.Release()
+		c = c2
+	}
+
+	rows, err := c.Query(r.Context(),
+		`SELECT rg.id::text, rg.client_book_id::text, rg.link_confidence, rg.status, rg.created_at,
+			COALESCE((SELECT e.id::text FROM reconciliation_group_members m
+				JOIN extracted_entities e ON e.id = m.extracted_entity_id
+				WHERE m.reconciliation_group_id = rg.id AND m.role = 'invoice' LIMIT 1), ''),
+			COALESCE((SELECT e.id::text FROM reconciliation_group_members m
+				JOIN extracted_entities e ON e.id = m.extracted_entity_id
+				WHERE m.reconciliation_group_id = rg.id AND m.role = 'bank' LIMIT 1), ''),
+			COALESCE((SELECT e.id::text FROM reconciliation_group_members m
+				JOIN extracted_entities e ON e.id = m.extracted_entity_id
+				WHERE m.reconciliation_group_id = rg.id AND m.role = 'gl' LIMIT 1), '')
+		 FROM reconciliation_groups rg
+		 WHERE rg.client_book_id = $1 AND rg.status = $2
+		 ORDER BY rg.created_at DESC LIMIT 100`, bookID, status)
+	if err != nil {
+		slog.Error("failed to list review queue", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type item struct {
+		ID              string    `json:"id"`
+		ClientBookID    string    `json:"client_book_id"`
+		InvoiceEntityID *string   `json:"invoice_entity_id"`
+		BankEntityID    *string   `json:"bank_entity_id"`
+		GLEntityID      *string   `json:"gl_entity_id"`
+		LinkConfidence  float64   `json:"link_confidence"`
+		Status          string    `json:"status"`
+		CreatedAt       time.Time `json:"created_at"`
+	}
+
+	var out []item
+	for rows.Next() {
+		var it item
+		var createdAt time.Time
+		var invID, bankID, glID string
+		if err := rows.Scan(&it.ID, &it.ClientBookID, &it.LinkConfidence, &it.Status, &createdAt,
+			&invID, &bankID, &glID); err != nil {
+			continue
+		}
+		it.InvoiceEntityID = nullableStr(invID)
+		it.BankEntityID = nullableStr(bankID)
+		it.GLEntityID = nullableStr(glID)
+		it.CreatedAt = createdAt
+		out = append(out, it)
+	}
+	if out == nil {
+		out = []item{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": out, "next_cursor": nil})
+}
+
+func nullableStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // HandleConfirm marks a reconciliation group as confirmed by the reviewer.
