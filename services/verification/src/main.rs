@@ -1,4 +1,6 @@
 // services/verification/src/main.rs
+#![deny(clippy::unwrap_used)]
+
 mod grpc;
 mod decimal_math;
 mod zen;
@@ -8,8 +10,9 @@ use tonic::transport::Server;
 use tracing::{info, error};
 use clap::Parser;
 
-use crate::grpc::{VerificationServiceImpl, verification_service_server::VerificationServiceServer};
-use crate::zen::ZenEngine;
+use crate::grpc::{VerificationServiceImpl};
+use crate::grpc::verification_service::verification_service_server::VerificationServiceServer;
+use crate::zen::RuleEngine;
 
 #[derive(Parser, Debug)]
 #[command(name = "verification", version, about = "AI Auditor Verification Service")]
@@ -31,11 +34,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting verification service on {}", args.grpc_addr);
 
-    // Initialize Zen Engine with decision graph
-    let zen_engine = Arc::new(ZenEngine::new(&args.decision_graph_path).await?);
+    // Initialize RuleEngine with decision graph (synchronous load)
+    let rule_engine = Arc::new(
+        RuleEngine::new(&args.decision_graph_path)
+            .map_err(|e| {
+                error!("Failed to load decision graph: {}", e);
+                e
+            })?
+    );
+
+    info!(
+        "Loaded decision graph: rule_id={}, rule_version={}",
+        rule_engine.rule_id,
+        rule_engine.rule_version,
+    );
 
     // Create service implementation
-    let svc = VerificationServiceImpl::new(zen_engine);
+    let svc = VerificationServiceImpl::new(rule_engine);
 
     // Start gRPC server
     let addr = args.grpc_addr.parse()?;
