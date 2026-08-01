@@ -29,7 +29,10 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/findings"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/mcp"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/notify"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/periods"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/review"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/settings"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/tenant"
 )
 
@@ -58,6 +61,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Seed chart-of-accounts templates (idempotent; warn-only on failure)
+	if err := settings.SeedTemplates(ctx, pool); err != nil {
+		slog.Warn("failed to seed COA templates", "error", err)
+	}
+
+	// Proactive stale document-request reminder loop (doc 10 §7)
+	go notify.Run(ctx, pool, notify.DefaultInterval)
 
 	// Initialize pipeline event client (NATS JetStream)
 	var pipelineClient *pipeline.EventClient
@@ -89,6 +100,12 @@ func main() {
 	reviewSvc := review.NewService()
 	reviewSvc.SetDB(pool)
 	billingSvc := billing.NewService()
+
+	periodsSvc := periods.NewService()
+	periodsSvc.SetDB(pool)
+
+	settingsSvc := settings.NewService()
+	settingsSvc.SetDB(pool)
 	billingSvc.SetDB(pool)
 	mcpSvc := mcp.NewService()
 	mcpSvc.SetDB(pool)
@@ -181,6 +198,33 @@ func main() {
 		r.Post("/v1/billing/checkout", billingSvc.HandleCheckout)
 		r.Post("/v1/webhooks/stripe", billingSvc.HandleStripeWebhook)
 
+		// Periods (close workflow, doc 10 §1)
+		r.Get("/v1/books/{bookId}/periods", periodsSvc.HandleListPeriods)
+		r.Post("/v1/books/{bookId}/periods", periodsSvc.HandleCreatePeriod)
+		r.Post("/v1/books/{bookId}/periods/{periodId}/close", periodsSvc.HandleClosePeriod)
+		r.Post("/v1/books/{bookId}/periods/{periodId}/reopen", periodsSvc.HandleReopenPeriod)
+
+		// Document requests (doc 10 §4)
+		r.Get("/v1/books/{bookId}/document-requests", periodsSvc.HandleListDocumentRequests)
+		r.Post("/v1/books/{bookId}/document-requests", periodsSvc.HandleCreateDocumentRequest)
+		r.Post("/v1/books/{bookId}/document-requests/{requestId}/waive", periodsSvc.HandleWaiveDocumentRequest)
+
+		// Firm dashboard (doc 08 §6)
+		r.Get("/v1/firm/dashboard", periodsSvc.HandleFirmDashboard)
+
+		// Book settings (doc 07/08/09)
+		r.Get("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleListChartOfAccounts)
+		r.Post("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleCreateChartAccount)
+		r.Patch("/v1/books/{bookId}/chart-of-accounts/{accountId}", settingsSvc.HandleUpdateChartAccount)
+		r.Get("/v1/books/{bookId}/coa-templates", settingsSvc.HandleListCOATemplates)
+		r.Post("/v1/books/{bookId}/chart-of-accounts/apply-template", settingsSvc.HandleApplyTemplate)
+		r.Get("/v1/books/{bookId}/counterparty-aliases", settingsSvc.HandleListAliases)
+		r.Post("/v1/books/{bookId}/counterparty-aliases", settingsSvc.HandleCreateAlias)
+		r.Delete("/v1/books/{bookId}/counterparty-aliases/{aliasId}", settingsSvc.HandleDeleteAlias)
+		r.Get("/v1/books/{bookId}/csv-mappings", settingsSvc.HandleListCSVMappings)
+		r.Post("/v1/books/{bookId}/csv-mappings", settingsSvc.HandleCreateCSVMapping)
+		r.Put("/v1/books/{bookId}/csv-mappings/{mappingId}", settingsSvc.HandleUpdateCSVMapping)
+
 		// MCP tools (internal, called by agent-runtime)
 		r.Route("/mcp", func(r chi.Router) {
 			r.Post("/tools/get_pending_entities", mcpSvc.HandleGetPendingEntities)
@@ -196,6 +240,17 @@ func main() {
 			r.Get("/settings", tenantSvc.HandleGetFirmSettings)
 			r.Patch("/settings", tenantSvc.HandleUpdateFirmSettings)
 			r.Post("/rotate-keys", tenantSvc.HandleRotateKeys)
+
+			// API keys (doc 07 §7)
+			r.Get("/api-keys", settingsSvc.HandleListAPIKeys)
+			r.Post("/api-keys", settingsSvc.HandleCreateAPIKey)
+			r.Delete("/api-keys/{keyId}", settingsSvc.HandleRevokeAPIKey)
+
+			// Webhooks (doc 07 §7)
+			r.Get("/webhooks", settingsSvc.HandleListWebhooks)
+			r.Post("/webhooks", settingsSvc.HandleCreateWebhook)
+			r.Delete("/webhooks/{webhookId}", settingsSvc.HandleDeleteWebhook)
+			r.Post("/webhooks/{webhookId}/test", settingsSvc.HandleTestWebhook)
 		})
 	})
 
