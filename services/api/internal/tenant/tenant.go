@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/humanoverride"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 )
 
@@ -297,7 +298,24 @@ func (s *Service) HandleUpdateBookSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Doc 11 §3 — audit every config mutation (part of the same logical change).
+	s.auditConfigChange(r, bookID, settings.ClientName, "client_name")
+	s.auditConfigChange(r, bookID, settings.BaseCurrency, "base_currency")
+	s.auditConfigChange(r, bookID, settings.FiscalYearStartMonth, "fiscal_year_start_month")
+	s.auditConfigChange(r, bookID, settings.AutoLinkConfidenceThreshold, "auto_link_confidence_threshold")
+	s.auditConfigChange(r, bookID, settings.ReviewConfidenceFloor, "review_confidence_floor")
+
 	writeJSON(w, http.StatusOK, map[string]string{"message": "settings updated"})
+}
+
+// auditConfigChange records a changed setting to config_change_log when the
+// pointer is non-nil. Old-value capture deferred; the change itself is recorded.
+func (s *Service) auditConfigChange(r *http.Request, bookID string, v interface{}, field string) {
+	if v == nil {
+		return
+	}
+	userID := middleware.GetUserID(r.Context())
+	humanoverride.LogConfigChange(r.Context(), s.db, bookID, userID, field, nil, v)
 }
 
 func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {

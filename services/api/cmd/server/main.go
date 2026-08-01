@@ -27,6 +27,7 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/entities"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/findings"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/humanoverride"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/mcp"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/notify"
@@ -124,6 +125,9 @@ func main() {
 	pushSvc := push.NewService()
 	pushSvc.SetDB(pool)
 
+	humanSvc := humanoverride.NewService()
+	humanSvc.SetDB(pool)
+
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -193,6 +197,22 @@ func main() {
 
 		// Entities
 		r.Get("/v1/books/{bookId}/entities", entitySvc.HandleList)
+
+		// Human override (doc 11) — manual entity creation + group split/merge
+		r.Post("/v1/books/{bookId}/entities/manual", humanSvc.HandleCreateManualEntity)
+		r.Post("/v1/reconciliation-groups/{groupId}/split", humanSvc.HandleSplitGroup)
+		r.Post("/v1/reconciliation-groups/merge", humanSvc.HandleMergeGroups)
+
+		// Config change history (doc 11 §3)
+		r.Get("/v1/books/{bookId}/config-history", humanSvc.HandleConfigHistory)
+
+		// Automation rate (doc 11 §5)
+		r.Get("/v1/books/{bookId}/automation-rate", humanSvc.HandleAutomationRate)
+
+		// Tags (doc 11 §6)
+		r.Get("/v1/tags", humanSvc.HandleListTags)
+		r.Post("/v1/tags", humanSvc.HandleCreateTag)
+		r.Post("/v1/entities/tag", humanSvc.HandleTagEntity)
 
 		// Review queue
 		r.Get("/v1/books/{bookId}/review-queue", reviewSvc.HandleList)
