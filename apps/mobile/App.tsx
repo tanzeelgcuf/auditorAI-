@@ -6,6 +6,7 @@ import { LoginScreen } from "./src/screens/LoginScreen";
 import { BooksScreen } from "./src/screens/BooksScreen";
 import { BookTabs } from "./src/screens/BookTabs";
 import { getAccessToken, clearTokens } from "./src/api";
+import { registerPushToken } from "./src/push";
 import type { ClientBook } from "./src/types";
 
 const queryClient = new QueryClient();
@@ -32,8 +33,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Request push permission so high-severity findings can notify
-    Notifications.requestPermissionsAsync().catch(() => {});
+    // Request push permission + register the device token so high-severity
+    // findings can notify (both non-fatal on failure).
+    Notifications.requestPermissionsAsync()
+      .catch(() => {})
+      .then(() => registerPushToken());
   }, []);
 
   if (!booted) return null;

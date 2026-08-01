@@ -1,14 +1,17 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Shell } from "../../components/layout/shell";
 import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/card";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { useBooks, useCreateBook } from "../../lib/hooks";
+import { isOnboardingComplete } from "../../lib/onboarding";
 
 export default function DashboardPage() {
+  const router = useRouter();
   const { data, isLoading } = useBooks();
   const createBook = useCreateBook();
   const [showNewBook, setShowNewBook] = useState(false);
@@ -16,6 +19,13 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
 
   const books = data?.items ?? [];
+
+  // First-login gate (doc 07 §9): route new firms with no client books through
+  // the onboarding wizard before showing the empty dashboard.
+  if (!isLoading && books.length === 0 && !isOnboardingComplete()) {
+    router.replace("/onboarding");
+    return null;
+  }
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();

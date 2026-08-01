@@ -1,6 +1,7 @@
 package findings
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,14 @@ import (
 
 type Service struct {
 	db *pgxpool.Pool
+	// Notifier delivers report.generated webhook events (doc 07 §7). Injected by
+	// main.go to avoid an import cycle (webhooks imports nothing from findings).
+	Notifier ReportNotifier
+}
+
+// ReportNotifier is satisfied by *webhooks.Service.
+type ReportNotifier interface {
+	NotifyReportGenerated(ctx context.Context, firmID, reportID string) error
 }
 
 func NewService() *Service { return &Service{} }
@@ -345,6 +354,11 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.RecordAccess(r.Context(), s.db, userID, bookID, "generate_report", reportID)
+	if s.Notifier != nil {
+		if err := s.Notifier.NotifyReportGenerated(r.Context(), middleware.GetFirmID(r.Context()), reportID); err != nil {
+			slog.Warn("report.generated webhook notification failed", "error", err)
+		}
+	}
 	body, _ := middleware.EncodeJSON(map[string]interface{}{
 		"id": reportID, "client_book_id": bookID,
 		"period_start": req.PeriodStart, "period_end": req.PeriodEnd,

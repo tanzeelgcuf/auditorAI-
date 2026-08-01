@@ -31,8 +31,11 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/notify"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/periods"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/portal"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/push"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/review"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/settings"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/webhooks"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/tenant"
 )
 
@@ -110,6 +113,17 @@ func main() {
 	mcpSvc := mcp.NewService()
 	mcpSvc.SetDB(pool)
 
+	webhooksSvc := webhooks.NewService()
+	webhooksSvc.SetDB(pool)
+	findingSvc.Notifier = webhooksSvc
+
+	portalSvc := portal.NewService()
+	portalSvc.SetDB(pool)
+	portalSvc.SetAuth(authSvc)
+
+	pushSvc := push.NewService()
+	pushSvc.SetDB(pool)
+
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -136,6 +150,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ready"))
 	})
+
+	// Client portal login (public — invite-token based, doc 07 §5)
+	r.Post("/v1/portal/login", portalSvc.HandleLogin)
 
 	// Auth routes (public)
 	r.Route("/v1/auth", func(r chi.Router) {
@@ -252,6 +269,17 @@ func main() {
 			r.Delete("/webhooks/{webhookId}", settingsSvc.HandleDeleteWebhook)
 			r.Post("/webhooks/{webhookId}/test", settingsSvc.HandleTestWebhook)
 		})
+
+		// Mobile push device registration (doc 07 §8)
+		r.Post("/v1/push/register", pushSvc.HandleRegisterDevice)
+	})
+
+	// Client portal — read-only, scoped to the portal user's own book
+	r.Group(func(r chi.Router) {
+		r.Use(portalSvc.RequirePortal)
+		r.Get("/v1/portal/reports", portalSvc.HandleListReports)
+		r.Get("/v1/portal/reports/{reportId}", portalSvc.HandleGetReport)
+		r.Get("/v1/portal/findings", portalSvc.HandleListFindings)
 	})
 
 	// Server

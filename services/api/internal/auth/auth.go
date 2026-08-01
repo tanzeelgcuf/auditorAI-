@@ -32,9 +32,10 @@ type Service struct {
 }
 
 type Claims struct {
-	UserID string `json:"user_id"`
-	FirmID string `json:"firm_id"`
-	Role   string `json:"role"`
+	UserID       string `json:"user_id"`
+	FirmID       string `json:"firm_id"`
+	Role         string `json:"role"`
+	PortalBookID string `json:"portal_book_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -138,6 +139,45 @@ func (s *Service) GenerateTokens(userID, firmID, role string) (*TokenPair, error
 		AccessToken:  accessStr,
 		RefreshToken: refreshStr,
 	}, nil
+}
+
+// GeneratePortalTokens issues a token pair for a client-portal user scoped to a
+// single book (Role="portal_user", PortalBookID set). Read-only portal access only.
+func (s *Service) GeneratePortalTokens(portalUserID, bookID string) (*TokenPair, error) {
+	now := time.Now()
+	accessClaims := Claims{
+		UserID:       portalUserID,
+		Role:         "portal_user",
+		PortalBookID: bookID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(s.accessTTL)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Subject:   portalUserID,
+		},
+	}
+	refreshClaims := Claims{
+		UserID:       portalUserID,
+		Role:         "portal_user",
+		PortalBookID: bookID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(s.refreshTTL)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Subject:   portalUserID,
+		},
+	}
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
+	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
+	accessStr, err := accessToken.SignedString(s.jwtSecret)
+	if err != nil {
+		return nil, err
+	}
+	refreshStr, err := refreshToken.SignedString(s.jwtSecret)
+	if err != nil {
+		return nil, err
+	}
+	return &TokenPair{AccessToken: accessStr, RefreshToken: refreshStr}, nil
 }
 
 func (s *Service) ValidateAccessToken(tokenStr string) (*Claims, error) {
