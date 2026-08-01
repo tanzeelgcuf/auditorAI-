@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
 )
 
 const maxUploadSize = 25 * 1024 * 1024 // 25MB per doc 06 §5
@@ -35,14 +36,16 @@ var allowedDocTypes = map[string]string{
 }
 
 type Service struct {
-	db        *pgxpool.Pool
-	pipeline  *pipeline.EventClient
+	db       *pgxpool.Pool
+	pipeline *pipeline.EventClient
+	storage  *storage.Client
 }
 
 func NewService() *Service { return &Service{} }
 
-func (s *Service) SetDB(db *pgxpool.Pool)          { s.db = db }
+func (s *Service) SetDB(db *pgxpool.Pool)             { s.db = db }
 func (s *Service) SetPipeline(p *pipeline.EventClient) { s.pipeline = p }
+func (s *Service) SetStorage(st *storage.Client)        { s.storage = st }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -185,6 +188,179 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)
+}
+
+// HandlePresignUpload (doc 12 §1) creates a document row + returns a presigned
+// PUT URL. The client uploads bytes directly to storage, then calls confirm.
+func (s *Service) HandlePresignUpload(w http.ResponseWriter, r *http.Request) {
+	bookID := r.PathValue("bookId")
+	if bookID == "" || !contains(middleware.GetAssignedBooks(r.Context()), bookID) {
+		writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "book not found")
+		return
+	}
+	userID := middleware.GetUserID(r.Context())
+	if s.storage == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/not-configured",
+			"storage not configured")
+		return
+	}
+
+	var req struct {
+		Filename string `json:"filename"`
+		DocType  string `json:"doc_type"`
+		Size     int64  `json:"size"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Filename == "" {
+		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request",
+			"filename and doc_type required")
+		return
+	}
+	if req.Size > maxUploadSize {
+		writeProblem(w, http.StatusRequestEntityTooLarge, "https://ai-auditor.dev/errors/too-large",
+			"file exceeds 25MB")
+		return
+	}
+
+	c := middleware.GetConn(r.Context())
+	if c == nil {
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
+		return
+	}
+
+	storageKey := fmt.Sprintf("documents/%s/%s-%s", bookID, uuid.NewString(), req.Filename)
+	// Per-row unique placeholder hash — the real content hash is computed and
+	// written at confirm time. A constant sentinel would collide on the
+	// (client_book_id, content_hash) unique index when multiple presigns are
+	// in flight for the same book.
+	placeholderHash := "pending-" + uuid.NewString()
+	var docID string
+	err := c.QueryRow(r.Context(),
+		`INSERT INTO source_documents
+			(client_book_id, filename, doc_type, storage_key, content_hash, uploaded_by, ocr_status)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+		 RETURNING id::text`,
+		bookID, req.Filename, req.DocType, storageKey, placeholderHash, userID).Scan(&docID)
+	if err != nil {
+		slog.Error("failed to create document for presign", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "insert failed")
+		return
+	}
+
+	url, err := s.storage.PresignUpload(r.Context(), storageKey, 15*time.Minute)
+	if err != nil {
+		slog.Error("presign failed", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "presign failed")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"document_id": docID, "upload_url": url, "expires_in_seconds": 900,
+	})
+}
+
+// HandleConfirmUpload (doc 12 §1) verifies bytes landed in storage, computes the
+// content hash by streaming, then triggers ingestion via NATS.
+func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
+	bookID := r.PathValue("bookId")
+	docID := r.PathValue("docId")
+	if bookID == "" || docID == "" || !contains(middleware.GetAssignedBooks(r.Context()), bookID) {
+		writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "book or doc not found")
+		return
+	}
+	if s.storage == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/not-configured",
+			"storage not configured")
+		return
+	}
+
+	c := middleware.GetConn(r.Context())
+	if c == nil {
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
+		return
+	}
+
+	var storageKey, docType string
+	err := c.QueryRow(r.Context(),
+		`SELECT storage_key, doc_type FROM source_documents WHERE id = $1 AND client_book_id = $2`,
+		docID, bookID).Scan(&storageKey, &docType)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "document not found")
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "query failed")
+		return
+	}
+
+	// Verify the object actually landed (don't trust the client).
+	exists, err := s.storage.ObjectExists(r.Context(), storageKey)
+	if err != nil || !exists {
+		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/upload-incomplete",
+			"object not found in storage — upload did not complete")
+		return
+	}
+
+	// Stream + hash the object for duplicate detection (doc 07 §3).
+	data, err := s.storage.StreamObject(r.Context(), storageKey)
+	if err != nil {
+		slog.Error("failed to stream object", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "stream failed")
+		return
+	}
+	hash := sha256.Sum256(data)
+	contentHash := hex.EncodeToString(hash[:])
+
+	var dupID string
+	err = c.QueryRow(r.Context(),
+		`SELECT id::text FROM source_documents
+		 WHERE client_book_id = $1 AND content_hash = $2 AND deleted_at IS NULL`,
+		bookID, contentHash).Scan(&dupID)
+	if err == nil && dupID != docID {
+		writeProblem(w, http.StatusConflict, "https://ai-auditor.dev/errors/duplicate",
+			"a document with identical content already exists in this book")
+		return
+	}
+
+	// Malware scan before ingestion (doc 06 §5).
+	if err := scanWithClamAV(r.Context(), data); err != nil {
+		if err == errInfected {
+			writeProblem(w, http.StatusUnprocessableEntity, "https://ai-auditor.dev/errors/malware",
+				"file failed malware scan")
+			return
+		}
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/scan-unavailable",
+			"file scanning temporarily unavailable")
+		return
+	}
+
+	_, err = c.Exec(r.Context(),
+		`UPDATE source_documents SET content_hash = $1, ocr_status = 'pending' WHERE id = $2`,
+		contentHash, docID)
+	if err != nil {
+		slog.Error("failed to update doc hash", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "update failed")
+		return
+	}
+
+	// Trigger ingestion.
+	if s.pipeline != nil {
+		payload, _ := json.Marshal(map[string]string{
+			"document_id": docID, "storage_key": storageKey, "doc_type": docType,
+			"client_book_id": bookID,
+		})
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if _, pubErr := s.pipeline.Publish(ctx, "document.uploaded", payload); pubErr != nil {
+			slog.Error("failed to publish ingestion event", "error", pubErr)
+			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "publish failed")
+			return
+		}
+	}
+
+	slog.Info("document confirmed + queued for ingestion", "doc_id", docID, "bytes", len(data))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id": docID, "ocr_status": "pending", "content_hash": contentHash[:12] + "…",
+	})
 }
 
 func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {

@@ -36,6 +36,7 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/push"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/review"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/settings"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/webhooks"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/tenant"
 )
@@ -96,6 +97,12 @@ func main() {
 	docSvc := documents.NewService()
 	docSvc.SetDB(pool)
 	docSvc.SetPipeline(pipelineClient)
+	if st, err := storage.New(); err == nil {
+		_ = st.EnsureBucketExists(ctx)
+		docSvc.SetStorage(st)
+	} else {
+		slog.Warn("storage (MinIO/S3) unavailable — uploads limited", "error", err)
+	}
 
 	entitySvc := entities.NewService()
 	entitySvc.SetDB(pool)
@@ -190,9 +197,11 @@ func main() {
 		// Documents
 		r.Route("/v1/books/{bookId}/documents", func(r chi.Router) {
 			r.With(middleware.Idempotency(pool)).Post("/", docSvc.HandleUpload)
+			r.Post("/upload-url", docSvc.HandlePresignUpload)
 			r.Get("/", docSvc.HandleList)
 			r.Get("/{docId}", docSvc.HandleGet)
 			r.Get("/{docId}/view", docSvc.HandlePresignedView)
+			r.Post("/{docId}/confirm-upload", docSvc.HandleConfirmUpload)
 		})
 
 		// Entities
