@@ -2,7 +2,7 @@ use super::{ExtractedEntity, BoundingBox, OcrBackend, OcrError, ProcessDocumentR
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
 use calamine::{open_workbook_from_rs, DataType, Reader, Xlsx};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use csv::ReaderBuilder;
 use regex::Regex;
 use std::collections::HashMap;
@@ -205,6 +205,7 @@ impl OcrBackend for XlsxParser {
 
         let range = workbook
             .worksheet_range(&sheet_name)
+            .ok_or_else(|| OcrError::ParsingError(format!("xlsx sheet '{sheet_name}' not found")))?
             .map_err(|e| OcrError::ParsingError(format!("xlsx sheet '{sheet_name}': {e}")))?;
 
         let mut rows = range.rows();
@@ -289,6 +290,9 @@ fn cell_string(cell: &DataType) -> String {
         DataType::Bool(b) => b.to_string(),
         DataType::Error(e) => format!("error:{e:?}"),
         DataType::Empty => String::new(),
+        DataType::Duration(d) => d.to_string(),
+        DataType::DateTimeIso(s) => s.clone(),
+        DataType::DurationIso(s) => s.clone(),
     }
 }
 

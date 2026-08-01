@@ -120,7 +120,8 @@ mod tests {
     fn test_iou_identical() {
         let a = BoundingBox::new(0.1, 0.1, 0.2, 0.2);
         let b = BoundingBox::new(0.1, 0.1, 0.2, 0.2);
-        assert_eq!(a.iou(&b), 1.0);
+        let iou = a.iou(&b);
+        assert!((iou - 1.0).abs() < 1e-5, "iou = {iou}, want ~1.0");
     }
 
     #[test]

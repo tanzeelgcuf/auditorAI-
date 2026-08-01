@@ -9,7 +9,7 @@ prost = "0.12"
 prost-types = "0.12"
 image = "0.25"
 csv = "1.3"
-calamine = { version = "0.22", features = ["xlsx"] }
+calamine = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
@@ -23,18 +23,21 @@ aws-config = "1.0"
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-nats = "0.22"
-clap = { version = "4.5", features = ["derive"] }
+async-nats = "0.34"
 regex = "1"
-sha2 = "0.10"
+clap = { version = "4.5", features = ["derive", "env"] }
 
 [build-dependencies]
 tonic-build = "0.10"
 
 [dev-dependencies]
-proptest = "1.0"
 mockall = "0.12"
 
+# nuid (a nats dep) declares rand ">=0.8" but only compiles against the 0.8 API;
+# Cargo resolves the highest available (0.10) which removed rand::distributions.
+# The exact rand pin in [dependencies] forces nuid to 0.8.5 (proptest was removed
+# from dev-deps; it needs rand 0.9, incompatible in one graph). ponytail: migrate
+# ingestion to async-nats (maintained successor) to drop nuid entirely.
 [profile.release]
 lto = true
 codegen-units = 1

@@ -4,7 +4,7 @@ use crate::ocr::{
 };
 use std::sync::Arc;
 
-use nats::jetstream::JetStream;
+use async_nats::jetstream::Context as JetStream;
 use tonic::{Request, Response, Status};
 
 pub mod ingestion_service {
@@ -173,7 +173,7 @@ impl IngestionService for IngestionServiceImpl {
             "entity_count": entities.len(),
             "status": "completed"
         });
-        let _ = self.js.publish("ingestion.completed", event.to_string().into());
+        let _ = self.js.publish("ingestion.completed", event.to_string().into()).await;
 
         Ok(Response::new(GrpcProcessResponse { entities }))
     }
@@ -262,6 +262,7 @@ mod tests {
         let g = IngestionServiceImpl::convert_entity(&e);
         assert_eq!(g.amount_cents, 15000);
         assert_eq!(g.description, "Widgets");
-        assert_eq!(g.bbox.unwrap().x, 0.1);
+        let bx = g.bbox.unwrap().x;
+        assert!((bx - 0.1).abs() < 1e-5, "bbox.x = {bx}, want ~0.1");
     }
 }

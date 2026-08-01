@@ -41,9 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url).await?
     );
 
-    // Initialize NATS connection
-    let nc = nats::connect(&args.nats_url)?;
-    let js = nc.jetstream()?;
+    // Initialize NATS connection (async-nats, the maintained successor client)
+    let nc = async_nats::connect(&args.nats_url).await?;
+    let js = async_nats::jetstream::new(nc);
 
     // Create service implementation
     let svc = IngestionServiceImpl::new(ocr_backend, js).await;
