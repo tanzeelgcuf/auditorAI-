@@ -34,24 +34,43 @@ For THIS page, identify the ONE invoice it contains and return:
 - vendor_name: the vendor from the address/header
 - invoice_number: e.g. "INV-1001"
 - invoice_date: YYYY-MM-DD
-- total_amount_cents: the invoice TOTAL in cents (e.g. $342.50 -> 34250)
+- total_amount_raw: the invoice TOTAL as a string EXACTLY as it appears on the
+  page (e.g. "342.50", "$342.50", "1,500.00"). NEVER convert to cents, never
+  multiply by 100, never scale — copy the digits/symbols verbatim. That
+  conversion is done deterministically elsewhere, not by you.
 - line_item_descriptions: list of the 1-3 line item descriptions present
 - source_indices: the zero-based indices (into the raw list I give you) that
   SUPPORT the total amount — i.e. which raw OCR entries contain the total or its
   clearest evidence. This must let us highlight the total line in the PDF.
 
 CRITICAL CONSTRAINTS:
-- Extract ONLY — do NOT sum, verify, or correct the sub/tax/total arithmetic.
+- Extract ONLY — do NOT sum, verify, correct, OR unit-convert anything.
 - Pick the total from the clearest single value. Do not use the address number
   (e.g. 4300400, 4422, 882) as a total.
 - If an invoice has a credit/negative line, report total as-is; don't net it.
 - Return ONLY a JSON object, no prose:
 {{"vendor_name": "...", "invoice_number": "...", "invoice_date": "...",
- "total_amount_cents": 0, "line_item_descriptions": [...], "source_indices": [0,1,2]}}
+ "total_amount_raw": "342.50", "line_item_descriptions": [...], "source_indices": [0,1,2]}}
 
 Raw OCR entries (zero-based index -> text):
 {entries}
 """
+
+
+def _raw_to_cents(value):
+    """Deterministic 'verbatim amount string' -> integer cents. The model never
+    does this conversion (doc 13). '$342.50' -> 34250, '128.75' -> 12875."""
+    if value is None:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    neg = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
+    s = "".join(c for c in s if c.isdigit() or c == ".")
+    try:
+        return int(round(float(s) * 100)) if "." in s else int(s or 0)
+    except ValueError:
+        return 0
 
 
 def main():
@@ -91,7 +110,9 @@ def main():
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
             data = json.loads(raw)
             data["page"] = page
-            data["total_amount"] = int(data.get("total_amount_cents", data.get("total_amount", 0)))
+            # Deterministic conversion of the verbatim raw string (doc 13) — the
+            # model must NOT do this arithmetic; mirror _parse_amount_cents.
+            data["total_amount"] = _raw_to_cents(data.get("total_amount_raw", ""))
             data["source_texts"] = [texts[i] for i in data.get("source_indices", [])[:3]]
             results.append(data)
             print(f"PAGE {page}: {data['invoice_number']} total={data['total_amount']} vendor={data['vendor_name'][:30]}")

@@ -24,7 +24,9 @@ EXTRACTION_PROMPT_TEMPLATE = """Extract structured entities from the OCR/structu
 For each item, return a JSON object with fields:
 - entity_type: "invoice_line_item" | "bank_transaction" | "gl_entry"
 - entity_subtype: "standard" | "credit_note" | "refund" | "void"
-- amount_cents: integer cents (negative for credits/refunds — extract raw sign)
+- amount_raw: the amount EXACTLY as it appears on the page, as a string
+  (e.g. "342.50", "1,500.00", "-45.00", "215"). Include the sign for credits/refunds.
+  NEVER multiply, scale, convert, or compute — copy the digits and symbols verbatim.
 - currency: ISO code
 - transaction_date: "YYYY-MM-DD" or null
 - counterparty: vendor/customer name or null
@@ -32,9 +34,12 @@ For each item, return a JSON object with fields:
 - gl_account_code: string or null
 
 CRITICAL RULES:
-- Extract raw values only. NEVER calculate totals, sums, or variances.
+- Extract raw values ONLY. NEVER calculate totals, sums, variances, OR unit
+  conversions. You must NOT convert a dollar amount to cents — that is arithmetic
+  and is done elsewhere, not by you.
+- Return amount_raw as the literal text/symbols you see. "$342.50" stays "$342.50".
 - If you see a total, return it as-is without summing line items to verify.
-- Preserve sign: credit notes / refunds are negative amount_cents.
+- Preserve sign: credit notes / refunds are negative in amount_raw (e.g. "-45.00").
 - Do not reconcile or judge — extraction only.
 
 Return ONLY a JSON array of objects, no prose.
@@ -139,12 +144,18 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
         for item in parsed:
             if not isinstance(item, dict):
                 continue
+            # amount_raw is the verbatim page string (e.g. "$342.50"); the
+            # deterministic _parse_amount_cents does the only money conversion —
+            # never ask the model to compute cents (doc 13: unit conversion is
+            # arithmetic the LLM must not touch). amount_cents kept as a fallback
+            # for older prompt versions.
+            amount_source = item.get("amount_raw") or item.get("amount_cents")
             entities.append(ExtractedEntity(
                 client_book_id=state.get("client_book_id"),
                 source_document_id=UUID(item.get("source_document_id", str(state.get("batch_id")))),
                 entity_type=item.get("entity_type", "invoice_line_item"),
                 entity_subtype=item.get("entity_subtype", "standard"),
-                amount_cents=_parse_amount_cents(item.get("amount_cents")),
+                amount_cents=_parse_amount_cents(amount_source),
                 currency=item.get("currency", "USD"),
                 transaction_date=_parse_date(item.get("transaction_date")),
                 counterparty=item.get("counterparty"),
