@@ -291,3 +291,24 @@ def test_ground_citations_fallback_to_cited_when_no_total_on_page():
     texts = ["$150.00", "$749.00"]
     # No entity carries 89900 -> keep the model's citation (nothing better).
     assert _ground_citations([0], texts, 89900) == [0]
+
+
+# ---- entity_type context anchoring (Round 7 / gl_entry fix) ----
+# A 5/5-consistent gl_entry misclassification on an invoice page was traced to
+# prompt framing: the open enum "invoice_line_item | bank_transaction | gl_entry"
+# let a small model drift to the catch-all. The prompt must anchor to document
+# context. Assert the production prompt carries the anchoring rule.
+
+def test_production_prompt_anchors_invoice_entity_type():
+    from graph.extract import EXTRACTION_PROMPT_TEMPLATE
+    assert "DOCUMENT CONTEXT" in EXTRACTION_PROMPT_TEMPLATE
+    assert "never gl_entry" in EXTRACTION_PROMPT_TEMPLATE.lower() or "ALWAYS invoice_line_item" in EXTRACTION_PROMPT_TEMPLATE
+    # Invoice-first ordering (no structural bias toward gl_entry)
+    et = EXTRACTION_PROMPT_TEMPLATE.split("entity_type:")[1]
+    assert et.find("invoice_line_item") < et.find("gl_entry")
+
+def test_production_prompt_defaults_to_invoice():
+    from graph.extract import extract_entities, EXTRACTION_PROMPT_TEMPLATE
+    # No gl_entry default — the fallback is invoice_line_item
+    assert "item.get(\"entity_type\", \"invoice_line_item\")" in open(
+        os.path.join(os.path.dirname(__file__), "..", "graph", "extract.py")).read()

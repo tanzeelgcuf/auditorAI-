@@ -22,7 +22,13 @@ EXTRACTION_SYSTEM = (
 EXTRACTION_PROMPT_TEMPLATE = """Extract structured entities from the OCR/structured data below.
 
 For each item, return a JSON object with fields:
-- entity_type: "invoice_line_item" | "bank_transaction" | "gl_entry"
+- entity_type: choose by the DOCUMENT CONTEXT below, not by a guess:
+  - "invoice_line_item" when this page/block is an INVOICE (it has an invoice
+    number like INV-xxxx, line items, subtotal/total)
+  - "bank_transaction" when it is a BANK statement/ledger entry
+  - "gl_entry" ONLY when it is explicitly a general-ledger entry
+  An invoice's line items and totals are ALWAYS invoice_line_item — never
+  gl_entry or bank_transaction just because they contain a dollar amount.
 - entity_subtype: "standard" | "credit_note" | "refund" | "void"
 - amount_raw: the amount EXACTLY as it appears in the OCR/Data context below,
   as a string. MUST be a value you actually see THERE — hundreds/thousands may
