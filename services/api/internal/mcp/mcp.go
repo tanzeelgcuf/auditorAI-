@@ -175,11 +175,30 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Derive group scope from the GL legs' chart-of-accounts account type
+	// (doc 12 §2 / Round 7): AR-side activity is categorized, not excluded.
+	// A GL leg posting to AR / asset / revenue accounts => 'ar'; else 'ap'.
+	var scope string
+	err = tx.QueryRow(r.Context(),
+		`SELECT CASE WHEN count(*) > 0 THEN 'ar' ELSE 'ap' END
+		 FROM extracted_entities e
+		 LEFT JOIN chart_of_accounts coa
+		   ON coa.client_book_id = e.client_book_id
+		  AND (coa.account_code = e.gl_account_code OR coa.account_name = e.gl_account_code)
+		 WHERE e.id = ANY($1)
+		   AND (coa.account_type IN ('asset','revenue')
+		        OR e.gl_account_code ILIKE '%checking%' OR e.gl_account_code ILIKE '%cash%'
+		        OR e.gl_account_code ILIKE '%receivable%')`,
+		req.GLIDs).Scan(&scope)
+	if err != nil {
+		scope = "ap"
+	}
+
 	var groupID string
 	err = tx.QueryRow(r.Context(),
-		`INSERT INTO reconciliation_groups (client_book_id, link_confidence, status)
-		 VALUES ($1, $2, $3) RETURNING id::text`,
-		bookID, req.Confidence, req.Status).Scan(&groupID)
+		`INSERT INTO reconciliation_groups (client_book_id, link_confidence, status, group_scope)
+		 VALUES ($1, $2, $3, $4) RETURNING id::text`,
+		bookID, req.Confidence, req.Status, scope).Scan(&groupID)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "insert failed")
 		return
