@@ -91,8 +91,10 @@ CREATE TABLE extracted_entities (
     bbox JSONB NOT NULL,
     extraction_confidence NUMERIC(4,3) NOT NULL,
     source_format TEXT NOT NULL DEFAULT 'ocr' CHECK (source_format IN ('ocr', 'structured')),
+    transaction_ref TEXT,
     extracted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_extracted_entities_ref ON extracted_entities (client_book_id, transaction_ref);
 
 -- ===== CROSS-LINKING & REVIEW =====
 CREATE TABLE reconciliation_groups (

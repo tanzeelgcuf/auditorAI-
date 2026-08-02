@@ -216,6 +216,7 @@ impl OcrBackend for DoctrBackend {
                             counterparty: None,
                             description: Some(text.clone()),
                             gl_account_code: None,
+                            transaction_ref: None,
                             page_number: page.page_number,
                             bbox,
                             confidence: line.confidence,

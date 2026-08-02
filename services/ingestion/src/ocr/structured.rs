@@ -193,6 +193,13 @@ impl OcrBackend for CsvParser {
             let counterparty = mapped.get("counterparty").cloned();
             let account_code = mapped.get("account_code").cloned();
             let currency = mapped.get("currency").cloned().unwrap_or_else(|| "USD".to_string());
+            // The transaction reference (e.g. QuickBooks "Num" column) identifies a
+            // journal entry so debit/credit legs can be keyed on it, not a heuristic.
+            let tx_ref = mapped.get("transaction_ref")
+                .or_else(|| row_data.get("Num"))
+                .or_else(|| row_data.get("Ref"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             entities.push(ExtractedEntity {
                 entity_type: entity_type.to_string(),
@@ -202,6 +209,7 @@ impl OcrBackend for CsvParser {
                 counterparty,
                 description,
                 gl_account_code: account_code,
+                transaction_ref: tx_ref,
                 page_number: 1,
                 bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
                 confidence: 1.0,
@@ -229,12 +237,20 @@ pub fn dedupe_gl_pairs(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for e in entities {
-        let key = format!(
-            "{:?}|{}|{}",
-            e.transaction_date,
-            e.counterparty.clone().unwrap_or_default(),
-            e.amount_cents.abs()
-        );
+        // Prefer the transaction reference (e.g. GL "Num") as the dedup key —
+        // it uniquely identifies a journal entry. Fall back to
+        // (date, counterparty, abs amount) only when no ref exists (OCR entities,
+        // OFX without FITID) — that heuristic can wrongly collapse two distinct
+        // entries that happen to share all three.
+        let key = match &e.transaction_ref {
+            Some(r) if !r.is_empty() => format!("ref:{}", r),
+            _ => format!(
+                "heur:{:?}|{}|{}",
+                e.transaction_date,
+                e.counterparty.clone().unwrap_or_default(),
+                e.amount_cents.abs()
+            ),
+        };
         if seen.insert(key) {
             out.push(e);
         }
@@ -313,6 +329,13 @@ impl OcrBackend for XlsxParser {
             let counterparty = mapped.get("counterparty").cloned();
             let account_code = mapped.get("account_code").cloned();
             let currency = mapped.get("currency").cloned().unwrap_or_else(|| "USD".to_string());
+            // The transaction reference (e.g. QuickBooks "Num" column) identifies a
+            // journal entry so debit/credit legs can be keyed on it, not a heuristic.
+            let tx_ref = mapped.get("transaction_ref")
+                .or_else(|| row_data.get("Num"))
+                .or_else(|| row_data.get("Ref"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             entities.push(ExtractedEntity {
                 entity_type: entity_type.to_string(),
@@ -322,6 +345,7 @@ impl OcrBackend for XlsxParser {
                 counterparty,
                 description,
                 gl_account_code: account_code,
+                transaction_ref: tx_ref,
                 page_number: 1,
                 bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
                 confidence: 1.0,
@@ -432,6 +456,7 @@ impl OcrBackend for OfxParser {
                 counterparty: name,
                 description,
                 gl_account_code: None,
+                transaction_ref: fitid.clone(),
                 page_number: 1,
                 bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
                 confidence: 1.0,
@@ -467,6 +492,7 @@ pub fn create_structured_entity(
         counterparty,
         description,
         gl_account_code,
+        transaction_ref: None,
         page_number,
         bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
         confidence: 1.0,
@@ -569,6 +595,7 @@ mod tests {
             counterparty: Some("Acme".into()),
             description: None,
             gl_account_code: None,
+            transaction_ref: None,
             currency: "USD".into(),
             page_number: 1,
             bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
@@ -578,5 +605,33 @@ mod tests {
         let input = vec![mk(47125), mk(47125), mk(21500), mk(-21500)];
         let out = dedupe_gl_pairs(input);
         assert_eq!(out.len(), 2, "debit+credit pairs must collapse to one each");
+    }
+
+    // Doc 08: with a transaction ref present, dedup keys on the REF, so two
+    // distinct entries sharing date+counterparty+amount are NOT collapsed.
+    #[test]
+    fn test_dedupe_gl_pairs_uses_ref() {
+        let d = NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
+        let mk = |amt: i64, rf: &str| ExtractedEntity {
+            entity_type: "gl_entry".into(),
+            amount_cents: amt,
+            transaction_date: Some(d),
+            counterparty: Some("Acme".into()),
+            description: None,
+            gl_account_code: None,
+            transaction_ref: Some(rf.to_string()),
+            currency: "USD".into(),
+            page_number: 1,
+            bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            confidence: 1.0,
+            source_format: "structured".into(),
+        };
+        // Two DIFFERENT refs, same date/counterparty/amount = 2 distinct entries.
+        let input = vec![mk(47125, "A"), mk(47125, "B")];
+        let out = dedupe_gl_pairs(input);
+        assert_eq!(out.len(), 2, "distinct refs must not be collapsed");
+        // Same ref, debit+credit legs = 1 entry.
+        let input2 = vec![mk(47125, "X"), mk(47125, "X")];
+        assert_eq!(dedupe_gl_pairs(input2).len(), 1, "same ref legs collapse to one");
     }
 }

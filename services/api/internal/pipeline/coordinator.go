@@ -201,11 +201,11 @@ func (c *Coordinator) persistEntities(ctx context.Context, bookID, docID string,
 		_, err := c.db.Exec(ctx,
 			`INSERT INTO extracted_entities
 				(client_book_id, source_document_id, entity_type, amount_cents, transaction_date,
-				 counterparty, description, gl_account_code, page_number, bbox, extraction_confidence, source_format)
-			 VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''),
-			 	$9, '{}', $10, $11)`,
+				 counterparty, description, gl_account_code, transaction_ref, page_number, bbox, extraction_confidence, source_format)
+			 VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), NULLIF($9,''),
+			 	$10, '{}', $11, $12)`,
 			bookID, docID, e.EntityType, e.AmountCents, txnDate,
-			e.Counterparty, e.Description, e.GlAccountCode,
+			e.Counterparty, e.Description, e.GlAccountCode, e.TransactionRef,
 			e.PageNumber, e.Confidence, e.SourceFormat)
 		if err != nil {
 			return err

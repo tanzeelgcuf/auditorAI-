@@ -17,6 +17,7 @@ pub struct ExtractedEntity {
     pub counterparty: Option<String>,
     pub description: Option<String>,
     pub gl_account_code: Option<String>,
+    pub transaction_ref: Option<String>, // source ref (e.g. GL "Num", OFX "FITID")
     pub page_number: i32,
     pub bbox: BoundingBox,
     pub confidence: f32,               // 0.0 - 1.0

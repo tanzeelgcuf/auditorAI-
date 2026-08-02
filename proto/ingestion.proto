@@ -35,6 +35,7 @@ message ExtractedEntity {
     double confidence = 10;
     string source_format = 11;    // ocr | structured
     string entity_subtype = 12;   // standard | credit_note | refund | void
+    string transaction_ref = 13;  // source transaction reference (GL Num, OFX FITID)
 }
 
 message BoundingBox {

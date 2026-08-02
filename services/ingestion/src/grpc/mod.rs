@@ -117,6 +117,7 @@ impl IngestionServiceImpl {
             confidence: e.confidence as f64,
             source_format: e.source_format.clone(),
             entity_subtype: String::new(),
+            transaction_ref: e.transaction_ref.clone().unwrap_or_default(),
         }
     }
 }
@@ -267,6 +268,7 @@ mod tests {
             counterparty: Some("Acme Corp".into()),
             description: Some("Widgets".into()),
             gl_account_code: Some("4000".into()),
+            transaction_ref: Some("10456".into()),
             page_number: 1,
             bbox: crate::ocr::BoundingBox {
                 x: 0.1,

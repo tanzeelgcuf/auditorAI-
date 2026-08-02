@@ -155,8 +155,9 @@ type ExtractedEntity struct {
 	PageNumber      int32                  `protobuf:"varint,8,opt,name=page_number,json=pageNumber,proto3" json:"page_number,omitempty"`
 	Bbox            *BoundingBox           `protobuf:"bytes,9,opt,name=bbox,proto3" json:"bbox,omitempty"`
 	Confidence      float64                `protobuf:"fixed64,10,opt,name=confidence,proto3" json:"confidence,omitempty"`
-	SourceFormat    string                 `protobuf:"bytes,11,opt,name=source_format,json=sourceFormat,proto3" json:"source_format,omitempty"`    // ocr | structured
-	EntitySubtype   string                 `protobuf:"bytes,12,opt,name=entity_subtype,json=entitySubtype,proto3" json:"entity_subtype,omitempty"` // standard | credit_note | refund | void
+	SourceFormat    string                 `protobuf:"bytes,11,opt,name=source_format,json=sourceFormat,proto3" json:"source_format,omitempty"`       // ocr | structured
+	EntitySubtype   string                 `protobuf:"bytes,12,opt,name=entity_subtype,json=entitySubtype,proto3" json:"entity_subtype,omitempty"`    // standard | credit_note | refund | void
+	TransactionRef  string                 `protobuf:"bytes,13,opt,name=transaction_ref,json=transactionRef,proto3" json:"transaction_ref,omitempty"` // source transaction reference (GL Num, OFX FITID)
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -271,6 +272,13 @@ func (x *ExtractedEntity) GetSourceFormat() string {
 func (x *ExtractedEntity) GetEntitySubtype() string {
 	if x != nil {
 		return x.EntitySubtype
+	}
+	return ""
+}
+
+func (x *ExtractedEntity) GetTransactionRef() string {
+	if x != nil {
+		return x.TransactionRef
 	}
 	return ""
 }
@@ -465,7 +473,7 @@ const file_ingestion_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"Q\n" +
 	"\x17ProcessDocumentResponse\x126\n" +
-	"\bentities\x18\x01 \x03(\v2\x1a.ingestion.ExtractedEntityR\bentities\"\xc3\x03\n" +
+	"\bentities\x18\x01 \x03(\v2\x1a.ingestion.ExtractedEntityR\bentities\"\xec\x03\n" +
 	"\x0fExtractedEntity\x12\x1f\n" +
 	"\ventity_type\x18\x01 \x01(\tR\n" +
 	"entityType\x12!\n" +
@@ -483,7 +491,8 @@ const file_ingestion_proto_rawDesc = "" +
 	" \x01(\x01R\n" +
 	"confidence\x12#\n" +
 	"\rsource_format\x18\v \x01(\tR\fsourceFormat\x12%\n" +
-	"\x0eentity_subtype\x18\f \x01(\tR\rentitySubtype\"W\n" +
+	"\x0eentity_subtype\x18\f \x01(\tR\rentitySubtype\x12'\n" +
+	"\x0ftransaction_ref\x18\r \x01(\tR\x0etransactionRef\"W\n" +
 	"\vBoundingBox\x12\f\n" +
 	"\x01x\x18\x01 \x01(\x01R\x01x\x12\f\n" +
 	"\x01y\x18\x02 \x01(\x01R\x01y\x12\x14\n" +
