@@ -102,6 +102,24 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
 /// Map source columns to target fields using a column_map.
 /// `column_map`: target_field -> source_column
 /// Returns target_field -> value for matched columns.
+/// Resolve the amount for a row: use the column-map amount if present, else fall
+/// back to whichever of Debit/Credit is non-empty (double-entry GL exports).
+pub fn resolve_amount(mapped: &HashMap<String, String>, raw: &HashMap<String, String>) -> String {
+    if let Some(amt) = mapped.get("amount") {
+        if !amt.trim().is_empty() {
+            return amt.clone();
+        }
+    }
+    for key in ["Debit", "Credit", "debit", "credit"] {
+        if let Some(v) = raw.get(key) {
+            if !v.trim().is_empty() {
+                return v.clone();
+            }
+        }
+    }
+    String::new()
+}
+
 pub fn map_columns(
     data: &HashMap<String, String>,
     column_map: &HashMap<String, String>,
@@ -165,8 +183,11 @@ impl OcrBackend for CsvParser {
 
             let mapped = map_columns(&row_data, &self.column_map);
 
-            let raw_amount = mapped.get("amount").map(|s| s.as_str()).unwrap_or("0");
-            let amount_cents = parse_amount(raw_amount).unwrap_or(0);
+            // Double-entry CSV exports carry Debit + Credit columns; the column map
+            // points amount at one of them. If the mapped amount is empty but the
+            // OTHER side exists in the raw row, fall back to it (doc 08 §1).
+            let raw_amount = resolve_amount(&mapped, &row_data);
+            let amount_cents = parse_amount(&raw_amount).unwrap_or(0);
             let tx_date = mapped.get("date").and_then(|d| parse_date(d));
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
@@ -188,12 +209,37 @@ impl OcrBackend for CsvParser {
             });
         }
 
+        // Double-entry GL exports emit one row per side (debit AND credit for the
+        // same journal entry). Collapse pairs sharing (date, counterparty, abs
+        // amount) into one entity so the GL sums once, not twice.
+        entities = dedupe_gl_pairs(entities);
+
         Ok(ProcessDocumentResponse { entities })
     }
 
     fn name(&self) -> &'static str {
         "csv"
     }
+}
+
+/// Collapse debit/credit pairs in a GL export to one entity per journal entry.
+/// Two rows with the same date + counterparty + |amount| are one transaction.
+pub fn dedupe_gl_pairs(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for e in entities {
+        let key = format!(
+            "{:?}|{}|{}",
+            e.transaction_date,
+            e.counterparty.clone().unwrap_or_default(),
+            e.amount_cents.abs()
+        );
+        if seen.insert(key) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 // ── XLSX Parser ──
@@ -257,8 +303,11 @@ impl OcrBackend for XlsxParser {
 
             let mapped = map_columns(&row_data, &self.column_map);
 
-            let raw_amount = mapped.get("amount").map(|s| s.as_str()).unwrap_or("0");
-            let amount_cents = parse_amount(raw_amount).unwrap_or(0);
+            // Double-entry CSV exports carry Debit + Credit columns; the column map
+            // points amount at one of them. If the mapped amount is empty but the
+            // OTHER side exists in the raw row, fall back to it (doc 08 §1).
+            let raw_amount = resolve_amount(&mapped, &row_data);
+            let amount_cents = parse_amount(&raw_amount).unwrap_or(0);
             let tx_date = mapped.get("date").and_then(|d| parse_date(d));
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
@@ -507,5 +556,27 @@ mod tests {
     fn test_parse_date_ofx_timestamp() {
         assert_eq!(parse_date("20260606120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 6).unwrap()));
         assert_eq!(parse_date("20260608120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 8).unwrap()));
+    }
+
+    // Doc 08: double-entry GL debit+credit pairs collapse to one entity.
+    #[test]
+    fn test_dedupe_gl_pairs() {
+        let d = NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
+        let mk = |amt: i64| ExtractedEntity {
+            entity_type: "gl_entry".into(),
+            amount_cents: amt,
+            transaction_date: Some(d),
+            counterparty: Some("Acme".into()),
+            description: None,
+            gl_account_code: None,
+            currency: "USD".into(),
+            page_number: 1,
+            bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            confidence: 1.0,
+            source_format: "structured".into(),
+        };
+        let input = vec![mk(47125), mk(47125), mk(21500), mk(-21500)];
+        let out = dedupe_gl_pairs(input);
+        assert_eq!(out.len(), 2, "debit+credit pairs must collapse to one each");
     }
 }

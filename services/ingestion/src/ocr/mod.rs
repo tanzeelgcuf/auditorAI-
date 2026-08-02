@@ -37,6 +37,7 @@ pub struct ProcessDocumentRequest {
     pub storage_key: String,
     pub doc_type: String,  // "invoice", "bank_statement", "gl_export"
     pub client_book_id: Uuid,
+    pub column_map: std::collections::HashMap<String, String>, // per-book CSV mapping
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

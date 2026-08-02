@@ -3,6 +3,8 @@ syntax = "proto3";
 
 package ingestion;
 
+option go_package = "github.com/tanzeelgcuf/ai-auditor/services/api/genproto/ingestion";
+
 service IngestionService {
     rpc ProcessDocument(ProcessDocumentRequest) returns (ProcessDocumentResponse);
     rpc GetProcessingStatus(StatusRequest) returns (StatusResponse);
@@ -13,6 +15,7 @@ message ProcessDocumentRequest {
     string client_book_id = 2;
     string storage_key = 3;
     string doc_type = 4; // invoice | bank_statement | gl_export
+    map<string, string> column_map = 5; // per-book CSV column mapping (doc 08 §1)
 }
 
 message ProcessDocumentResponse {

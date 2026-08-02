@@ -127,6 +127,7 @@ impl IngestionService for IngestionServiceImpl {
             storage_key: req.storage_key.clone(),
             doc_type: req.doc_type.clone(),
             client_book_id,
+            column_map: req.column_map.clone(),
         };
 
         // Detect format by extension first; if ambiguous, content-sniff from S3
@@ -148,19 +149,23 @@ impl IngestionService for IngestionServiceImpl {
             }
         }
 
-        // Route to backend
-        let response = match Self::backend_key(format) {
-            Some(key) => {
-                if let Some(backend) = self.structured_backends.get(key) {
-                    backend.process(&process_req).await.map_err(ocr_error_to_status)
-                } else {
-                    self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)
-                }
+        // Route to backend. Structured formats use a per-request backend so the
+        // book's CSV column mapping (doc 08 §1) is applied; OCR uses the singleton.
+        let response = match format {
+            DetectedFormat::Csv => {
+                let backend = crate::ocr::structured::CsvParser::new(
+                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
+                backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
-            None => {
-                self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)
+            DetectedFormat::Xlsx => {
+                let backend = crate::ocr::structured::XlsxParser::new(
+                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
+                backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
-        }?;
+            _ => {
+                self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)?
+            }
+        };
 
         let entities: Vec<GrpcExtractedEntity> =
             response.entities.iter().map(Self::convert_entity).collect();

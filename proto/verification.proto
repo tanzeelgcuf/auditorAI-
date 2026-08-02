@@ -3,6 +3,8 @@ syntax = "proto3";
 
 package verification;
 
+option go_package = "github.com/tanzeelgcuf/ai-auditor/services/api/genproto/verification";
+
 service VerificationService {
     rpc EvaluateReconciliation(ReconciliationRequest) returns (ReconciliationResult);
     rpc BatchEvaluate(BatchReconciliationRequest) returns (BatchReconciliationResult);

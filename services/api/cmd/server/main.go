@@ -97,11 +97,32 @@ func main() {
 	docSvc := documents.NewService()
 	docSvc.SetDB(pool)
 	docSvc.SetPipeline(pipelineClient)
-	if st, err := storage.New(); err == nil {
-		_ = st.EnsureBucketExists(ctx)
-		docSvc.SetStorage(st)
+	var st *storage.Client
+	if sc, err := storage.New(); err == nil {
+		_ = sc.EnsureBucketExists(ctx)
+		docSvc.SetStorage(sc)
+		st = sc
 	} else {
 		slog.Warn("storage (MinIO/S3) unavailable — uploads limited", "error", err)
+	}
+
+	// Pipeline coordinator: consumes document.uploaded -> ingestion gRPC ->
+	// extracted_entities -> entity.extraction.requested (doc 12 §1).
+	if pipelineClient != nil && st != nil {
+		if ingURL := os.Getenv("INGESTION_GRPC_ADDR"); ingURL != "" {
+			coord, err := pipeline.NewCoordinator(os.Getenv("NATS_URL"), ingURL, pool, st)
+			if err != nil {
+				slog.Warn("pipeline coordinator unavailable", "error", err)
+			} else {
+				go func() {
+					if err := coord.Run(ctx); err != nil {
+						slog.Error("pipeline coordinator stopped", "error", err)
+					}
+				}()
+			}
+		} else {
+			slog.Warn("INGESTION_GRPC_ADDR unset — coordinator not started")
+		}
 	}
 
 	entitySvc := entities.NewService()
