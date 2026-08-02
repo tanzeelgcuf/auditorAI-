@@ -257,6 +257,30 @@ mod tests {
         assert!(result.exceeds_tolerance);
     }
 
+    #[test]
+    fn test_riverside_row2_variance() {
+        // Riverside Design Co. row 2 (Round 7 eval): bank -89900, GL +89400,
+        // invoice +89900. Three-way variance = 500¢ (inv-gl and bank-gl differ),
+        // tolerance 100¢. 500 = 5× tolerance (≤ 10×) => low severity, exceeds.
+        let result = evaluate_rules(&ReconciliationInput {
+            variance_cents: 500,
+            tolerance_cents: 100,
+        });
+        assert_eq!(result.severity, "low");
+        assert!(result.exceeds_tolerance);
+    }
+
+    #[test]
+    fn test_riverside_row1_zero_variance() {
+        // Row 1 (many-to-many): invoices 34250+12875 = 47125 = bank = GL, 0¢ gap.
+        let result = evaluate_rules(&ReconciliationInput {
+            variance_cents: 0,
+            tolerance_cents: 100,
+        });
+        assert_eq!(result.severity, "info");
+        assert!(!result.exceeds_tolerance);
+    }
+
     // ---- rule_version tests ----
 
     #[test]

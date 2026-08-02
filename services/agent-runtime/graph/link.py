@@ -15,7 +15,21 @@ logger = structlog.get_logger()
 
 MAX_GROUP_SIZE = 5
 DATE_WINDOW_DAYS = 3
+# Invoices are dated when issued; payment lands later (net terms). So an
+# invoice may legitimately PRECEDE its payment by days-to-weeks, but can never
+# FOLLOW it. INVOICE_LOOKBACK_DAYS widens the candidate window for invoices
+# before the payment; _dates_match keeps enforcing the tight 3-day window for
+# same-side legs (invoice↔invoice = the affected rows stay real). The rejection
+# for invoice-after-payment is an asymmetric cap that catches a real matching
+# error (doc 11 Round 5) without admitting spurious dates.
+INVOICE_LOOKBACK_DAYS = 14
 COUNTERPARTY_THRESHOLD = 0.80
+# Pass-5 mismatch detection: bank↔GL same date/cp but amounts disagree. Only flag
+# it when the disagreement is a plausible POSTING ERROR (small relative gap), not
+# two unrelated transactions with the same counterparty that happen to share a
+# date. 50% of the larger amount is the ceiling — a receivable posted for less
+# than half its value is a different transaction, not a typo.
+MISMATCH_RATIO = 0.50
 
 
 def _entity_key(e: ExtractedEntity) -> tuple:
@@ -33,10 +47,21 @@ def _amounts_match(a: int, b: int, tolerance: int) -> bool:
 
 
 def _dates_match(a: Optional[date], b: Optional[date]) -> bool:
-    """Check if two dates are within the matching window."""
+    """Check if two dates are within the matching window.
+
+    a is the invoice date, b the payment date. Same-side legs (invoice↔invoice,
+    bank↔bank, GL↔GL) use the tight symmetric window; an invoice may precede its
+    payment (net terms) by up to INVOICE_LOOKBACK_DAYS but never follow it.
+    """
     if a is None or b is None:
         return True  # no date = don't filter out
-    return abs((a - b).days) <= DATE_WINDOW_DAYS
+    delta = (b - a).days
+    if delta < 0:  # payment before invoice — impossible
+        return False
+    if delta <= DATE_WINDOW_DAYS:  # tight window, exact-ish
+        return True
+    # invoice precedes payment by more than the tight window — allow net terms
+    return delta <= INVOICE_LOOKBACK_DAYS and a <= b
 
 
 def _counterparties_match(a: Optional[str], b: Optional[str]) -> bool:
@@ -235,6 +260,52 @@ def build_candidate_groups(
                 status="needs_review",
             ))
 
+    # Pass 5: same-date+counterparty bank↔GL pair whose AMOUNTS DO NOT MATCH.
+    # The bank leg and GL leg describe the same real transaction (same date,
+    # same counterparty) but differ in amount — e.g. a posting error left a
+    # receivable recorded at 89400 when the bank cleared 89900. This is a
+    # discrepancy a human must see, NOT a silent "unmatched". Mark it mismatch=True
+    # so score_and_route routes it to needs_review regardless of the (hair-thin)
+    # confidence threshold, and the verification tier computes the variance and
+    # flags severity (doc 12 §2 / Round 5). Pass 4 already covered matching
+    # pairs; this pass catches the mismatch case it would have dropped.
+    for bank in banks:
+        for gl in gls:
+            if _amounts_match(bank.amount_cents, gl.amount_cents, config.tolerance_cents):
+                continue  # already covered by pass 4
+            if not _dates_match(bank.transaction_date, gl.transaction_date):
+                continue
+            if not _counterparties_match(bank.counterparty, gl.counterparty):
+                continue
+            # Bound the mismatch to plausible posting errors: the two amounts must
+            # be within MISMATCH_RATIO of each other (89900 vs 89400 ✓, 99999 vs
+            # 11111 ✗ — different transactions). Prevents flagging unrelated
+            # same-cp/same-date pairs as discrepancies.
+            larger = max(abs(bank.amount_cents), abs(gl.amount_cents))
+            smaller = min(abs(bank.amount_cents), abs(gl.amount_cents))
+            if smaller == 0 or (larger - smaller) / larger > MISMATCH_RATIO:
+                continue
+            # Attach any invoice legs that match the bank side (same cp, date,
+            # and amount) — e.g. BCH-2291 $899.00 sits against bank -89900 while
+            # GL mis-posted 89400. The invoice belongs in the group so the
+            # verification tier sees the full 3-way variance, not a dangling
+            # 2-member pair with an orphaned invoice (doc 12 §2).
+            attached_invs = [
+                inv.id for inv in invoices
+                if _counterparties_match(inv.counterparty, bank.counterparty)
+                and _dates_match(inv.transaction_date, bank.transaction_date)
+                and _amounts_match(inv.amount_cents, bank.amount_cents, config.tolerance_cents)
+            ]
+            candidates.append(ReconciliationGroup(
+                client_book_id=config.id,
+                invoice_entity_ids=attached_invs,
+                bank_entity_ids=[bank.id],
+                gl_entity_ids=[gl.id],
+                link_confidence=0.0,
+                status="needs_review",
+                mismatch=True,
+            ))
+
     return _deduplicate_candidates(candidates)
 
 
@@ -286,6 +357,18 @@ def score_and_route(
 
         score = _score_group(invs, banks, gls, config, is_exact)
         group.link_confidence = round(score, 4)
+
+        # Pass-5 discrepancy candidates are mismatch BY CONSTRUCTION — the bank
+        # and GL legs are the same real transaction whose amounts disagree. Route
+        # them straight to needs_review regardless of confidence: a hair-thin
+        # score drop (e.g. 0.4976 vs floor 0.50 from a trailing "." in a
+        # counterparty) must not bury a real discrepancy as "unmatched".
+        if group.mismatch:
+            group.status = "needs_review"
+            needs_review.append(group)
+            for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:
+                matched_ids.add(str(eid))
+            continue
 
         if score >= config.auto_link_threshold:
             group.status = "auto_linked"

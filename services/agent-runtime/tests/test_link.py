@@ -171,13 +171,22 @@ def test_date_outside_window():
     gl = make_entity("gl_entry", 50000, date(2026, 6, 10), "Acme Corp")
 
     auto, review, unmatched = run_link([inv], [bank], [gl])
-    # The invoice (6/1) is 9 days from bank/GL (6/10) — outside the 3-day window,
-    # so the invoice must NOT link. But bank+GL (same date, matching amount) form
-    # a valid 2-member group (doc 09 §1 — groups need not have all three legs).
-    # The far-dated invoice stays unmatched.
-    assert len(auto) == 1, "bank+GL should auto-link as a 2-member group"
-    assert auto[0].invoice_entity_ids == [], "invoice must not join the group"
-    assert any(str(e.id) == str(inv.id) for e in unmatched), "invoice stays unmatched"
+    # Invoice 6/1 is 9 days before payment 6/10 — within INVOICE_LOOKBACK_DAYS (14),
+    # so the invoice legitimately joins (net terms: issued before paid). This is
+    # the real-world case the 3-leg reconciliation proved (INV-1001 5 days out).
+    assert len(auto) == 1, "bank+GL auto-link as a 2-member group"
+    assert len(auto[0].invoice_entity_ids) == 1, "invoice within lookback joins the group"
+
+def test_date_beyond_lookback():
+    inv = make_entity("invoice_line_item", 50000, date(2026, 6, 1), "Acme Corp")
+    bank = make_entity("bank_transaction", 50000, date(2026, 6, 20), "Acme Corp")
+    gl = make_entity("gl_entry", 50000, date(2026, 6, 20), "Acme Corp")
+
+    auto, review, unmatched = run_link([inv], [bank], [gl])
+    # Invoice 6/1 is 19 days before payment — beyond the 14-day lookback. Still
+    # links (amount matches) but stays unmatched as a distinct 2-member group
+    # without the stale invoice.
+    assert any(str(e.id) == str(inv.id) for e in unmatched), "invoice beyond lookback stays unmatched"
 
 
 # ---- credit notes / negative amounts ----
@@ -242,3 +251,51 @@ def test_cross_link_node_sets_state():
     assert "groups" in result
     assert len(result["groups"]) >= 1
     assert "unmatched" in result
+
+# ---- Riverside Design Co. 3-leg reconciliation (real-document eval, Round 7) ----
+# Locks the exact rows the real extraction set proved: row 1 is a many-to-many
+# (2 invoices sum to one bank+GL payment), row 2 is a full 3-member mismatch the
+# verification tier must flag (bank -89900 vs GL 89400, invoice 89900).
+
+RIVERSIDE_CONFIG = BookConfig(id=BOOK_ID, tolerance_cents=100)
+
+def test_riverside_row1_many_to_many_3leg():
+    inv1 = make_entity("invoice_line_item", 34250, date(2026, 6, 1), "ACME OFFICE SUPPLY CO")
+    inv2 = make_entity("invoice_line_item", 12875, date(2026, 6, 5), "ACME OFFICE SUPPLY CO")
+    bank = make_entity("bank_transaction", -47125, date(2026, 6, 6), "ACME OFFICE SUPPLY CO")
+    gl = make_entity("gl_entry", 47125, date(2026, 6, 6), "Acme Office Supplies Co.")
+
+    auto, review, unmatched = run_link([inv1, inv2], [bank], [gl], RIVERSIDE_CONFIG)
+    # INV-1001 (5 days back) must join via the invoice lookback; sum = 47125 matches bank/GL.
+    assert len(auto) == 1
+    group = auto[0]
+    assert group.invoice_entity_ids == [inv1.id, inv2.id]
+    assert bank.id in group.bank_entity_ids
+    assert gl.id in group.gl_entity_ids
+
+def test_riverside_row2_mismatch_surfaces_as_review():
+    inv = make_entity("invoice_line_item", 89900, date(2026, 6, 8), "BRIGHT CLOUD HOSTING INC")
+    bank = make_entity("bank_transaction", -89900, date(2026, 6, 8), "BRIGHT CLOUD HOSTING INC")
+    gl = make_entity("gl_entry", 89400, date(2026, 6, 8), "Bright Cloud Hosting Inc.")
+
+    auto, review, unmatched = run_link([inv], [bank], [gl], RIVERSIDE_CONFIG)
+    # The bank/GL disagree by 500¢ (> 100 tolerance) — must surface as needs_review,
+    # NOT auto-link and NOT silently unmatched. The invoice joins so verification
+    # sees the full 3-way variance.
+    assert len(review) == 1
+    group = review[0]
+    assert group.mismatch is True
+    assert inv.id in group.invoice_entity_ids
+    assert bank.id in group.bank_entity_ids
+    assert gl.id in group.gl_entity_ids
+    assert all(e.id not in [x.id for x in unmatched] for e in [inv, bank, gl])
+
+def test_riverside_unrelated_amounts_not_mismatch():
+    # Same date/cp but wildly different amounts (9x) — unrelated transactions,
+    # pass-5 must NOT flag them as a discrepancy.
+    bank = make_entity("bank_transaction", -99999, date(2026, 6, 1), "Acme Corp")
+    gl = make_entity("gl_entry", 11111, date(2026, 6, 1), "Acme Corp")
+    auto, review, unmatched = run_link([], [bank], [gl], RIVERSIDE_CONFIG)
+    assert len(review) == 0
+    assert len(auto) == 0
+    assert len(unmatched) == 2

@@ -62,6 +62,7 @@ class ReconciliationGroup(BaseModel):
     gl_entity_ids: List[UUID] = Field(default_factory=list)
     link_confidence: float = 0.0
     status: str = "needs_review"  # auto_linked, needs_review, unmatched
+    mismatch: bool = False  # pass-5 provenance: bank↔GL same-date/cp but amounts differ
 
 
 class BookConfig(BaseModel):
