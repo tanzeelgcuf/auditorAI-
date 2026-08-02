@@ -134,9 +134,11 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request", "invalid body")
 		return
 	}
-	if len(req.InvoiceIDs) == 0 || len(req.BankIDs) == 0 || len(req.GLIDs) == 0 {
+	// Doc 09: groups need not have all three legs (bank+GL only is valid — deposits,
+	// fees). At least bank+GL required; invoice may be empty.
+	if len(req.BankIDs) == 0 || len(req.GLIDs) == 0 {
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request",
-			"invoice_ids, bank_ids, gl_ids all required")
+			"bank_ids and gl_ids required (invoice_ids optional)")
 		return
 	}
 	if req.Status == "" {
@@ -161,11 +163,20 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 	}
 	defer tx.Rollback(r.Context())
 
-	// Determine the book from the first entity (all must be same book — verified by RLS).
+	// Determine the book from the first entity present (invoice, else bank, else GL)
+	// — all must be same book (verified by RLS).
+	firstID := ""
+	if len(req.InvoiceIDs) > 0 {
+		firstID = req.InvoiceIDs[0]
+	} else if len(req.BankIDs) > 0 {
+		firstID = req.BankIDs[0]
+	} else {
+		firstID = req.GLIDs[0]
+	}
 	var bookID string
 	err = tx.QueryRow(r.Context(),
 		"SELECT client_book_id::text FROM extracted_entities WHERE id = $1",
-		req.InvoiceIDs[0]).Scan(&bookID)
+		firstID).Scan(&bookID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "entity not found")
