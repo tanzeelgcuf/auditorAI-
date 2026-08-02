@@ -23,8 +23,13 @@ def _entity_key(e: ExtractedEntity) -> tuple:
 
 
 def _amounts_match(a: int, b: int, tolerance: int) -> bool:
-    """Check if two amounts match within tolerance (cents)."""
-    return abs(a - b) <= tolerance
+    """Check if two amounts match within tolerance (cents).
+
+    Compares absolute values: bank transactions are debits (negative) while GL
+    entries are credits (positive) for the same underlying transaction — the
+    sign is a side convention, not a different amount.
+    """
+    return abs(abs(a) - abs(b)) <= tolerance
 
 
 def _dates_match(a: Optional[date], b: Optional[date]) -> bool:
@@ -84,15 +89,19 @@ def _score_group(
     total_bank = sum(e.amount_cents for e in bank_entities)
     total_gl = sum(e.amount_cents for e in gl_entities)
 
-    # Amount match score (0.5)
-    amounts = [total_inv, total_bank, total_gl]
-    max_amt = max(abs(a) for a in amounts) if any(amounts) else 1
-    variances = [
-        abs(total_inv - total_bank),
-        abs(total_inv - total_gl),
-        abs(total_bank - total_gl),
-    ]
-    avg_variance = sum(variances) / len(variances)
+    # Amount match score (0.5). Compare only PRESENT legs — a 2-member group
+    # (bank+GL, no invoice) must not be penalized by the absent invoice leg.
+    present = [("inv", total_inv), ("bank", total_bank), ("gl", total_gl)]
+    amounts = [abs(v) for _, v in present if v != 0]
+    max_amt = max(amounts) if amounts else 1
+    variances = []
+    for i in range(len(present)):
+        for j in range(i + 1, len(present)):
+            li, vi = present[i]
+            lj, vj = present[j]
+            if vi != 0 and vj != 0:
+                variances.append(abs(vi - vj))
+    avg_variance = sum(variances) / len(variances) if variances else 0.0
     amount_score = max(0.0, 1.0 - (avg_variance / max_amt)) if max_amt > 0 else 0.0
 
     # Date proximity (0.2)
@@ -206,6 +215,26 @@ def build_candidate_groups(
                                 status="needs_review",
                             ))
 
+    # Pass 4: bank+GL two-member groups — transactions with no invoice leg
+    # (deposits, bank fees) still reconcile bank against GL (doc 09 §1: a
+    # group need not have all three legs).
+    for bank in banks:
+        for gl in gls:
+            if not _dates_match(bank.transaction_date, gl.transaction_date):
+                continue
+            if not _counterparties_match(bank.counterparty, gl.counterparty):
+                continue
+            if not _amounts_match(bank.amount_cents, gl.amount_cents, config.tolerance_cents):
+                continue
+            candidates.append(ReconciliationGroup(
+                client_book_id=config.id,
+                invoice_entity_ids=[],
+                bank_entity_ids=[bank.id],
+                gl_entity_ids=[gl.id],
+                link_confidence=0.0,
+                status="needs_review",
+            ))
+
     return _deduplicate_candidates(candidates)
 
 
@@ -238,16 +267,21 @@ def score_and_route(
         banks = [e for e in banks if e is not None]
         gls = [e for e in gls if e is not None]
 
-        if not invs or not banks or not gls:
+        # Skip groups with no present legs at all, but ALLOW 2-member groups
+        # (bank+GL, no invoice leg — deposits, bank fees).
+        if not banks or not gls:
             continue
 
         inv_total = sum(e.amount_cents for e in invs)
         bank_total = sum(e.amount_cents for e in banks)
         gl_total = sum(e.amount_cents for e in gls)
-        # Exact = all three grouped totals match within tolerance (any group size)
-        is_exact = (
-            _amounts_match(inv_total, bank_total, config.tolerance_cents)
-            and _amounts_match(inv_total, gl_total, config.tolerance_cents)
+        # Exact = every PRESENT leg matches within tolerance (abs — sign is a
+        # convention). A 2-member group (bank+GL, no invoice) is exact when the
+        # two match; a 3-member group needs all three.
+        present_totals = [t for t in (inv_total, bank_total, gl_total) if t != 0]
+        is_exact = len(present_totals) >= 2 and all(
+            _amounts_match(present_totals[0], t, config.tolerance_cents)
+            for t in present_totals[1:]
         )
 
         score = _score_group(invs, banks, gls, config, is_exact)
@@ -274,17 +308,22 @@ def score_and_route(
 
 
 def _deduplicate_candidates(candidates: List[ReconciliationGroup]) -> List[ReconciliationGroup]:
-    """Remove duplicate candidates (same entity ID sets)."""
-    seen = set()
-    unique = []
+    """Remove duplicate candidates.
+
+    When a bank+GL pair is covered by BOTH a full 3-leg group (with invoice) and a
+    2-member group (no invoice), prefer the fuller 3-leg group — it captures the
+    many-to-many case. Key by the bank+GL entity set so 2-member groups don't
+    duplicate a full group for the same legs.
+    """
+    by_legs: dict = {}
     for c in candidates:
-        key = frozenset(
-            list(c.invoice_entity_ids) + list(c.bank_entity_ids) + list(c.gl_entity_ids)
-        )
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-    return unique
+        # Key = (bank ids, gl ids) — the legs that identify "these transactions reconcile".
+        key = (tuple(sorted(str(x) for x in c.bank_entity_ids)),
+               tuple(sorted(str(x) for x in c.gl_entity_ids)))
+        existing = by_legs.get(key)
+        if existing is None or len(c.invoice_entity_ids) > len(existing.invoice_entity_ids):
+            by_legs[key] = c
+    return list(by_legs.values())
 
 
 def _combo_dates_within_window(entities: List[ExtractedEntity]) -> bool:

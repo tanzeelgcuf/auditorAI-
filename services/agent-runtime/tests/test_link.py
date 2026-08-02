@@ -171,8 +171,13 @@ def test_date_outside_window():
     gl = make_entity("gl_entry", 50000, date(2026, 6, 10), "Acme Corp")
 
     auto, review, unmatched = run_link([inv], [bank], [gl])
-    # Dates 9 days apart — outside 3-day window; amounts match though.
-    assert len(auto) == 0
+    # The invoice (6/1) is 9 days from bank/GL (6/10) — outside the 3-day window,
+    # so the invoice must NOT link. But bank+GL (same date, matching amount) form
+    # a valid 2-member group (doc 09 §1 — groups need not have all three legs).
+    # The far-dated invoice stays unmatched.
+    assert len(auto) == 1, "bank+GL should auto-link as a 2-member group"
+    assert auto[0].invoice_entity_ids == [], "invoice must not join the group"
+    assert any(str(e.id) == str(inv.id) for e in unmatched), "invoice stays unmatched"
 
 
 # ---- credit notes / negative amounts ----
