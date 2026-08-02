@@ -265,3 +265,29 @@ def test_citation_ungrounded_when_wrong_amount_cited():
     # A cite pointing at $150.00 line when the total is $899.00 is ungrounded —
     # the user would highlight the wrong line.
     assert not _cited_total_is_grounded(["$150.00", "$749.00"], 89900)
+
+
+# ---- citation re-grounding (Round 7 / task #6) ----
+# The model's source_indices may cite boilerplate ("Net 15") that carries no
+# dollar value even when the total is correct. Deterministic re-grounding points
+# the citation at the raw entity whose text actually contains the total.
+
+def test_ground_citations_keeps_valid_cited():
+    from run_extraction import _ground_citations
+    texts = ["$342.50", "$342.50", "$250.00", "Net 15"]
+    # Cited [0, 1] already carry the total -> preserved.
+    assert _ground_citations([0, 1], texts, 34250) == [0, 1]
+
+def test_ground_citations_repairs_boilerplate_cite():
+    from run_extraction import _ground_citations
+    texts = ["$128.75", "$128.75", "$128.75", "$5.15", "Net 15"]
+    # Cited [4] = "Net 15" has no dollar value -> re-point onto the $128.75 lines.
+    got = _ground_citations([4], texts, 12875)
+    assert 4 not in got
+    assert texts[got[0]] == "$128.75"
+
+def test_ground_citations_fallback_to_cited_when_no_total_on_page():
+    from run_extraction import _ground_citations
+    texts = ["$150.00", "$749.00"]
+    # No entity carries 89900 -> keep the model's citation (nothing better).
+    assert _ground_citations([0], texts, 89900) == [0]

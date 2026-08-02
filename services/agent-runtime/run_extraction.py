@@ -36,11 +36,11 @@ For THIS page, identify the ONE invoice it contains and return:
 - invoice_date: YYYY-MM-DD
 - total_amount_raw: the invoice TOTAL as a string ===EXACTLY as it appears in the
   Raw OCR entries below===. It MUST be one of the dollar-value strings you actually
-  see in the entries (e.g. "$215.00", "342.50"). NEVER copy the example below,
-  never invent a number, never convert to cents, never multiply by 100, never
-  scale — copy the digits/symbols you see verbatim. That conversion is done
-  deterministically elsewhere, not by you. If none of the entries clearly look
-  like the invoice TOTAL, return null.
+  see in the entries. NEVER copy any example below, never invent a number,
+  never convert to cents, never multiply by 100, never scale — copy the
+  digits/symbols you see verbatim. That conversion is done deterministically
+  elsewhere, not by you. If none of the entries clearly look like the invoice
+  TOTAL, return null.
 - line_item_descriptions: list of the 1-3 line item descriptions present
 - source_indices: the zero-based indices (into the raw list I give you) that
   SUPPORT the total amount — i.e. which raw OCR entries contain the total or its
@@ -75,6 +75,19 @@ def _raw_to_cents(value):
         return int(round(float(s) * 100)) if "." in s else int(s or 0)
     except ValueError:
         return 0
+
+
+def _ground_citations(cited, texts, total_cents):
+    """Deterministically re-point source_indices onto raw entities whose text
+    actually carries the reported total. The model's index selection is not
+    reliable (may cite boilerplate like 'Net 15' that has no dollar value);
+    keep its cited indices only if they already resolve to a total-bearing
+    line, else override with the total-bearing entities on the page. Falls back
+    to the model's citation if none carry the total (nothing better to offer)."""
+    grounded = [i for i in cited if i < len(texts) and _raw_to_cents(texts[i]) == total_cents]
+    if not grounded:
+        grounded = [i for i, t in enumerate(texts) if _raw_to_cents(t) == total_cents][:3]
+    return grounded or cited
 
 
 def main():
@@ -117,7 +130,16 @@ def main():
             # Deterministic conversion of the verbatim raw string (doc 13) — the
             # model must NOT do this arithmetic; mirror _parse_amount_cents.
             data["total_amount"] = _raw_to_cents(data.get("total_amount_raw", ""))
-            data["source_texts"] = [texts[i] for i in data.get("source_indices", [])[:3]]
+            # Citation grounding (Round 7): the model's source_indices are not
+            # reliable — it may cite boilerplate ("Net 15") that contains no
+            # dollar value even when it gets the amount right. Deterministically
+            # re-ground the citation onto the raw entity whose text actually
+            # contains the reported total, so the PDF highlight points at the
+            # real total line. Preserve the model's cited indices only if they
+            # already resolve to a total-bearing line.
+            data["source_indices"] = _ground_citations(
+                data.get("source_indices", [])[:3], texts, data["total_amount"])
+            data["source_texts"] = [texts[i] for i in data["source_indices"]][:3]
             results.append(data)
             print(f"PAGE {page}: {data['invoice_number']} total={data['total_amount']} vendor={data['vendor_name'][:30]}")
         except Exception as e:
