@@ -56,8 +56,7 @@ impl DoctrBackend {
     pub async fn new(sidecar_url: &str) -> Result<Self, OcrError> {
         let client = Client::new();
 
-        let config = aws_config::load_from_env().await;
-        let s3_client = Arc::new(aws_sdk_s3::Client::new(&config));
+        let s3_client = Arc::new(crate::ocr::structured::build_s3_client().await);
         let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
 
         Ok(Self {

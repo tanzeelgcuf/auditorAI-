@@ -29,6 +29,15 @@ func NewEventClient(natsURL string) (*EventClient, error) {
 		nc.Close()
 		return nil, err
 	}
+	// Ensure the pipeline stream exists (idempotent) so publishes never fail with
+	// "no response from stream" on a fresh NATS instance.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:      "DOCUMENTS",
+		Subjects:  []string{"document.uploaded", "document.processing.failed", "ingestion.completed", "entity.extraction.requested"},
+		Retention: jetstream.WorkQueuePolicy,
+	})
 	return &EventClient{nc: nc, js: js}, nil
 }
 

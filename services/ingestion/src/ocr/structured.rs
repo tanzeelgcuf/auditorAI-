@@ -1,6 +1,7 @@
 use super::{ExtractedEntity, BoundingBox, OcrBackend, OcrError, ProcessDocumentRequest, ProcessDocumentResponse};
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use calamine::{open_workbook_from_rs, DataType, Reader, Xlsx};
 use chrono::{Datelike, NaiveDate};
 use csv::ReaderBuilder;
@@ -8,6 +9,23 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+
+// ── S3 client with MinIO path-style support ──
+
+/// Build an S3 client that works against both MinIO (path-style, custom endpoint)
+/// and AWS. Reads AWS_ENDPOINT_URL / AWS_REGION / credentials from env.
+pub(crate) async fn build_s3_client() -> S3Client {
+    let config = aws_config::load_from_env().await;
+    let mut b = S3ConfigBuilder::from(&config);
+    b.set_force_path_style(Some(true));
+    b.set_region(Some(Region::new("us-east-1")));
+    if let Ok(ep) = std::env::var("AWS_ENDPOINT_URL") {
+        if !ep.is_empty() {
+            b.set_endpoint_url(Some(ep));
+        }
+    }
+    S3Client::from_conf(b.build())
+}
 
 // ── S3 download helper ──
 
@@ -57,6 +75,12 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
     if s.is_empty() {
         return None;
     }
+    // OFX timestamps are YYYYMMDDHHMMSS (14 chars) — take the date portion.
+    let s = if s.len() >= 8 && s.chars().all(|c| c.is_ascii_digit()) && s.len() >= 14 {
+        &s[..8]
+    } else {
+        s
+    };
     let fmts = &[
         "%Y-%m-%d",
         "%m/%d/%Y",
@@ -315,7 +339,8 @@ impl OcrBackend for OfxParser {
         let data = download_from_s3(&self.s3_client, &self.bucket, &request.storage_key).await?;
         let content = String::from_utf8_lossy(&data);
 
-        let stmt_trn_re = Regex::new(r"<STMTTRN>(.*?)</STMTTRN>")
+        // (?s) = dotall: STMTTRN blocks span multiple lines; `.` must match \n.
+        let stmt_trn_re = Regex::new(r"(?s)<STMTTRN>(.*?)</STMTTRN>")
             .map_err(|e| OcrError::ParsingError(format!("ofx regex: {e}")))?;
 
         let tag_re = Regex::new(r"<(\w+)>([^<]*)")
@@ -447,5 +472,40 @@ mod tests {
         assert_eq!(mapped.get("date").unwrap(), "2024-01-15");
         assert_eq!(mapped.get("amount").unwrap(), "150.00");
         assert!(mapped.get("description").is_none());
+    }
+
+    // Doc 08 §1: real Riverside GL headers (Debit/Credit) require the per-book
+    // column mapping to extract amounts. Debit or Credit non-empty => amount.
+    #[test]
+    fn test_map_columns_riverside_gl() {
+        let mut data = HashMap::new();
+        data.insert("Date".to_string(), "06/06/2026".to_string());
+        data.insert("Transaction Type".to_string(), "Bill Payment".to_string());
+        data.insert("Num".to_string(), "10456".to_string());
+        data.insert("Name".to_string(), "Acme Office Supplies Co.".to_string());
+        data.insert("Memo".to_string(), "Payment - INV-1001, INV-1002".to_string());
+        data.insert("Account".to_string(), "Accounts Payable".to_string());
+        data.insert("Debit".to_string(), "471.25".to_string());
+        data.insert("Credit".to_string(), "".to_string());
+
+        let mut col_map = HashMap::new();
+        col_map.insert("date".to_string(), "Date".to_string());
+        col_map.insert("amount".to_string(), "Debit".to_string());
+        col_map.insert("counterparty".to_string(), "Name".to_string());
+        col_map.insert("description".to_string(), "Memo".to_string());
+        col_map.insert("account_code".to_string(), "Account".to_string());
+
+        let mapped = map_columns(&data, &col_map);
+        assert_eq!(mapped.get("amount").unwrap(), "471.25");
+        assert_eq!(parse_amount(mapped.get("amount").unwrap()).unwrap(), 47125);
+        assert_eq!(mapped.get("counterparty").unwrap(), "Acme Office Supplies Co.");
+        assert_eq!(parse_date(mapped.get("date").unwrap()).unwrap(), NaiveDate::from_ymd_opt(2026, 6, 6).unwrap());
+    }
+
+    // OFX timestamps are YYYYMMDDHHMMSS — parse_date must take the date portion.
+    #[test]
+    fn test_parse_date_ofx_timestamp() {
+        assert_eq!(parse_date("20260606120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 6).unwrap()));
+        assert_eq!(parse_date("20260608120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 8).unwrap()));
     }
 }
