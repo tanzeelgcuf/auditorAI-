@@ -234,3 +234,34 @@ def test_classify_leaves_standard_alone():
     state["classified_entities"] = [e]
     result = classify_entities(state, None)
     assert result["classified_entities"][0].entity_subtype == "standard"
+
+
+# ---- citation grounding (Round 7 / task #6) ----
+# A cited source index must resolve to a raw OCR entity carrying the total
+# amount. A correct amount with a wrong citation is worse than a wrong amount —
+# it looks trustworthy until a user clicks it (the whole traceability feature).
+def _cited_total_is_grounded(cited_texts, want_cents):
+    for src in cited_texts:
+        digits = "".join(c for c in src if c.isdigit())
+        if digits and abs(int(digits) - want_cents) < 5:
+            return True
+    return False
+
+
+def test_citation_grounded_when_total_cited():
+    # Page 3 eval: cites address + $899.00 + $899.00. Grounded because the
+    # $899.00 lines carry the total (89900) even though the address is noise.
+    assert _cited_total_is_grounded(
+        ["900 Cirrus Park Drive, Austin, TX 78701", "$899.00", "$899.00"], 89900)
+
+
+def test_citation_ungrounded_when_no_amount_cited():
+    # Page 2 failure mode: model cited only "Net 15" — no dollar amount. The
+    # citation gives the user nothing to verify; must flag as ungrounded.
+    assert not _cited_total_is_grounded(["Net 15"], 12875)
+
+
+def test_citation_ungrounded_when_wrong_amount_cited():
+    # A cite pointing at $150.00 line when the total is $899.00 is ungrounded —
+    # the user would highlight the wrong line.
+    assert not _cited_total_is_grounded(["$150.00", "$749.00"], 89900)

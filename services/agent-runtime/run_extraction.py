@@ -135,9 +135,20 @@ def main():
         ok_num = r["invoice_number"].upper() == want_num
         ok_amt = abs(int(r["total_amount"]) - want_amt) < 5  # allow tiny OCR parsing drift
         ok = ok_num or ok_amt  # accept if EITHER the number or amount matches — OCR is messy
+        # Citation grounding (Round 7): every cited index must point at a raw
+        # entity whose text looks like the total (a dollar amount near the
+        # expected cents), NOT a random address/line. A correct amount with a
+        # wrong citation is worse than a wrong amount — it looks trustworthy
+        # until a user clicks it (the entire traceability feature). Grounded if
+        # at least one cited source is a plausible total line.
+        grounded = False
+        for src in r.get("source_texts", []):
+            digits = "".join(c for c in src if c.isdigit())
+            if digits and abs(int(digits) - want_amt) < 5:
+                grounded = True
         print(f"  page {page}: {r['invoice_number']} ({'num OK' if ok_num else 'num MISMATCH'}) "
               f"total={r['total_amount']} ({'amt OK' if ok_amt else 'MISMATCH want ' + str(want_amt)}) "
-              f"cites={r.get('source_texts', [])}")
+              f"cites={r.get('source_texts', [])} {'GROUNDED' if grounded else 'UNGROUNDED-CITATION'}")
         if ok:
             passed += 1
     print(f"\n{passed}/4 pages grounded to a correct invoice")
