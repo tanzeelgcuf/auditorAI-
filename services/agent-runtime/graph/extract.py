@@ -25,9 +25,9 @@ For each item, return a JSON object with fields:
 - entity_type: "invoice_line_item" | "bank_transaction" | "gl_entry"
 - entity_subtype: "standard" | "credit_note" | "refund" | "void"
 - amount_raw: the amount EXACTLY as it appears in the OCR/Data context below,
-  as a string. MUST be a value you actually see there — never copy the example
-  (e.g. "342.50", "1,500.00", "-45.00", "215" are SHAPE examples only, and
-  "342.50"/"215" are examples of a SHAPE, not values present in the input).
+  as a string. MUST be a value you actually see THERE — hundreds/thousands may
+  vary. The examples above ("1,500.00", "-45.00") are SHAPE illustrations, not
+  values that appear in the input; never copy them.
   Include the sign for credits/refunds.
   NEVER multiply, scale, convert, or compute — copy the digits and symbols verbatim.
 - currency: ISO code
@@ -41,8 +41,8 @@ CRITICAL RULES:
   conversions. You must NOT convert a dollar amount to cents — that is arithmetic
   and is done elsewhere, not by you.
 - Return amount_raw as the literal text/symbols you see in the OCR/Data context.
-  If "$342.50" appears there, it stays "$342.50". Never output a dollar string
-  that is not in the context.
+  If a dollar symbol is present, include it; otherwise return the digits as-is.
+  Never output a dollar string that is not in the context.
 - If you see a total, return it as-is without summing line items to verify.
 - Preserve sign: credit notes / refunds are negative in amount_raw (e.g. "-45.00").
 - Do not reconcile or judge — extraction only.
