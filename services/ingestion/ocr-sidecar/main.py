@@ -11,6 +11,18 @@ from typing import List, Dict, Any
 
 app = FastAPI(title="docTR OCR Sidecar")
 
+
+def _as_geometry(g):
+    """Convert docTR geometry to a 4-corner nested list [[x1,y1],[x2,y2],[x3,y3],[x4,y4]].
+    docTR returns 2-point geometry (top-left, bottom-right); the ingestion contract
+    expects 4 corners. Tolerant of numpy arrays or tuples."""
+    pts = [[float(c) for c in p] for p in g]
+    if len(pts) == 2:
+        # [[x1,y1],[x2,y2]] -> top-left, top-right, bottom-right, bottom-left
+        (x1, y1), (x2, y2) = pts[0], pts[1]
+        return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+    return pts
+
 # Initialize docTR predictor
 predictor = ocr_predictor(pretrained=True, detect_language=True)
 
@@ -77,15 +89,15 @@ async def process_document(request: Dict[str, Any]):
 
             for block in page.blocks:
                 block_data = {
-                    "geometry": block.geometry.tolist(),  # 4 corners [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                    "confidence": float(block.confidence),
+                    "geometry": _as_geometry(block.geometry),  # 4 corners [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                    "confidence": float(getattr(block, "objectness_score", 1.0)),
                     "lines": []
                 }
 
                 for line in block.lines:
                     line_data = {
-                        "geometry": line.geometry.tolist(),
-                        "confidence": float(line.confidence),
+                        "geometry": _as_geometry(line.geometry),
+                        "confidence": float(getattr(line, "objectness_score", 1.0)),
                         "words": []
                     }
 
@@ -93,7 +105,7 @@ async def process_document(request: Dict[str, Any]):
                         line_data["words"].append({
                             "value": word.value,
                             "confidence": float(word.confidence),
-                            "geometry": word.geometry.tolist(),
+                            "geometry": _as_geometry(word.geometry),
                         })
 
                     block_data["lines"].append(line_data)

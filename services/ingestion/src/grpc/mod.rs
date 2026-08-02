@@ -19,6 +19,18 @@ use ingestion_service::{
     ProcessDocumentResponse as GrpcProcessResponse,
 };
 
+/// True if a path's extension is a definitive OCR media type (PDF/image) that
+/// must not be content-sniffed.
+fn is_image_or_pdf(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".tiff")
+        || lower.ends_with(".bmp")
+}
+
 fn ocr_error_to_status(e: OcrError) -> Status {
     match e {
         OcrError::NotFound(msg) => Status::not_found(msg),
@@ -130,9 +142,11 @@ impl IngestionService for IngestionServiceImpl {
             column_map: req.column_map.clone(),
         };
 
-        // Detect format by extension first; if ambiguous, content-sniff from S3
+        // Detect format by extension first; content-sniff ONLY for extensions that
+        // are not a definitive OCR media type. A .pdf/.png/.jpg is unambiguously OCR
+        // and must not be sniffed into CSV by a stray comma in the PDF binary.
         let mut format = FormatDetector::from_extension(&req.storage_key);
-        if format == DetectedFormat::Ocr {
+        if format == DetectedFormat::Ocr && !is_image_or_pdf(&req.storage_key) {
             // download first bytes for content sniff
             match crate::ocr::structured::download_from_s3(
                 &self.s3_client,

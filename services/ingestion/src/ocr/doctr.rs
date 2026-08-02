@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct DoctrRequest {
-    document_url: String,
+    storage_key: String,
     doc_type: String,
 }
 
@@ -172,13 +172,12 @@ impl DoctrBackend {
 #[async_trait]
 impl OcrBackend for DoctrBackend {
     async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
-        let doc_url = self.generate_presigned_url(&request.storage_key)?;
-
+        // The sidecar downloads the object itself via storage_key (S3-compatible).
         let resp = self
             .client
-            .post(&format!("{}/ocr", self.base_url))
+            .post(&format!("{}/ocr/process", self.base_url))
             .json(&DoctrRequest {
-                document_url: doc_url,
+                storage_key: request.storage_key.clone(),
                 doc_type: request.doc_type.clone(),
             })
             .send()
