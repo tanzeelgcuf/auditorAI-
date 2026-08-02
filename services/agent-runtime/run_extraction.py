@@ -34,10 +34,13 @@ For THIS page, identify the ONE invoice it contains and return:
 - vendor_name: the vendor from the address/header
 - invoice_number: e.g. "INV-1001"
 - invoice_date: YYYY-MM-DD
-- total_amount_raw: the invoice TOTAL as a string EXACTLY as it appears on the
-  page (e.g. "342.50", "$342.50", "1,500.00"). NEVER convert to cents, never
-  multiply by 100, never scale — copy the digits/symbols verbatim. That
-  conversion is done deterministically elsewhere, not by you.
+- total_amount_raw: the invoice TOTAL as a string ===EXACTLY as it appears in the
+  Raw OCR entries below===. It MUST be one of the dollar-value strings you actually
+  see in the entries (e.g. "$215.00", "342.50"). NEVER copy the example below,
+  never invent a number, never convert to cents, never multiply by 100, never
+  scale — copy the digits/symbols you see verbatim. That conversion is done
+  deterministically elsewhere, not by you. If none of the entries clearly look
+  like the invoice TOTAL, return null.
 - line_item_descriptions: list of the 1-3 line item descriptions present
 - source_indices: the zero-based indices (into the raw list I give you) that
   SUPPORT the total amount — i.e. which raw OCR entries contain the total or its
@@ -50,7 +53,8 @@ CRITICAL CONSTRAINTS:
 - If an invoice has a credit/negative line, report total as-is; don't net it.
 - Return ONLY a JSON object, no prose:
 {{"vendor_name": "...", "invoice_number": "...", "invoice_date": "...",
- "total_amount_raw": "342.50", "line_item_descriptions": [...], "source_indices": [0,1,2]}}
+ "total_amount_raw": "<a dollar string you saw in the entries>",
+ "line_item_descriptions": [...], "source_indices": [0,1,2]}}
 
 Raw OCR entries (zero-based index -> text):
 {entries}

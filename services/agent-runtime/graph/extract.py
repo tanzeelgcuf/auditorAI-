@@ -24,8 +24,11 @@ EXTRACTION_PROMPT_TEMPLATE = """Extract structured entities from the OCR/structu
 For each item, return a JSON object with fields:
 - entity_type: "invoice_line_item" | "bank_transaction" | "gl_entry"
 - entity_subtype: "standard" | "credit_note" | "refund" | "void"
-- amount_raw: the amount EXACTLY as it appears on the page, as a string
-  (e.g. "342.50", "1,500.00", "-45.00", "215"). Include the sign for credits/refunds.
+- amount_raw: the amount EXACTLY as it appears in the OCR/Data context below,
+  as a string. MUST be a value you actually see there — never copy the example
+  (e.g. "342.50", "1,500.00", "-45.00", "215" are SHAPE examples only, and
+  "342.50"/"215" are examples of a SHAPE, not values present in the input).
+  Include the sign for credits/refunds.
   NEVER multiply, scale, convert, or compute — copy the digits and symbols verbatim.
 - currency: ISO code
 - transaction_date: "YYYY-MM-DD" or null
@@ -37,7 +40,9 @@ CRITICAL RULES:
 - Extract raw values ONLY. NEVER calculate totals, sums, variances, OR unit
   conversions. You must NOT convert a dollar amount to cents — that is arithmetic
   and is done elsewhere, not by you.
-- Return amount_raw as the literal text/symbols you see. "$342.50" stays "$342.50".
+- Return amount_raw as the literal text/symbols you see in the OCR/Data context.
+  If "$342.50" appears there, it stays "$342.50". Never output a dollar string
+  that is not in the context.
 - If you see a total, return it as-is without summing line items to verify.
 - Preserve sign: credit notes / refunds are negative in amount_raw (e.g. "-45.00").
 - Do not reconcile or judge — extraction only.
