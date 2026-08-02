@@ -98,6 +98,29 @@ def test_parse_amount_garbage():
     assert _parse_amount_cents("N/A") == 0
 
 
+# ---- fixture eval set (doc 13 / Round 7) ----
+# Lock the 4 real invoice totals from invoices_batch_june2026.pdf. The extraction
+# contract outputs amount_raw (verbatim page string); the deterministic parser
+# converts. Asserting these exact cents catches a regression in either the
+# contract or the parser before it silently drifts — the permanent eval guard.
+def test_invoice_fixture_raw_strings_convert_exactly():
+    fixtures = {
+        "342.50": 34250,   # INV-1001
+        "128.75": 12875,   # INV-1002
+        "899.00": 89900,   # BCH-2291
+        "215.00": 21500,   # MP-5502
+        "$342.50": 34250,  # with symbol
+        "1,500.00": 150000,  # comma-thousands
+    }
+    for raw, want in fixtures.items():
+        assert _parse_amount_cents(raw) == want, f"{raw!r} -> {_parse_amount_cents(raw)}, want {want}"
+
+
+def test_parse_raw_string_negative():
+    assert _parse_amount_cents("-45.00") == -4500
+    assert _parse_amount_cents("-342.50") == -34250
+
+
 # ---- extract_entities ----
 
 def test_extract_entities_calls_llm_and_parses():
