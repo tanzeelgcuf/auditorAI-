@@ -6,8 +6,17 @@ import { Shell } from "../../../../components/layout/shell";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../../components/ui/card";
 import { Badge } from "../../../../components/ui/badge";
 import { Dropzone } from "../../../../components/upload/dropzone";
-import { useUploadDocument, useDocuments } from "../../../../lib/hooks";
+import { ColumnMapping } from "../../../../components/upload/column-mapping";
+import { useUploadDocument, useDocuments, useCsvMappings, useCreateCsvMapping } from "../../../../lib/hooks";
 import { formatDate } from "../../../../lib/utils";
+
+// Pending column-mapping gate for one file awaiting user confirmation.
+// `rest` holds the other dropped files, uploaded after the mapping is saved.
+interface PendingMapping {
+  file: File;
+  headers: string[];
+  rest: File[];
+}
 
 function docTypeBadge(docType: string) {
   const map: Record<string, { label: string; variant: "info" | "default" }> = {
@@ -30,24 +39,62 @@ function ocrStatusBadge(status: string) {
   return <Badge variant={m.variant}>{m.label}</Badge>;
 }
 
+const CSV_RE = /\.csv$/i;
+
+// ponytail: header-row detection is CSV-only; reading XLSX headers client-side
+// needs a spreadsheet lib (SheetJS). Add when/if XLSX export formats appear.
+/** Read the first non-empty line of a CSV file client-side (doc 08 §1). */
+async function readCsvHeaders(file: File): Promise<string[]> {
+  const text = await file.text();
+  const first = text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "";
+  return first.split(",").map((h) => h.replace(/^"|"$/g, "").trim()).filter(Boolean);
+}
+
 export default function UploadPage() {
   const params = useParams();
   const bookId = String(params.bookId);
   const upload = useUploadDocument(bookId);
   const { data: docs } = useDocuments(bookId);
+  const { data: mappings } = useCsvMappings(bookId);
+  const createMapping = useCreateCsvMapping(bookId);
   const [uploadingFiles, setUploadingFiles] = useState<{ name: string; status: string }[]>([]);
+  const [pending, setPending] = useState<PendingMapping | null>(null);
+
+  const hasMapping = (mappings ?? []).length > 0;
+
+  async function uploadOne(file: File) {
+    await upload.mutateAsync({
+      file,
+      idempotencyKey: `upload-${file.name}-${Date.now()}`,
+    });
+  }
 
   async function handleFiles(files: File[]) {
+    // CSV with no stored mapping for this book: parse the header row and ask
+    // the user to confirm the column map before anything uploads.
+    const unmapped = files.filter((f) => CSV_RE.test(f.name) && !hasMapping);
+    if (unmapped.length > 0) {
+      // Prompt for the first unmapped CSV; upload the rest once mapping persists.
+      const first = unmapped[0];
+      const headers = await readCsvHeaders(first);
+      setPending({
+        file: first,
+        headers,
+        rest: files.filter((f) => f !== first),
+      });
+      return;
+    }
+    await runUploads(files);
+  }
+
+  async function runUploads(files: File[]) {
     setUploadingFiles(files.map((f) => ({ name: f.name, status: "queued" })));
     for (const file of files) {
       setUploadingFiles((prev) =>
         prev.map((f) => (f.name === file.name ? { ...f, status: "uploading" } : f)),
       );
       try {
-        await upload.mutateAsync({
-          file,
-          idempotencyKey: `upload-${file.name}-${Date.now()}`,
-        });
+        await uploadOne(file);
         setUploadingFiles((prev) =>
           prev.map((f) => (f.name === file.name ? { ...f, status: "done" } : f)),
         );
@@ -59,11 +106,30 @@ export default function UploadPage() {
     }
   }
 
+  async function handleMappingConfirm(columnMap: Record<string, string>) {
+    if (!pending) return;
+    await createMapping.mutateAsync({ source_system: "manual_upload", column_map: columnMap });
+    const file = pending.file;
+    const rest = pending.rest;
+    setPending(null);
+    await runUploads([file, ...rest]);
+  }
+
   return (
     <Shell>
       <h1 className="mb-6 text-2xl font-semibold text-slate-900">Upload Documents</h1>
 
       <Dropzone onFiles={handleFiles} uploading={uploadingFiles.some((f) => f.status === "uploading")} />
+
+      {pending && (
+        <ColumnMapping
+          fileName={pending.file.name}
+          headers={pending.headers}
+          onConfirm={handleMappingConfirm}
+          onCancel={() => setPending(null)}
+          submitting={createMapping.isPending}
+        />
+      )}
 
       {uploadingFiles.length > 0 && (
         <Card className="mt-6">

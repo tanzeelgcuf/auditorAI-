@@ -112,6 +112,90 @@ export function useUpdateBookSettings(bookId: string) {
   });
 }
 
+// ---- csv column mappings ----
+export interface CsvColumnMapping {
+  id: string;
+  client_book_id: string;
+  source_system: string;
+  column_map: Record<string, string>; // target field -> source column
+  created_at: string;
+}
+
+export const TARGET_FIELDS = ["date", "amount", "debit", "credit", "counterparty", "account", "transaction_ref"] as const;
+
+/** Normalize header/target names for matching. */
+function norm(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Auto-suggest a detected source column for a target field (doc 08 §1).
+ * Normalized substring/equality match against a per-field alias list.
+ */
+function suggestField(field: string, headerNames: string[]): string {
+  const f = norm(field);
+  const aliases: Record<string, string[]> = {
+    date: ["date", "courant"],
+    amount: ["amount", "amt", "value", "total"],
+    debit: ["debit", "dr", "db"],
+    credit: ["credit", "cr", "cd"],
+    counterparty: ["counterparty", "vendor", "supplier", "payee", "customer", "name", "description"],
+    account: ["account", "gl", "code", "category"],
+    transaction_ref: ["ref", "reference", "trans", "check", "invoice"],
+  };
+  const fieldAliases = aliases[field] ?? [];
+
+  for (const h of headerNames) {
+    const hn = norm(h);
+    if (hn === f) return h;
+    for (const a of fieldAliases) {
+      const aa = norm(a);
+      if (hn === aa || hn.includes(aa) || aa.includes(hn)) return h;
+    }
+  }
+  // transaction_ref: invoice/check + no/num
+  if (field === "transaction_ref") {
+    for (const h of headerNames) {
+      const hn = norm(h);
+      if (/\d+/.test(hn) && /(invoice|check|ref|no|num)/.test(hn)) return h;
+    }
+  }
+  return "";
+}
+
+/** Build an initial column_map with auto-suggested source headers. */
+export function suggestColumnMap(headerNames: string[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const t of TARGET_FIELDS) map[t] = suggestField(t, headerNames);
+  return map;
+}
+
+export function useCsvMappings(bookId: string) {
+  return useQuery({
+    queryKey: ["csv-mappings", bookId],
+    queryFn: () => api.get<CsvColumnMapping[]>(`/v1/books/${bookId}/csv-mappings`),
+    enabled: !!bookId,
+  });
+}
+
+export function useCreateCsvMapping(bookId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { source_system: string; column_map: Record<string, string> }) =>
+      api.post<CsvColumnMapping>(`/v1/books/${bookId}/csv-mappings`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["csv-mappings", bookId] }),
+  });
+}
+
+export function useUpdateCsvMapping(bookId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ mappingId, body }: { mappingId: string; body: { column_map: Record<string, string> } }) =>
+      api.put<CsvColumnMapping>(`/v1/books/${bookId}/csv-mappings/${mappingId}`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["csv-mappings", bookId] }),
+  });
+}
+
 // ---- documents ----
 export function useDocuments(bookId: string, cursor?: string | null) {
   return useQuery({

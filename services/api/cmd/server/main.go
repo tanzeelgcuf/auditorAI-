@@ -24,6 +24,7 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/billing"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/documents"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/email"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/entities"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/findings"
@@ -90,6 +91,7 @@ func main() {
 	// Initialize services
 	authSvc := auth.NewService()
 	authSvc.SetDB(pool)
+	authSvc.SetEmailSender(email.NewResend())
 
 	tenantSvc := tenant.NewService()
 	tenantSvc.SetDB(pool)

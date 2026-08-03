@@ -21,6 +21,8 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/argon2"
+
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/email"
 )
 
 type Service struct {
@@ -29,6 +31,7 @@ type Service struct {
 	accessTTL    time.Duration
 	refreshTTL   time.Duration
 	deniedTokens sync.Map
+	emailSender  email.EmailSender
 }
 
 type Claims struct {
@@ -60,6 +63,10 @@ func NewService() *Service {
 
 func (s *Service) SetDB(db *pgxpool.Pool) {
 	s.db = db
+}
+
+func (s *Service) SetEmailSender(sender email.EmailSender) {
+	s.emailSender = sender
 }
 
 // HashPassword uses Argon2id
@@ -285,6 +292,24 @@ func (s *Service) HandleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send verification email (async fire-and-forget is fine; the user will see
+	// the same message regardless, and the token is already stored).
+	if s.emailSender != nil {
+		verifyURL := fmt.Sprintf("%s/verify-email?token=%s&user_id=%s", os.Getenv("APP_BASE_URL"), tokenHex, userID)
+		if verifyURL == "/verify-email?token="+tokenHex+"&user_id="+userID {
+			verifyURL = fmt.Sprintf("https://auditor.app/verify-email?token=%s&user_id=%s", tokenHex, userID)
+		}
+		html, _ := email.Render(email.VerifyEmailTemplate, email.TemplateData{
+			VerifyURL:       verifyURL,
+			FirmName:        req.FirmName,
+			UserName:        req.Email,
+			ExpirationHours: 48,
+		})
+		if err := s.emailSender.Send(r.Context(), req.Email, "Verify your AI Auditor account", html); err != nil {
+			slog.Error("failed to send verification email", "error", err, "email", req.Email)
+		}
+	}
+
 	slog.Info("user signed up", "user_id", userID, "firm_id", firmID, "email", req.Email)
 	writeJSON(w, http.StatusCreated, map[string]string{"message": "Signup initiated, check email"})
 }
@@ -466,6 +491,23 @@ func (s *Service) HandleForgotPassword(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to store reset token", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
+	}
+
+	// Send reset email (fire-and-forget; token already stored).
+	if s.emailSender != nil {
+		resetURL := fmt.Sprintf("%s/reset-password?token=%s&user_id=%s", os.Getenv("APP_BASE_URL"), tokenHex, req.Email)
+		if resetURL == "/reset-password?token="+tokenHex+"&user_id="+req.Email {
+			resetURL = fmt.Sprintf("https://auditor.app/reset-password?token=%s&user_id=%s", tokenHex, req.Email)
+		}
+		html, _ := email.Render(email.ResetPasswordTemplate, email.TemplateData{
+			ResetURL:        resetURL,
+			FirmName:        "AI Auditor",
+			UserName:        req.Email,
+			ExpirationHours: 1,
+		})
+		if err := s.emailSender.Send(r.Context(), req.Email, "Reset your AI Auditor password", html); err != nil {
+			slog.Error("failed to send reset email", "error", err, "email", req.Email)
+		}
 	}
 
 	// Always return same message regardless of whether email exists (anti-enumeration)

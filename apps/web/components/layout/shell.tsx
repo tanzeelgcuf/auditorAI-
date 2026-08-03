@@ -28,6 +28,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
     ? [
         { href: `/books/${bookId}/documents`, label: "Documents" },
         { href: `/books/${bookId}/upload`, label: "Upload" },
+        { href: `/books/${bookId}/csv-mapping`, label: "CSV Mapping" },
         { href: `/books/${bookId}/review-queue`, label: "Review Queue" },
         { href: `/books/${bookId}/reports/${"latest"}`, label: "Reports" },
       ]
