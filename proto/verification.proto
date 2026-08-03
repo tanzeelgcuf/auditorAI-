@@ -16,6 +16,9 @@ message ReconciliationRequest {
     int64 bank_amount_cents = 3;
     int64 gl_amount_cents = 4;
     int32 tolerance_cents = 5;
+    bool has_invoice = 6; // leg present (false => exclude from variance)
+    bool has_bank = 7;
+    bool has_gl = 8;
 }
 
 message ReconciliationResult {
@@ -38,6 +41,9 @@ message GroupReconciliation {
     int64 bank_total_cents = 3;
     int64 gl_total_cents = 4;
     int32 tolerance_cents = 5;
+    bool has_invoice = 6; // leg present (false => exclude from variance)
+    bool has_bank = 7;
+    bool has_gl = 8;
 }
 
 message BatchReconciliationResult {

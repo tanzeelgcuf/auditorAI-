@@ -29,13 +29,21 @@ func NewEventClient(natsURL string) (*EventClient, error) {
 		nc.Close()
 		return nil, err
 	}
-	// Ensure the pipeline stream exists (idempotent) so publishes never fail with
-	// "no response from stream" on a fresh NATS instance.
+	// Ensure the pipeline streams exist (idempotent) so publishes never fail
+	// with "no response from stream" on a fresh NATS instance. DOCUMENTS is a
+	// WorkQueue (single-consumer: the coordinator). Verification lives on its
+	// own stream because a WorkQueue allows only one consumer, and the verify
+	// worker is a second consumer.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:      "DOCUMENTS",
 		Subjects:  []string{"document.uploaded", "document.processing.failed", "ingestion.completed", "entity.extraction.requested"},
+		Retention: jetstream.WorkQueuePolicy,
+	})
+	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:      "VERIFY",
+		Subjects:  []string{"verification.requested"},
 		Retention: jetstream.WorkQueuePolicy,
 	})
 	return &EventClient{nc: nc, js: js}, nil
@@ -88,4 +96,9 @@ func (e *EventClient) RequestVerification(ctx context.Context, groupID, clientBo
 	defer cancel()
 	_, err = e.js.Publish(ctx, "verification.requested", payload)
 	return err
+}
+
+// PublishVerification satisfies mcp.VerificationPublisher.
+func (e *EventClient) PublishVerification(ctx context.Context, groupID, clientBookID string) error {
+	return e.RequestVerification(ctx, groupID, clientBookID)
 }

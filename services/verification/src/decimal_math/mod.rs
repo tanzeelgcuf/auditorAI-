@@ -64,20 +64,31 @@ pub fn compute_greater_of_tolerance(
 
 /// Grouped tolerance: sum each group, then check variance across groups.
 /// For 3-way reconciliation: invoice_total vs bank_total vs gl_total.
+///
+/// A leg may be absent (e.g. a deposit group is bank+GL only — doc 09). An
+/// absent leg contributes nothing: comparing it as 0 would inflate |0-bank| to
+/// the full bank amount and flag a balanced 2-leg group. Only variances between
+/// PRESENT legs are computed; absent legs are excluded.
 pub fn compute_three_way_variance(
     invoice_group: &[Decimal],
     bank_group: &[Decimal],
     gl_group: &[Decimal],
-) -> MathResult<(Decimal, Decimal, Decimal)> {
-    let inv_sum = sum(invoice_group)?;
-    let bank_sum = sum(bank_group)?;
-    let gl_sum = sum(gl_group)?;
+) -> MathResult<Vec<Decimal>> {
+    let inv_sum = if invoice_group.is_empty() { None } else { Some(sum(invoice_group)?) };
+    let bank_sum = if bank_group.is_empty() { None } else { Some(sum(bank_group)?) };
+    let gl_sum = if gl_group.is_empty() { None } else { Some(sum(gl_group)?) };
 
-    let variance_ib = (inv_sum - bank_sum).abs();
-    let variance_igl = (inv_sum - gl_sum).abs();
-    let variance_bgl = (bank_sum - gl_sum).abs();
-
-    Ok((variance_ib, variance_igl, variance_bgl))
+    let mut variances = Vec::with_capacity(3);
+    if let (Some(a), Some(b)) = (inv_sum, bank_sum) {
+        variances.push((a - b).abs());
+    }
+    if let (Some(a), Some(b)) = (inv_sum, gl_sum) {
+        variances.push((a - b).abs());
+    }
+    if let (Some(a), Some(b)) = (bank_sum, gl_sum) {
+        variances.push((a - b).abs());
+    }
+    Ok(variances)
 }
 
 /// Format a human-readable calculation formula string.
@@ -290,10 +301,8 @@ mod tests {
         let bank = [dec!(150.00)];
         let gl = [dec!(150.00)];
 
-        let (ib, igl, bgl) = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
-        assert_eq!(ib, Decimal::ZERO);
-        assert_eq!(igl, Decimal::ZERO);
-        assert_eq!(bgl, Decimal::ZERO);
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![Decimal::ZERO, Decimal::ZERO, Decimal::ZERO]);
     }
 
     #[test]
@@ -302,10 +311,8 @@ mod tests {
         let bank = [dec!(99.50)];
         let gl = [dec!(100.00)];
 
-        let (ib, igl, bgl) = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
-        assert_eq!(ib, dec!(0.50));
-        assert_eq!(igl, Decimal::ZERO);
-        assert_eq!(bgl, dec!(0.50));
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(0.50), Decimal::ZERO, dec!(0.50)]);
     }
 
     #[test]
@@ -314,10 +321,8 @@ mod tests {
         let bank = [dec!(90.00)];
         let gl = [dec!(80.00)];
 
-        let (ib, igl, bgl) = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
-        assert_eq!(ib, dec!(10.00));
-        assert_eq!(igl, dec!(20.00));
-        assert_eq!(bgl, dec!(10.00));
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(10.00), dec!(20.00), dec!(10.00)]);
     }
 
     #[test]
@@ -326,18 +331,45 @@ mod tests {
         let bank = [dec!(50.00)];
         let gl = [dec!(0.00)];
 
-        let (ib, igl, bgl) = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
-        assert_eq!(ib, dec!(100.00));
-        assert_eq!(igl, dec!(50.00));
-        assert_eq!(bgl, dec!(50.00));
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(100.00), dec!(50.00), dec!(50.00)]);
     }
 
     #[test]
     fn test_three_way_empty_groups() {
-        let (ib, igl, bgl) = compute_three_way_variance(&[], &[], &[]).unwrap();
-        assert_eq!(ib, Decimal::ZERO);
-        assert_eq!(igl, Decimal::ZERO);
-        assert_eq!(bgl, Decimal::ZERO);
+        let v = compute_three_way_variance(&[], &[], &[]).unwrap();
+        assert_eq!(v, Vec::<Decimal>::new());
+    }
+
+    // Prompt 3 regression: a 2-leg group (bank+GL only, no invoice — deposits,
+    // fees, AR, doc 09) must not compare the absent invoice leg as 0. |0-bank|
+    // would inflate to the full bank amount and flag a balanced group. Variance
+    // must be computed only between present legs.
+    #[test]
+    fn test_two_leg_balanced_no_false_positive() {
+        let bank = [dec!(6200.00)];
+        let gl = [dec!(6200.00)];
+        // invoice leg absent -> empty slice
+        let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
+        // Only bank-gl variance, which is 0
+        assert_eq!(v, vec![Decimal::ZERO]);
+    }
+
+    #[test]
+    fn test_two_leg_balanced_with_invoice_present() {
+        let invoice = [dec!(6200.00)];
+        let bank = [dec!(6200.00)];
+        let gl = [dec!(6200.00)];
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![Decimal::ZERO, Decimal::ZERO, Decimal::ZERO]);
+    }
+
+    #[test]
+    fn test_two_leg_mismatch_detected() {
+        let bank = [dec!(6200.00)];
+        let gl = [dec!(6100.00)];
+        let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(100.00)]);
     }
 
     // ---- format_formula tests ----

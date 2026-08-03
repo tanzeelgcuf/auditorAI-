@@ -5,6 +5,7 @@ package mcp
 // get_book_tolerance.
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -14,13 +15,23 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 )
 
+// VerificationPublisher publishes verification.requested after a group is
+// linked, so the verify worker (pipeline.VerifyWorker) evaluates it and writes
+// a finding. Injected by main.go; nil-safe (MCP works without NATS).
+type VerificationPublisher interface {
+	PublishVerification(ctx context.Context, groupID, clientBookID string) error
+}
+
 type Service struct {
-	db *pgxpool.Pool
+	db            *pgxpool.Pool
+	verifyPub     VerificationPublisher
 }
 
 func NewService() *Service { return &Service{} }
 
 func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
+
+func (s *Service) SetVerificationPublisher(p VerificationPublisher) { s.verifyPub = p }
 
 func writeProblem(w http.ResponseWriter, status int, typ, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
@@ -243,6 +254,14 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 	if err := tx.Commit(r.Context()); err != nil {
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "commit failed")
 		return
+	}
+
+	// Fire-and-forget: ask the verify worker to evaluate this group and write
+	// a finding (Prompt 3 wiring — verification.requested had no consumer).
+	if s.verifyPub != nil {
+		if err := s.verifyPub.PublishVerification(r.Context(), groupID, bookID); err != nil {
+			slog.Error("verification publish failed", "group", groupID, "error", err)
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{

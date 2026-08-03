@@ -127,6 +127,23 @@ func main() {
 		}
 	}
 
+	// Verification worker: consumes verification.requested -> loads group
+	// totals -> Rust gRPC -> writes audit_findings (Prompt 3 wiring).
+	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
+		if vURL := os.Getenv("VERIFICATION_GRPC_ADDR"); vURL != "" {
+			vw, err := pipeline.NewVerifyWorker(natsURL, vURL, pool)
+			if err != nil {
+				slog.Warn("verify worker unavailable", "error", err)
+			} else {
+				go func() {
+					if err := vw.Run(ctx); err != nil {
+						slog.Error("verify worker stopped", "error", err)
+					}
+				}()
+			}
+		}
+	}
+
 	entitySvc := entities.NewService()
 	entitySvc.SetDB(pool)
 	findingSvc := findings.NewService()
@@ -143,6 +160,9 @@ func main() {
 	billingSvc.SetDB(pool)
 	mcpSvc := mcp.NewService()
 	mcpSvc.SetDB(pool)
+	if pipelineClient != nil {
+		mcpSvc.SetVerificationPublisher(pipelineClient)
+	}
 
 	webhooksSvc := webhooks.NewService()
 	webhooksSvc.SetDB(pool)

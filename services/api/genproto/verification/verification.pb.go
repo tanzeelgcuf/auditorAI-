@@ -30,6 +30,9 @@ type ReconciliationRequest struct {
 	BankAmountCents    int64                  `protobuf:"varint,3,opt,name=bank_amount_cents,json=bankAmountCents,proto3" json:"bank_amount_cents,omitempty"`
 	GlAmountCents      int64                  `protobuf:"varint,4,opt,name=gl_amount_cents,json=glAmountCents,proto3" json:"gl_amount_cents,omitempty"`
 	ToleranceCents     int32                  `protobuf:"varint,5,opt,name=tolerance_cents,json=toleranceCents,proto3" json:"tolerance_cents,omitempty"`
+	HasInvoice         bool                   `protobuf:"varint,6,opt,name=has_invoice,json=hasInvoice,proto3" json:"has_invoice,omitempty"` // leg present (false => exclude from variance)
+	HasBank            bool                   `protobuf:"varint,7,opt,name=has_bank,json=hasBank,proto3" json:"has_bank,omitempty"`
+	HasGl              bool                   `protobuf:"varint,8,opt,name=has_gl,json=hasGl,proto3" json:"has_gl,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -97,6 +100,27 @@ func (x *ReconciliationRequest) GetToleranceCents() int32 {
 		return x.ToleranceCents
 	}
 	return 0
+}
+
+func (x *ReconciliationRequest) GetHasInvoice() bool {
+	if x != nil {
+		return x.HasInvoice
+	}
+	return false
+}
+
+func (x *ReconciliationRequest) GetHasBank() bool {
+	if x != nil {
+		return x.HasBank
+	}
+	return false
+}
+
+func (x *ReconciliationRequest) GetHasGl() bool {
+	if x != nil {
+		return x.HasGl
+	}
+	return false
 }
 
 type ReconciliationResult struct {
@@ -242,6 +266,9 @@ type GroupReconciliation struct {
 	BankTotalCents    int64                  `protobuf:"varint,3,opt,name=bank_total_cents,json=bankTotalCents,proto3" json:"bank_total_cents,omitempty"`
 	GlTotalCents      int64                  `protobuf:"varint,4,opt,name=gl_total_cents,json=glTotalCents,proto3" json:"gl_total_cents,omitempty"`
 	ToleranceCents    int32                  `protobuf:"varint,5,opt,name=tolerance_cents,json=toleranceCents,proto3" json:"tolerance_cents,omitempty"`
+	HasInvoice        bool                   `protobuf:"varint,6,opt,name=has_invoice,json=hasInvoice,proto3" json:"has_invoice,omitempty"` // leg present (false => exclude from variance)
+	HasBank           bool                   `protobuf:"varint,7,opt,name=has_bank,json=hasBank,proto3" json:"has_bank,omitempty"`
+	HasGl             bool                   `protobuf:"varint,8,opt,name=has_gl,json=hasGl,proto3" json:"has_gl,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -309,6 +336,27 @@ func (x *GroupReconciliation) GetToleranceCents() int32 {
 		return x.ToleranceCents
 	}
 	return 0
+}
+
+func (x *GroupReconciliation) GetHasInvoice() bool {
+	if x != nil {
+		return x.HasInvoice
+	}
+	return false
+}
+
+func (x *GroupReconciliation) GetHasBank() bool {
+	if x != nil {
+		return x.HasBank
+	}
+	return false
+}
+
+func (x *GroupReconciliation) GetHasGl() bool {
+	if x != nil {
+		return x.HasGl
+	}
+	return false
 }
 
 type BatchReconciliationResult struct {
@@ -451,13 +499,17 @@ var File_verification_proto protoreflect.FileDescriptor
 
 const file_verification_proto_rawDesc = "" +
 	"\n" +
-	"\x12verification.proto\x12\fverification\"\xec\x01\n" +
+	"\x12verification.proto\x12\fverification\"\xbf\x02\n" +
 	"\x15ReconciliationRequest\x12$\n" +
 	"\x0eclient_book_id\x18\x01 \x01(\tR\fclientBookId\x120\n" +
 	"\x14invoice_amount_cents\x18\x02 \x01(\x03R\x12invoiceAmountCents\x12*\n" +
 	"\x11bank_amount_cents\x18\x03 \x01(\x03R\x0fbankAmountCents\x12&\n" +
 	"\x0fgl_amount_cents\x18\x04 \x01(\x03R\rglAmountCents\x12'\n" +
-	"\x0ftolerance_cents\x18\x05 \x01(\x05R\x0etoleranceCents\"\xf3\x01\n" +
+	"\x0ftolerance_cents\x18\x05 \x01(\x05R\x0etoleranceCents\x12\x1f\n" +
+	"\vhas_invoice\x18\x06 \x01(\bR\n" +
+	"hasInvoice\x12\x19\n" +
+	"\bhas_bank\x18\a \x01(\bR\ahasBank\x12\x15\n" +
+	"\x06has_gl\x18\b \x01(\bR\x05hasGl\"\xf3\x01\n" +
 	"\x14ReconciliationResult\x12%\n" +
 	"\x0evariance_cents\x18\x01 \x01(\x03R\rvarianceCents\x12+\n" +
 	"\x11exceeds_tolerance\x18\x02 \x01(\bR\x10exceedsTolerance\x12/\n" +
@@ -467,13 +519,17 @@ const file_verification_proto_rawDesc = "" +
 	"\bseverity\x18\x06 \x01(\tR\bseverity\"}\n" +
 	"\x1aBatchReconciliationRequest\x12$\n" +
 	"\x0eclient_book_id\x18\x01 \x01(\tR\fclientBookId\x129\n" +
-	"\x06groups\x18\x02 \x03(\v2!.verification.GroupReconciliationR\x06groups\"\xd9\x01\n" +
+	"\x06groups\x18\x02 \x03(\v2!.verification.GroupReconciliationR\x06groups\"\xac\x02\n" +
 	"\x13GroupReconciliation\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\tR\agroupId\x12.\n" +
 	"\x13invoice_total_cents\x18\x02 \x01(\x03R\x11invoiceTotalCents\x12(\n" +
 	"\x10bank_total_cents\x18\x03 \x01(\x03R\x0ebankTotalCents\x12$\n" +
 	"\x0egl_total_cents\x18\x04 \x01(\x03R\fglTotalCents\x12'\n" +
-	"\x0ftolerance_cents\x18\x05 \x01(\x05R\x0etoleranceCents\"P\n" +
+	"\x0ftolerance_cents\x18\x05 \x01(\x05R\x0etoleranceCents\x12\x1f\n" +
+	"\vhas_invoice\x18\x06 \x01(\bR\n" +
+	"hasInvoice\x12\x19\n" +
+	"\bhas_bank\x18\a \x01(\bR\ahasBank\x12\x15\n" +
+	"\x06has_gl\x18\b \x01(\bR\x05hasGl\"P\n" +
 	"\x19BatchReconciliationResult\x123\n" +
 	"\aresults\x18\x01 \x03(\v2\x19.verification.GroupResultR\aresults\"\x85\x02\n" +
 	"\vGroupResult\x12\x19\n" +

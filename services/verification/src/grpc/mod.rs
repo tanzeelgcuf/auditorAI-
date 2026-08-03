@@ -38,24 +38,38 @@ impl VerificationServiceImpl {
         gl_total_cents: i64,
         tolerance_cents: i32,
         group_id: &str,
+        has_invoice: bool,
+        has_bank: bool,
+        has_gl: bool,
     ) -> Result<GrpcGroupResult, Status> {
-        // Convert to Decimal for arithmetic
-        let inv_dec = rust_decimal::Decimal::from_i64(inv_total_cents)
-            .ok_or_else(|| Status::invalid_argument("inv_total_cents overflow"))?;
-        let bank_dec = rust_decimal::Decimal::from_i64(bank_total_cents)
-            .ok_or_else(|| Status::invalid_argument("bank_total_cents overflow"))?;
-        let gl_dec = rust_decimal::Decimal::from_i64(gl_total_cents)
-            .ok_or_else(|| Status::invalid_argument("gl_total_cents overflow"))?;
+        // Convert to Decimal for arithmetic. Absent legs (has_X = false) are
+        // excluded from variance — comparing an absent leg as 0 would inflate
+        // |0-bank| to the full bank amount and flag balanced 2-leg groups.
+        let inv_group = if has_invoice {
+            vec![rust_decimal::Decimal::from_i64(inv_total_cents)
+                .ok_or_else(|| Status::invalid_argument("inv_total_cents overflow"))?]
+        } else { vec![] };
+        let bank_group = if has_bank {
+            vec![rust_decimal::Decimal::from_i64(bank_total_cents)
+                .ok_or_else(|| Status::invalid_argument("bank_total_cents overflow"))?]
+        } else { vec![] };
+        let gl_group = if has_gl {
+            vec![rust_decimal::Decimal::from_i64(gl_total_cents)
+                .ok_or_else(|| Status::invalid_argument("gl_total_cents overflow"))?]
+        } else { vec![] };
+        let inv_dec = inv_group.first().copied().unwrap_or_default();
+        let bank_dec = bank_group.first().copied().unwrap_or_default();
+        let gl_dec = gl_group.first().copied().unwrap_or_default();
 
-        // Compute three-way variance
-        let (vib, v_igl, v_bgl) = decimal_math::compute_three_way_variance(
-            &[inv_dec],
-            &[bank_dec],
-            &[gl_dec],
+        // Compute variance only over PRESENT legs.
+        let variances = decimal_math::compute_three_way_variance(
+            &inv_group,
+            &bank_group,
+            &gl_group,
         ).map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
 
-        // Find max variance across the 3 comparisons
-        let max_variance = vib.max(v_igl).max(v_bgl);
+        // Find max variance across the present-leg comparisons.
+        let max_variance = variances.iter().copied().fold(Decimal::ZERO, Decimal::max);
 
         // Convert max variance to cents for severity evaluation
         let variance_cents = max_variance.to_i64()
@@ -102,23 +116,35 @@ impl VerificationService for VerificationServiceImpl {
         let _client_book_id = Uuid::parse_str(&req.client_book_id)
             .map_err(|e| Status::invalid_argument(format!("invalid client_book_id: {}", e)))?;
 
-        // Convert to rust_decimal for processing
-        let invoice_amt = rust_decimal::Decimal::from_i64(req.invoice_amount_cents)
-            .ok_or_else(|| Status::invalid_argument("invoice_amount_cents overflow"))?;
-        let bank_amt = rust_decimal::Decimal::from_i64(req.bank_amount_cents)
-            .ok_or_else(|| Status::invalid_argument("bank_amount_cents overflow"))?;
-        let gl_amt = rust_decimal::Decimal::from_i64(req.gl_amount_cents)
-            .ok_or_else(|| Status::invalid_argument("gl_amount_cents overflow"))?;
+        // Convert to rust_decimal for processing. A leg is included only when
+        // the caller marks it present (has_invoice/has_bank/has_gl) — an absent
+        // leg (e.g. invoice on a bank+GL-only deposit group, doc 09) must not
+        // be compared as 0, or |0-bank| flags a balanced 2-leg group.
+        let invoice_group = if req.has_invoice {
+            vec![rust_decimal::Decimal::from_i64(req.invoice_amount_cents)
+                .ok_or_else(|| Status::invalid_argument("invoice_amount_cents overflow"))?]
+        } else { vec![] };
+        let bank_group = if req.has_bank {
+            vec![rust_decimal::Decimal::from_i64(req.bank_amount_cents)
+                .ok_or_else(|| Status::invalid_argument("bank_amount_cents overflow"))?]
+        } else { vec![] };
+        let gl_group = if req.has_gl {
+            vec![rust_decimal::Decimal::from_i64(req.gl_amount_cents)
+                .ok_or_else(|| Status::invalid_argument("gl_amount_cents overflow"))?]
+        } else { vec![] };
+        let invoice_amt = invoice_group.first().copied().unwrap_or_default();
+        let bank_amt = bank_group.first().copied().unwrap_or_default();
+        let gl_amt = gl_group.first().copied().unwrap_or_default();
 
-        // Compute three-way variance (gives us all pairwise variances at once)
-        let (vib, v_igl, v_bgl) = decimal_math::compute_three_way_variance(
-            &[invoice_amt],
-            &[bank_amt],
-            &[gl_amt],
+        // Compute variance only over PRESENT legs.
+        let variances = decimal_math::compute_three_way_variance(
+            &invoice_group,
+            &bank_group,
+            &gl_group,
         ).map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
 
-        // The max variance across the three comparisons
-        let max_variance = vib.max(v_igl).max(v_bgl);
+        // The max variance across the computed comparisons
+        let max_variance = variances.iter().copied().fold(Decimal::ZERO, Decimal::max);
 
         // Convert to cents for severity evaluation
         let variance_cents = max_variance.to_i64()
@@ -170,6 +196,9 @@ impl VerificationService for VerificationServiceImpl {
                 group.gl_total_cents,
                 group.tolerance_cents,
                 &group.group_id,
+                group.has_invoice,
+                group.has_bank,
+                group.has_gl,
             )?;
             results.push(result);
         }
@@ -203,6 +232,9 @@ mod tests {
             bank_amount_cents: bank,
             gl_amount_cents: gl,
             tolerance_cents: tolerance,
+            has_invoice: true,
+            has_bank: true,
+            has_gl: true,
         }
     }
 
@@ -219,6 +251,9 @@ mod tests {
             bank_total_cents: bank,
             gl_total_cents: gl,
             tolerance_cents: tolerance,
+            has_invoice: true,
+            has_bank: true,
+            has_gl: true,
         }
     }
 

@@ -51,14 +51,24 @@ async def process_batch(client, graph, mcp, batch_event: dict):
     }
 
     result = await graph.arun(state)
+    groups = result.get("groups", [])
     logger.info(
         "batch complete",
         client_book_id=client_book_id,
         batch_id=batch_id,
-        auto_linked=len([g for g in result.get("groups", []) if g.status == "auto_linked"]),
-        needs_review=len([g for g in result.get("groups", []) if g.status == "needs_review"]),
+        auto_linked=len([g for g in groups if g.status == "auto_linked"]),
+        needs_review=len([g for g in groups if g.status == "needs_review"]),
         errors=result.get("errors", []),
     )
+
+    # Persist cross-linked groups back to the API (Prompt 3: the pipeline
+    # dead-ended after extraction — groups were produced but never written).
+    if groups:
+        try:
+            written = await mcp.persist_groups(groups, client_book_id)
+            logger.info("groups persisted", client_book_id=client_book_id, written=written)
+        except Exception as e:
+            logger.error("group persistence failed", error=str(e))
 
 
 async def run_consumer():
