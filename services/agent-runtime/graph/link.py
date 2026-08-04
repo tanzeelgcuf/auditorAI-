@@ -23,7 +23,12 @@ DATE_WINDOW_DAYS = 3
 # for invoice-after-payment is an asymmetric cap that catches a real matching
 # error (doc 11 Round 5) without admitting spurious dates.
 INVOICE_LOOKBACK_DAYS = 14
-COUNTERPARTY_THRESHOLD = 0.80
+# Jaro-Winkler floor for two names to be "the same vendor". 0.80 admitted
+# confusable pairs (Stress Set #2: "Sunrise Landscaping & Grounds" vs "Sunrise
+# Landscape Maintenance" scored 0.87 and cross-linked). Correct pairs score
+# >=0.95; genuinely different vendors score <=0.87. 0.90 cleanly separates them
+# while Riverside/QBO exact-name pairs (>=0.99) are unaffected.
+COUNTERPARTY_THRESHOLD = 0.90
 # Pass-5 mismatch detection: bank↔GL same date/cp but amounts disagree. Only flag
 # it when the disagreement is a plausible POSTING ERROR (small relative gap), not
 # two unrelated transactions with the same counterparty that happen to share a
