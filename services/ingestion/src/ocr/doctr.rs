@@ -260,6 +260,46 @@ impl DoctrBackend {
         });
         candidates.first().map(|(_, d)| *d)
     }
+
+    /// Attach a counterparty (vendor name) by proximity/context — the same
+    /// principle as attach_date, for a field that isn't an amount.
+    ///
+    /// The vendor is the TOPMOST line in the block that plausibly names a party:
+    /// not a currency line (already an amount), not a date-bearing line, and not
+    /// boilerplate ("INVOICE", "Amount", "Qty", "Description", "Total", "Date",
+    /// "Due", "Bill To", "Customer", "PO Box", addresses/ZIPs). The header vendor
+    /// ("SUNRISE LANDSCAPE MAINTENANCE") is the first such line. This generalizes
+    /// across layouts — QBO exports and firm invoices put the vendor at the top
+    /// of the document header, not a fixed offset.
+    fn attach_counterparty(amount_text: &str, block_lines: &[(String, f32)]) -> Option<String> {
+        let skip = [
+            "invoice", "amount", "qty", "description", "total", "date", "due",
+            "bill to", "customer", "po box", "service", "payment terms",
+            "unit price", "memo", "amt", "subtotal", "balance",
+        ];
+        for (text, _) in block_lines {
+            let t = text.trim();
+            if t.is_empty() || t == amount_text.trim() {
+                continue;
+            }
+            let lower = t.to_lowercase();
+            if skip.iter().any(|s| lower.starts_with(s)) {
+                continue;
+            }
+            // A currency or date line isn't a vendor.
+            if Self::extract_amount(t).is_some() {
+                continue;
+            }
+            if Self::extract_date(t).is_some() {
+                continue;
+            }
+            // Must contain letters (a name), and not be just a ZIP/phone line.
+            if t.chars().any(|c| c.is_alphabetic()) {
+                return Some(t.to_string());
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -308,12 +348,14 @@ impl OcrBackend for DoctrBackend {
                         let bbox = self.normalize_bbox(line.geometry, page.width, page.height);
                         let date = DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
 
+                        let counterparty = DoctrBackend::attach_counterparty(&text, &block_lines);
+
                         entities.push(ExtractedEntity {
                             entity_type: self.classify_entity_type(&text, &request.doc_type),
                             amount_cents: amount,
                             currency: "USD".to_string(),
                             transaction_date: date,
-                            counterparty: None,
+                            counterparty,
                             description: Some(text),
                             gl_account_code: None,
                             transaction_ref: None,
@@ -417,5 +459,46 @@ mod tests {
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.32, &lines);
         assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+    }
+
+    // ---- counterparty (vendor) attachment ----
+
+    #[test]
+    fn counterparty_from_header_topmost_name() {
+        // Set #2 case: vendor header is the topmost non-boilerplate line.
+        let lines = block(&[
+            ("SUNRISE LANDSCAPE MAINTENANCE", 0.10),
+            ("A division of Coastal Property Services, Inc.", 0.14),
+            ("Invoice No: SLM-9042", 0.18),
+            ("Service Date: 07/10/2026", 0.22),
+            ("Irrigation system inspection + seasonal trim", 0.45),
+            ("AMOUNT DUE: $150.00", 0.60),
+        ]);
+        let cp = DoctrBackend::attach_counterparty("AMOUNT DUE: $150.00", &lines);
+        assert_eq!(cp.as_deref(), Some("SUNRISE LANDSCAPE MAINTENANCE"));
+    }
+
+    #[test]
+    fn counterparty_skips_amount_date_and_boilerplate() {
+        // A line that is a currency amount, a date, or boilerplate is NOT the
+        // vendor — the first real name wins.
+        let lines = block(&[
+            ("INVOICE", 0.08),
+            ("Date: 07/03/2026", 0.12),
+            ("$150.00", 0.16),
+            ("Sunrise Landscaping & Grounds LLC", 0.20),
+        ]);
+        let cp = DoctrBackend::attach_counterparty("$150.00", &lines);
+        assert_eq!(cp.as_deref(), Some("Sunrise Landscaping & Grounds LLC"));
+    }
+
+    #[test]
+    fn counterparty_none_when_only_boilerplate() {
+        let lines = block(&[
+            ("INVOICE", 0.08),
+            ("Total: $150.00", 0.20),
+        ]);
+        let cp = DoctrBackend::attach_counterparty("Total: $150.00", &lines);
+        assert_eq!(cp, None);
     }
 }

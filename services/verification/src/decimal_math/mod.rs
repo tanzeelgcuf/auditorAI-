@@ -79,17 +79,19 @@ pub fn compute_three_way_variance(
     let gl_sum = if gl_group.is_empty() { None } else { Some(sum(gl_group)?) };
 
     let mut variances = Vec::with_capacity(3);
+    // ALL three comparisons use ABSOLUTE values. An invoice is a billed amount
+    // (positive); its bank payment and GL entry carry the opposite sign by
+    // convention (bank debit -, GL credit +). The linker's _amounts_match
+    // already treats them as matching on abs; the verifier must too, or every
+    // legit 3-way group flags as a full-amount variance (Set #2: invoice +150,
+    // bank -150, GL +150 flagged $300 high). This extends the earlier
+    // bank↔GL-only abs fix (Prompt B) to invoice↔bank and invoice↔gl.
     if let (Some(a), Some(b)) = (inv_sum, bank_sum) {
-        variances.push((a - b).abs());
+        variances.push((a.abs() - b.abs()).abs());
     }
     if let (Some(a), Some(b)) = (inv_sum, gl_sum) {
-        variances.push((a - b).abs());
+        variances.push((a.abs() - b.abs()).abs());
     }
-    // bank↔GL compares ABSOLUTE values: a bank debit (-) and its GL credit (+)
-    // are the same payment with opposite sign conventions (doc 09 §1). The
-    // linker's _amounts_match already treats them as matching; the verifier
-    // must too, or every legit payment pair flags as a full-amount variance.
-    // (Prompt B stress catch: SLG/SLM $150 pairs were flagged $300 high.)
     if let (Some(a), Some(b)) = (bank_sum, gl_sum) {
         variances.push((a.abs() - b.abs()).abs());
     }
@@ -332,12 +334,15 @@ mod tests {
 
     #[test]
     fn test_three_way_with_negatives() {
+        // A credit memo invoice (-50) matched to a bank refund (+50) is the
+        // same transaction — signs are convention, so abs values are compared.
+        // |−50| vs |50| = 0 variance for the matching legs; GL 0 vs |−50| = 50.
         let invoice = [dec!(-50.00)];
         let bank = [dec!(50.00)];
         let gl = [dec!(0.00)];
 
         let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
-        assert_eq!(v, vec![dec!(100.00), dec!(50.00), dec!(50.00)]);
+        assert_eq!(v, vec![dec!(0.00), dec!(50.00), dec!(50.00)]);
     }
 
     #[test]
@@ -394,6 +399,27 @@ mod tests {
         let gl = [dec!(145.00)];
         let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
         assert_eq!(v, vec![dec!(5.00)]);
+    }
+
+    // Set #2 regression: a full 3-way group where the invoice is +150 (billed),
+    // bank is -150 (payment debit), GL is +150 (credit) — all the same real
+    // transaction with opposite sign conventions. Must be 0 variance, not $300.
+    #[test]
+    fn test_three_way_opposite_signs_is_a_match() {
+        let invoice = [dec!(150.00)];
+        let bank = [dec!(-150.00)];
+        let gl = [dec!(150.00)];
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![Decimal::ZERO, Decimal::ZERO, Decimal::ZERO]);
+    }
+
+    #[test]
+    fn test_three_way_real_discrepancy_still_detected() {
+        let invoice = [dec!(150.00)];
+        let bank = [dec!(-145.00)];
+        let gl = [dec!(150.00)];
+        let v = compute_three_way_variance(&invoice, &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(5.00), Decimal::ZERO, dec!(5.00)]);
     }
 
     // ---- format_formula tests ----
