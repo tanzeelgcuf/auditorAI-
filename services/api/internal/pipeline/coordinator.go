@@ -10,10 +10,12 @@ package pipeline
 // can run.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -130,8 +132,12 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	// Fetch the book's CSV column mapping (doc 08 §1) so structured formats parse
-	// with the correct header mapping, not an empty one.
-	columnMap := c.fetchColumnMap(ctx, ev.ClientBookID)
+	// with the correct header mapping, not an empty one. The mapping is chosen
+	// by matching the file's actual header row against each stored mapping's
+	// source columns — a firm may hold multiple exports (QBO, Xero, custom)
+	// needing different maps (Prompt C: the most-recent-mapping heuristic sent
+	// a QBO export through the stress-set map, dropping counterparty/account).
+	columnMap := c.fetchColumnMap(ctx, ev.ClientBookID, raw)
 
 	// Call ingestion gRPC: it parses the bytes into structured entities.
 	resp, err := c.ingestion.ProcessDocument(ctx, &ingestionpb.ProcessDocumentRequest{
@@ -173,18 +179,77 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 	_ = raw
 }
 
-// fetchColumnMap loads the most recent csv_column_mappings for a book (doc 08 §1).
-func (c *Coordinator) fetchColumnMap(ctx context.Context, bookID string) map[string]string {
+// fetchColumnMap selects the csv_column_mapping whose source columns best match
+// the file's header row. Falls back to the most recent mapping when no header
+// match (e.g. PDF/OFX, or an unknown export).
+func (c *Coordinator) fetchColumnMap(ctx context.Context, bookID string, fileBytes []byte) map[string]string {
 	out := map[string]string{}
-	var raw []byte
-	err := c.db.QueryRow(ctx,
-		`SELECT column_map FROM csv_column_mappings WHERE client_book_id = $1 ORDER BY created_at DESC LIMIT 1`,
-		bookID).Scan(&raw)
-	if err != nil {
-		return out // no mapping yet — CSV rows parse structurally but amount defaults
+
+	// Extract the header row from CSV-like content.
+	var header []string
+	if i := bytes.IndexByte(fileBytes, '\n'); i > 0 {
+		first := string(fileBytes[:i])
+		header = strings.Split(first, ",")
+		for j := range header {
+			header[j] = strings.TrimSpace(strings.Trim(header[j], `"'`))
+		}
 	}
-	_ = json.Unmarshal(raw, &out)
+
+	rows, err := c.db.Query(ctx,
+		`SELECT column_map FROM csv_column_mappings WHERE client_book_id = $1 ORDER BY created_at DESC`,
+		bookID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
+	type scored struct {
+		colmap map[string]string
+		score  int
+	}
+	var best scored
+	var latest map[string]string
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var m map[string]string
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		latest = m
+		if len(header) == 0 {
+			continue
+		}
+		score := mappingHeaderScore(m, header)
+		if score > best.score {
+			best = scored{colmap: m, score: score}
+		}
+	}
+	if best.score > 0 {
+		return best.colmap
+	}
+	if latest != nil {
+		return latest
+	}
 	return out
+}
+
+// mappingHeaderScore counts how many of a mapping's source column names appear
+// in the file's header row (case-insensitive). The mapping with the most hits
+// is the one the file was exported from.
+func mappingHeaderScore(m map[string]string, header []string) int {
+	score := 0
+	for _, src := range m {
+		for _, h := range header {
+			if strings.EqualFold(src, h) {
+				score++
+				break
+			}
+		}
+	}
+	return score
 }
 
 // nullableDate converts a "YYYY-MM-DD" string (or empty) to *time.Time for the
