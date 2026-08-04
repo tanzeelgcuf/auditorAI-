@@ -156,10 +156,18 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 	_, _ = c.db.Exec(ctx,
 		"UPDATE source_documents SET ocr_status = 'done' WHERE id = $1", ev.DocumentID)
 
-	// Request agent-runtime to extract/link/classify this batch.
+	// Request agent-runtime to extract this document's entities (per-doc — a
+	// single LLM prompt must not span the whole book).
 	req := map[string]string{"client_book_id": ev.ClientBookID, "batch_id": ev.DocumentID}
 	if payload, err := json.Marshal(req); err == nil {
 		_, _ = c.js.Publish(ctx, "entity.extraction.requested", payload)
+	}
+
+	// Then trigger a BOOK-WIDE link pass: 3-way reconciliation needs entities
+	// from the invoice + bank + GL documents together, which per-doc extraction
+	// can't produce. The link handler fetches the whole book's pending set.
+	if payload, err := json.Marshal(map[string]string{"client_book_id": ev.ClientBookID}); err == nil {
+		_, _ = c.js.Publish(ctx, "link.requested", payload)
 	}
 
 	_ = raw

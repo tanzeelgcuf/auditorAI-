@@ -177,6 +177,15 @@ impl IngestionService for IngestionServiceImpl {
                     process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
                 backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
+            DetectedFormat::Ofx => {
+                // OFX is structured (STMTTRN blocks), NOT OCR. It was falling
+                // through to the OCR sidecar (the `_` arm), which returns
+                // Not Found — the structured ofx parser was never routed to.
+                // Prompt B wiring-first catch.
+                let backend = crate::ocr::structured::OfxParser::new(
+                    self.s3_client.clone(), self.bucket.clone());
+                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+            }
             _ => {
                 self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }

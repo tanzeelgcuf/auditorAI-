@@ -23,9 +23,12 @@ class MCPClient:
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or os.getenv("API_MCP_URL", "http://api:8080")).rstrip("/")
         self.api_key = api_key or os.getenv("API_INTERNAL_KEY", "")
+        # Internal MCP auth (doc 05 §3): shared secret on X-Internal-Key, not a
+        # user JWT. The API's InternalAuth middleware resolves client_book_id ->
+        # firm from the body.
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
-            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+            headers={"X-Internal-Key": self.api_key} if self.api_key else {},
             timeout=30.0,
         )
 
@@ -34,8 +37,13 @@ class MCPClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def get_pending_entities(self, client_book_id: str) -> List[Dict[str, Any]]:
-        result = await self._post("get_pending_entities", {"client_book_id": client_book_id})
+    async def get_pending_entities(self, client_book_id: str, batch_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch pending entities. batch_id (a source document id) scopes the
+        result to that document — extraction must not span the whole book."""
+        payload: Dict[str, Any] = {"client_book_id": client_book_id}
+        if batch_id:
+            payload["batch_id"] = batch_id
+        result = await self._post("get_pending_entities", payload)
         return result.get("entities", [])
 
     async def create_entity_link(

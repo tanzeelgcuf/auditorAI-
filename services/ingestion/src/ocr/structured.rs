@@ -110,7 +110,11 @@ pub fn resolve_amount(mapped: &HashMap<String, String>, raw: &HashMap<String, St
             return amt.clone();
         }
     }
-    for key in ["Debit", "Credit", "debit", "credit"] {
+    // Double-entry exports name the sides differently. The mapped amount points
+    // at one side (e.g. debit_amount); a credit row has that side empty, so fall
+    // back to the OTHER side. Handles plain "Debit"/"Credit" and the
+    // "*_amount" variants (Prompt B: stress GL uses debit_amount/credit_amount).
+    for key in ["Debit", "Credit", "debit", "credit", "debit_amount", "credit_amount"] {
         if let Some(v) = raw.get(key) {
             if !v.trim().is_empty() {
                 return v.clone();

@@ -38,7 +38,19 @@ func NewEventClient(natsURL string) (*EventClient, error) {
 	defer cancel()
 	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:      "DOCUMENTS",
-		Subjects:  []string{"document.uploaded", "document.processing.failed", "ingestion.completed", "entity.extraction.requested"},
+		Subjects:  []string{"document.uploaded", "document.processing.failed", "ingestion.completed"},
+		Retention: jetstream.WorkQueuePolicy,
+	})
+	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:      "EXTRACTION",
+		Subjects:  []string{"entity.extraction.requested"},
+		Retention: jetstream.WorkQueuePolicy,
+	})
+	// Book-wide linking lives on its own stream (a WorkQueue allows one
+	// consumer; per-doc extraction and book-wide link need separate ones).
+	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:      "LINK",
+		Subjects:  []string{"link.requested"},
 		Retention: jetstream.WorkQueuePolicy,
 	})
 	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{

@@ -165,7 +165,9 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
                 client_book_id=state.get("client_book_id"),
                 source_document_id=UUID(item.get("source_document_id", str(state.get("batch_id")))),
                 entity_type=item.get("entity_type", "invoice_line_item"),
-                entity_subtype=item.get("entity_subtype", "standard"),
+                # The model may emit entity_subtype: null — coerce to the default
+                # so the pydantic schema (which rejects None for str) accepts it.
+                entity_subtype=item.get("entity_subtype") or "standard",
                 amount_cents=_parse_amount_cents(amount_source),
                 currency=item.get("currency", "USD"),
                 transaction_date=_parse_date(item.get("transaction_date")),

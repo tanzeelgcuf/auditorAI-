@@ -85,8 +85,13 @@ pub fn compute_three_way_variance(
     if let (Some(a), Some(b)) = (inv_sum, gl_sum) {
         variances.push((a - b).abs());
     }
+    // bank↔GL compares ABSOLUTE values: a bank debit (-) and its GL credit (+)
+    // are the same payment with opposite sign conventions (doc 09 §1). The
+    // linker's _amounts_match already treats them as matching; the verifier
+    // must too, or every legit payment pair flags as a full-amount variance.
+    // (Prompt B stress catch: SLG/SLM $150 pairs were flagged $300 high.)
     if let (Some(a), Some(b)) = (bank_sum, gl_sum) {
-        variances.push((a - b).abs());
+        variances.push((a.abs() - b.abs()).abs());
     }
     Ok(variances)
 }
@@ -370,6 +375,25 @@ mod tests {
         let gl = [dec!(6100.00)];
         let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
         assert_eq!(v, vec![dec!(100.00)]);
+    }
+
+    // Prompt B regression: a bank debit (-) and its GL credit (+) are the same
+    // payment (sign is a side convention, doc 09 §1). |bank-gl| must compare
+    // absolute values, or every legit payment flags as a full-amount variance.
+    #[test]
+    fn test_two_leg_opposite_signs_is_a_match() {
+        let bank = [dec!(-150.00)];
+        let gl = [dec!(150.00)];
+        let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
+        assert_eq!(v, vec![Decimal::ZERO]);
+    }
+
+    #[test]
+    fn test_two_leg_opposite_signs_real_mismatch_still_detected() {
+        let bank = [dec!(-150.00)];
+        let gl = [dec!(145.00)];
+        let v = compute_three_way_variance(&[], &bank, &gl).unwrap();
+        assert_eq!(v, vec![dec!(5.00)]);
     }
 
     // ---- format_formula tests ----

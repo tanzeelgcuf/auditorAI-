@@ -314,14 +314,6 @@ func main() {
 		r.Post("/v1/books/{bookId}/csv-mappings", settingsSvc.HandleCreateCSVMapping)
 		r.Put("/v1/books/{bookId}/csv-mappings/{mappingId}", settingsSvc.HandleUpdateCSVMapping)
 
-		// MCP tools (internal, called by agent-runtime)
-		r.Route("/mcp", func(r chi.Router) {
-			r.Post("/tools/get_pending_entities", mcpSvc.HandleGetPendingEntities)
-			r.Post("/tools/create_entity_link", mcpSvc.HandleCreateEntityLink)
-			r.Post("/tools/flag_for_review", mcpSvc.HandleFlagForReview)
-			r.Post("/tools/get_book_tolerance", mcpSvc.HandleGetBookTolerance)
-		})
-
 		// Firm admin
 		r.Route("/v1/admin", func(r chi.Router) {
 			r.Use(middleware.RequireRole("firm_admin"))
@@ -344,6 +336,17 @@ func main() {
 
 		// Mobile push device registration (doc 07 §8)
 		r.Post("/v1/push/register", pushSvc.HandleRegisterDevice)
+	})
+
+	// MCP tools (internal, called by agent-runtime). Outside the user-auth
+	// group: authenticated with the shared internal key instead of a user JWT,
+	// scoping to the client_book_id in the request body (doc 05 §3).
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.InternalAuth(pool))
+		r.Post("/mcp/tools/get_pending_entities", mcpSvc.HandleGetPendingEntities)
+		r.Post("/mcp/tools/create_entity_link", mcpSvc.HandleCreateEntityLink)
+		r.Post("/mcp/tools/flag_for_review", mcpSvc.HandleFlagForReview)
+		r.Post("/mcp/tools/get_book_tolerance", mcpSvc.HandleGetBookTolerance)
 	})
 
 	// Client portal — read-only, scoped to the portal user's own book

@@ -28,9 +28,11 @@ async def process_batch(client, graph, mcp, batch_event: dict):
         logger.error("batch event missing required fields")
         return
 
-    # Fetch pending entities + book config via MCP
+    # Fetch pending entities + book config via MCP. Scope to the batch's source
+    # document — extraction is per-document, not per-book (a book may hold
+    # hundreds of entities; a single LLM prompt must not span them all).
     try:
-        pending = await mcp.get_pending_entities(client_book_id)
+        pending = await mcp.get_pending_entities(client_book_id, batch_id=batch_id)
         tolerance = await mcp.get_book_tolerance(client_book_id)
     except Exception as e:
         logger.error("mcp fetch failed", error=str(e))
@@ -71,6 +73,67 @@ async def process_batch(client, graph, mcp, batch_event: dict):
             logger.error("group persistence failed", error=str(e))
 
 
+async def process_link(client, graph, mcp, link_event: dict):
+    """Handle one link.requested event — BOOK-WIDE linking.
+
+    3-way reconciliation needs entities from the invoice + bank + GL documents
+    together, which per-doc extraction can't provide. This fetches the whole
+    book's pending entities and runs the link node across them.
+    """
+    client_book_id = link_event.get("client_book_id")
+    if not client_book_id:
+        logger.error("link event missing client_book_id")
+        return
+
+    logger.info("linking book", client_book_id=client_book_id)
+    try:
+        pending = await mcp.get_pending_entities(client_book_id)  # no batch — all unlinked
+        tolerance = await mcp.get_book_tolerance(client_book_id)
+    except Exception as e:
+        logger.error("link mcp fetch failed", error=str(e))
+        return
+
+    config = BookConfig(
+        id=client_book_id,
+        tolerance_cents=int(tolerance.get("tolerance_cents", 1)),
+        auto_link_threshold=float(tolerance.get("auto_link_threshold", 0.85)),
+        review_floor=float(tolerance.get("review_floor", 0.50)),
+    )
+    state = {
+        "client_book_id": client_book_id,
+        "batch_id": "book-wide-link",
+        "book_config": config,
+        "entities": pending,
+    }
+    # The MCP pending entities are already structured (ingestion parsed them);
+    # re-running the LLM extract node would be redundant + slow on a whole book.
+    # Convert to ExtractedEntity and run ONLY the deterministic link node.
+    from graph.schema import ExtractedEntity
+    from graph.link import cross_link
+    try:
+        entities = [ExtractedEntity(**e) for e in pending]
+    except Exception as ex:
+        logger.error("link: entity parse failed", error=str(ex))
+        return
+    state["entities"] = entities
+    state["classified_entities"] = entities  # cross_link reads this key
+    linked = cross_link(state, config)
+    groups = linked.get("groups", [])
+    logger.info(
+        "link complete",
+        client_book_id=client_book_id,
+        auto_linked=len([g for g in groups if g.status == "auto_linked"]),
+        needs_review=len([g for g in groups if g.status == "needs_review"]),
+        errors=linked.get("errors", []),
+    )
+    if groups:
+        try:
+            written = await mcp.persist_groups(groups, client_book_id)
+            logger.info("link groups persisted", client_book_id=client_book_id, written=written)
+        except Exception as e:
+            logger.error("link persistence failed", error=str(e))
+
+
 async def run_consumer():
     """Subscribe to NATS JetStream and process batches."""
     try:
@@ -84,29 +147,37 @@ async def run_consumer():
 
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
-    await js.add_stream(name="ENTITY_EXTRACTION", subjects=["entity.extraction.requested"])
-
-    sub = await js.subscribe("entity.extraction.requested")
+    # The EXTRACTION/LINK streams are owned/created by services/api. Creating a
+    # competing stream would fail with "subjects overlap"; bind consumers to the
+    # existing streams instead (each is a WorkQueue with its single consumer).
+    ext_sub = await js.subscribe("entity.extraction.requested")
+    link_sub = await js.subscribe("link.requested")
     logger.info("nats consumer ready", url=NATS_URL)
 
-    from anthropic import Anthropic
-    client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+    from ollama_adapter import make_llm_client
+    client = make_llm_client()
     graph = build_graph(client)
 
     from mcp_client import MCPClient
     mcp = MCPClient(API_MCP_URL)
 
-    try:
-        async for msg in sub.messages:
-            try:
-                event = json.loads(msg.data.decode())
-                await process_batch(client, graph, mcp, event)
-            except Exception as e:
-                logger.error("batch processing failed", error=str(e))
-            finally:
-                await msg.ack()
-    finally:
-        await nc.drain()
+    async def consume(sub, handler):
+        try:
+            async for msg in sub.messages:
+                try:
+                    event = json.loads(msg.data.decode())
+                    await handler(client, graph, mcp, event)
+                except Exception as e:
+                    logger.error("batch processing failed", error=str(e))
+                finally:
+                    await msg.ack()
+        finally:
+            await nc.drain()
+
+    await asyncio.gather(
+        consume(ext_sub, process_batch),
+        consume(link_sub, process_link),
+    )
 
 
 def setup_structlog():

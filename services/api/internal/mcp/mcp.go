@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,10 +49,14 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // HandleGetPendingEntities returns unclassified/unlinked entities for a book so
-// agent-runtime can run extraction/classification on them.
+// agent-runtime can run extraction/classification on them. When batch_id is
+// provided (a source document id), only that document's entities are returned —
+// extraction is per-document, not per-book (a book can hold hundreds of
+// entities; a single LLM prompt must not span the whole book).
 func (s *Service) HandleGetPendingEntities(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ClientBookID string `json:"client_book_id"`
+		BatchID      string `json:"batch_id"` // optional: scope to one source document
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ClientBookID == "" {
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request", "client_book_id required")
@@ -71,15 +76,22 @@ func (s *Service) HandleGetPendingEntities(w http.ResponseWriter, r *http.Reques
 		c = c2
 	}
 
-	rows, err := c.Query(r.Context(),
-		`SELECT id::text, client_book_id::text, source_document_id::text, entity_type,
-			entity_subtype, amount_cents, currency, COALESCE(transaction_date, 'epoch'),
+	// Batch scoping: when a batch_id (source document) is given, restrict to its
+	// entities so the LLM prompt stays per-document, not per-book.
+	query := `SELECT id::text, client_book_id::text, source_document_id::text, entity_type,
+			COALESCE(entity_subtype, ''), amount_cents, currency, COALESCE(transaction_date, 'epoch'),
 			COALESCE(counterparty, ''), COALESCE(description, ''), COALESCE(gl_account_code, ''),
 			page_number, bbox, extraction_confidence, source_format
 		 FROM extracted_entities
 		 WHERE client_book_id = $1
-		   AND id NOT IN (SELECT extracted_entity_id FROM reconciliation_group_members)
-		 ORDER BY extracted_at DESC LIMIT 500`, req.ClientBookID)
+		   AND id NOT IN (SELECT extracted_entity_id FROM reconciliation_group_members)`
+	args := []interface{}{req.ClientBookID}
+	if req.BatchID != "" {
+		query += " AND source_document_id = $2"
+		args = append(args, req.BatchID)
+	}
+	query += " ORDER BY extracted_at DESC LIMIT 500"
+	rows, err := c.Query(r.Context(), query, args...)
 	if err != nil {
 		slog.Error("failed to query pending entities", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "query failed")
@@ -108,16 +120,17 @@ func (s *Service) HandleGetPendingEntities(w http.ResponseWriter, r *http.Reques
 	var out []entity
 	for rows.Next() {
 		var e entity
-		var txnDate string
+		var txnDate time.Time
 		var bboxJSON []byte
 		if err := rows.Scan(&e.ID, &e.ClientBookID, &e.SourceDocumentID, &e.EntityType,
 			&e.EntitySubtype, &e.AmountCents, &e.Currency, &txnDate, &e.Counterparty,
 			&e.Description, &e.GLAccountCode, &e.PageNumber, &bboxJSON,
 			&e.ExtractionConfidence, &e.SourceFormat); err != nil {
+			slog.Warn("mcp pending scan fail", "error", err)
 			continue
 		}
-		if txnDate != "0001-01-01T00:00:00Z" {
-			e.TransactionDate = txnDate[:10]
+		if !txnDate.IsZero() {
+			e.TransactionDate = txnDate.Format("2006-01-02")
 		}
 		e.BBox = map[string]float64{}
 		if len(bboxJSON) > 0 {
