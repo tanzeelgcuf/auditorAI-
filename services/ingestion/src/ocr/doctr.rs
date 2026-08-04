@@ -99,29 +99,32 @@ impl DoctrBackend {
     }
 
     /// Extract amount from text via char-by-char scanning.
-    /// Collects digit/decimal/minus sequences, returns the one with largest absolute value in cents.
-    fn extract_amount(&self, text: &str) -> Option<i64> {
+    ///
+    /// Only CURRENCY-SHAPED values are accepted — an optional `$`, digits with
+    /// optional comma thousands, and EXACTLY two decimal digits (`150.00`).
+    /// ZIPs, dates, and invoice numbers (97401, 2026, 9042) carry no cents and
+    /// are filtered out BEFORE they reach the LLM. Without this, a page's raw
+    /// OCR lines ("2210 Meadowbrook Ave, Eugene, OR 97401") become noisy
+    /// pseudo-entities that blow up the extraction prompt and time out the
+    /// model (Stress Set #2: 13 entities → 5×$150 + 8 garbage). The model's
+    /// real job — pick WHICH currency value is the total — is preserved; this
+    /// only removes the deterministically-non-currency noise.
+    fn extract_amount(text: &str) -> Option<i64> {
         let mut current = String::new();
         let mut candidates: Vec<f64> = Vec::new();
 
         for c in text.chars() {
-            if c.is_ascii_digit() || c == '.' || c == '-' || c == ',' {
+            if c.is_ascii_digit() || c == '.' || c == '-' || c == ',' || c == '$' {
                 current.push(c);
             } else if !current.is_empty() {
-                if current.contains(|c: char| c.is_ascii_digit()) {
-                    // Remove comma separators before parsing
-                    let cleaned: String = current.chars().filter(|&c| c != ',').collect();
-                    if let Ok(v) = cleaned.parse::<f64>() {
-                        candidates.push(v);
-                    }
+                if let Some(v) = Self::parse_currency(&current) {
+                    candidates.push(v);
                 }
                 current.clear();
             }
         }
-        // flush last candidate
-        if !current.is_empty() && current.contains(|c: char| c.is_ascii_digit()) {
-            let cleaned: String = current.chars().filter(|&c| c != ',').collect();
-            if let Ok(v) = cleaned.parse::<f64>() {
+        if !current.is_empty() {
+            if let Some(v) = Self::parse_currency(&current) {
                 candidates.push(v);
             }
         }
@@ -130,6 +133,30 @@ impl DoctrBackend {
             .iter()
             .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
             .map(|v| (v * 100.0).round() as i64)
+    }
+
+    /// Parse a candidate as a currency value: optional `$`, digits with comma
+    /// thousands, and EXACTLY two decimal digits. Returns None for anything not
+    /// shaped like a dollar amount (ZIPs, dates, IDs, bare integers).
+    fn parse_currency(candidate: &str) -> Option<f64> {
+        let s = candidate.trim();
+        let neg = s.starts_with('-');
+        let digits_only = |x: &str| {
+            let d: String = x.chars().filter(|c| *c != ',' && *c != '$').collect();
+            d
+        };
+        let core = digits_only(s.trim_start_matches(['-', '$']));
+        // Must have exactly two decimal places (currency cents), no more.
+        if core.contains('.') {
+            let (whole, frac) = core.split_once('.')?;
+            if !frac.is_empty() && frac.len() == 2 && frac.chars().all(|c| c.is_ascii_digit())
+                && !whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit())
+            {
+                let v: f64 = core.parse().ok()?;
+                return Some(if neg { -v } else { v });
+            }
+        }
+        None
     }
 
     /// Extract date from text via sliding window pattern matching.
@@ -205,7 +232,7 @@ impl OcrBackend for DoctrBackend {
                         .collect::<Vec<_>>()
                         .join(" ");
 
-                    if let Some(amount) = self.extract_amount(&text) {
+                    if let Some(amount) = DoctrBackend::extract_amount(&text) {
                         let bbox = self.normalize_bbox(line.geometry, page.width, page.height);
 
                         entities.push(ExtractedEntity {
@@ -232,5 +259,41 @@ impl OcrBackend for DoctrBackend {
 
     fn name(&self) -> &'static str {
         "docTR"
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::DoctrBackend;
+
+    fn amt(text: &str) -> Option<i64> {
+        DoctrBackend::extract_amount(text)
+    }
+
+    #[test]
+    fn currency_values_accepted() {
+        assert_eq!(amt("$150.00"), Some(15000));
+        assert_eq!(amt("Total Due: $150.00"), Some(15000));
+        assert_eq!(amt("1,234.56"), Some(123456));
+        assert_eq!(amt("-150.00"), Some(-15000));
+        assert_eq!(amt("850.00 line plus 900.00 total"), Some(90000));
+    }
+
+    #[test]
+    fn non_currency_noise_filtered() {
+        // Stress Set #2 noise: ZIPs, dates, invoice numbers have no cents.
+        assert_eq!(amt("2210 Meadowbrook Ave, Eugene, OR 97401"), None);
+        assert_eq!(amt("Invoice #: SLG-771 Date: 07/03/2026"), None);
+        assert_eq!(amt("PO Box 4471, Eugene OR 97440"), None);
+        assert_eq!(amt("Invoice No: SLM-9042"), None);
+        assert_eq!(amt("1"), None);
+        assert_eq!(amt("2026"), None);
+    }
+
+    #[test]
+    fn bare_integer_with_dollar_no_cents_filtered() {
+        // "$150" without cents is not a currency amount on an invoice page.
+        assert_eq!(amt("$150"), None);
     }
 }
