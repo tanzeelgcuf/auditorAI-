@@ -160,7 +160,7 @@ impl DoctrBackend {
     }
 
     /// Extract date from text via sliding window pattern matching.
-    fn extract_date(&self, text: &str) -> Option<NaiveDate> {
+    fn extract_date(text: &str) -> Option<NaiveDate> {
         let chars: Vec<char> = text.chars().collect();
         if chars.len() < 8 {
             return None;
@@ -187,12 +187,78 @@ impl DoctrBackend {
                 }
                 let slice: String = chars[i..slice_end].iter().collect();
                 if let Ok(d) = NaiveDate::parse_from_str(&slice, fmt) {
-                    return Some(d);
+                    // Reject misaligned windows: chrono accepts a truncated
+                    // slice as a valid date (" 07/03/202" parses as year 202
+                    // when the real "07/03/2026" begins one char later), and
+                    // first-match returns it before the aligned window. A real
+                    // date is not bounded on either side by another digit or a
+                    // date separator.
+                    let before = i.checked_sub(1).map(|j| chars[j]).unwrap_or(' ');
+                    let after = chars.get(slice_end).copied().unwrap_or(' ');
+                    let is_date_char = |c: char| c.is_ascii_digit() || c == '/' || c == '-' || c == '.';
+                    if !is_date_char(before) && !is_date_char(after) {
+                        return Some(d);
+                    }
                 }
             }
         }
 
         None
+    }
+
+    /// Join a line's words with spaces into display text.
+    fn line_text(line: &DoctrLine) -> String {
+        line.words
+            .iter()
+            .map(|w| w.value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Attach a transaction date to an amount line via deterministic proximity.
+    ///
+    /// Order:
+    /// 1. The amount line's own text (extract_date already matches a line like
+    ///    "Invoice #: SLG-771 Date: 07/03/2026" directly).
+    /// 2. Otherwise, scan the block's other lines for a date pattern and pick
+    ///    the NEAREST by vertical geometry (y distance), preferring a line that
+    ///    carries a "Date:" label when such exists.
+    /// 3. None if no date exists in the block.
+    ///
+    /// Generalizes across real layouts: QBO exports and firm invoices put dates
+    /// in varied positions (header, side, near the total). Proximity + label
+    /// preference is the general rule; this invoice's exact layout is not baked in.
+    fn attach_date(amount_text: &str, amount_y: f32, block_lines: &[(String, f32)]) -> Option<NaiveDate> {
+        if let Some(d) = Self::extract_date(amount_text) {
+            return Some(d);
+        }
+
+        let mut candidates: Vec<(f32, NaiveDate)> = block_lines
+            .iter()
+            .filter(|(t, _)| t.as_str() != amount_text)
+            .filter_map(|(t, y)| Self::extract_date(t).map(|d| (*y, d)))
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Prefer a line carrying a "Date:" label, as the most explicit signal.
+        let labeled: Vec<(f32, NaiveDate)> = block_lines
+            .iter()
+            .filter(|(t, _)| t.contains("Date:") && t.as_str() != amount_text)
+            .filter_map(|(t, y)| Self::extract_date(t).map(|d| (*y, d)))
+            .collect();
+        if !labeled.is_empty() {
+            candidates = labeled;
+        }
+
+        candidates.sort_by(|a, b| {
+            let da = (a.0 - amount_y).abs();
+            let db = (b.0 - amount_y).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.first().map(|(_, d)| *d)
     }
 }
 
@@ -224,24 +290,31 @@ impl OcrBackend for DoctrBackend {
 
         for page in doctr_resp.pages {
             for block in page.blocks {
+                // Collect all raw lines (text + vertical position) in the block
+                // so an amount line can pick up a date that lives on a different
+                // line (header, side, near the total). Narrow per-line scanning
+                // lost the date entirely once the currency filter dropped the
+                // date-bearing line's non-currency "amount".
+                let block_lines: Vec<(String, f32)> = block
+                    .lines
+                    .iter()
+                    .map(|l| (DoctrBackend::line_text(l), l.geometry[0][1]))
+                    .collect();
+
                 for line in block.lines {
-                    let text: String = line
-                        .words
-                        .iter()
-                        .map(|w| w.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let text = DoctrBackend::line_text(&line);
 
                     if let Some(amount) = DoctrBackend::extract_amount(&text) {
                         let bbox = self.normalize_bbox(line.geometry, page.width, page.height);
+                        let date = DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
 
                         entities.push(ExtractedEntity {
                             entity_type: self.classify_entity_type(&text, &request.doc_type),
                             amount_cents: amount,
                             currency: "USD".to_string(),
-                            transaction_date: self.extract_date(&text),
+                            transaction_date: date,
                             counterparty: None,
-                            description: Some(text.clone()),
+                            description: Some(text),
                             gl_account_code: None,
                             transaction_ref: None,
                             page_number: page.page_number,
@@ -295,5 +368,54 @@ mod tests {
     fn bare_integer_with_dollar_no_cents_filtered() {
         // "$150" without cents is not a currency amount on an invoice page.
         assert_eq!(amt("$150"), None);
+    }
+
+    fn block(rows: &[(&str, f32)]) -> Vec<(String, f32)> {
+        rows.iter().map(|(t, y)| (t.to_string(), *y)).collect()
+    }
+
+    #[test]
+    fn date_attached_from_other_line_in_block() {
+        // "$150.00" line has no date itself; the header line in the same block does.
+        let lines = block(&[
+            ("Invoice #: SLG-771 Date: 07/03/2026", 0.10),
+            ("Consulting services", 0.20),
+            ("$150.00", 0.30),
+        ]);
+        let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
+        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+    }
+
+    #[test]
+    fn no_date_in_block_yields_none() {
+        let lines = block(&[
+            ("Consulting services", 0.20),
+            ("$150.00", 0.30),
+        ]);
+        assert_eq!(DoctrBackend::attach_date("$150.00", 0.30, &lines), None);
+    }
+
+    #[test]
+    fn proximity_picks_nearest_of_two_dates() {
+        // Two date lines; the closer one (0.25) must win over 0.60.
+        let lines = block(&[
+            ("Invoice date: 07/03/2026", 0.25),
+            ("Terms Net 30 due 08/02/2026", 0.60),
+            ("$150.00", 0.30),
+        ]);
+        let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
+        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+    }
+
+    #[test]
+    fn date_label_preferred_over_nearer_unlabeled() {
+        // A "Date:"-labeled line farther away beats an unlabeled nearer one.
+        let lines = block(&[
+            ("Terms Net 30 due 08/02/2026", 0.31),
+            ("Date: 07/03/2026", 0.60),
+            ("$150.00", 0.32),
+        ]);
+        let d = DoctrBackend::attach_date("$150.00", 0.32, &lines);
+        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
     }
 }
