@@ -230,13 +230,6 @@ func CircuitBreaker(name string, settings gobreaker.Settings) func(http.Handler)
 	}
 }
 
-// RateLimiter provides per-firm rate limiting (placeholder - real impl uses Traefik/Kong)
-func RateLimiter(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
-}
-
 // getAssignedBooks fetches assigned book UUIDs for a user.
 // firm_admin gets ALL books in their firm; staff gets only user_book_assignments.
 // Runs on the RLS-wired request connection so the firm GUC scopes the reads.

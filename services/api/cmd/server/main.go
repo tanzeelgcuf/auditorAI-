@@ -205,11 +205,19 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 
-	// Client portal login (public — invite-token based, doc 07 §5)
-	r.Post("/v1/portal/login", portalSvc.HandleLogin)
+	// Rate limiters (per-IP token bucket, doc 00 §3.10). Auth and uploads are
+	// the brute-force / abuse surfaces; admin key operations are low-traffic.
+	// Rates: auth 5 req/s burst 20; upload 3 req/s burst 10; admin 2 req/s burst 5.
+	authLimiter := middleware.NewIPRateLimiter(5, 20)
+	uploadLimiter := middleware.NewIPRateLimiter(3, 10)
+	adminLimiter := middleware.NewIPRateLimiter(2, 5)
 
-	// Auth routes (public)
+	// Client portal login (public — invite-token based, doc 07 §5)
+	r.With(middleware.RateLimit(authLimiter)).Post("/v1/portal/login", portalSvc.HandleLogin)
+
+	// Auth routes (public) — rate-limited against brute force.
 	r.Route("/v1/auth", func(r chi.Router) {
+		r.Use(middleware.RateLimit(authLimiter))
 		r.Post("/signup", authSvc.HandleSignup)
 		r.Post("/login", authSvc.HandleLogin)
 		r.Post("/logout", authSvc.HandleLogout)
@@ -237,10 +245,11 @@ func main() {
 			r.Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
 		})
 
-		// Documents
+		// Documents — upload-url is a storage-abuse surface (presigned PUTs),
+		// rate-limited separately from the authenticated list/get.
 		r.Route("/v1/books/{bookId}/documents", func(r chi.Router) {
 			r.With(middleware.Idempotency(pool)).Post("/", docSvc.HandleUpload)
-			r.Post("/upload-url", docSvc.HandlePresignUpload)
+			r.With(middleware.RateLimit(uploadLimiter)).Post("/upload-url", docSvc.HandlePresignUpload)
 			r.Get("/", docSvc.HandleList)
 			r.Get("/{docId}", docSvc.HandleGet)
 			r.Get("/{docId}/view", docSvc.HandlePresignedView)
@@ -317,6 +326,7 @@ func main() {
 		// Firm admin
 		r.Route("/v1/admin", func(r chi.Router) {
 			r.Use(middleware.RequireRole("firm_admin"))
+			r.Use(middleware.RateLimit(adminLimiter)) // low-traffic admin ops
 			r.Get("/team", tenantSvc.HandleListStaff)
 			r.Get("/settings", tenantSvc.HandleGetFirmSettings)
 			r.Patch("/settings", tenantSvc.HandleUpdateFirmSettings)

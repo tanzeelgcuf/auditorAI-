@@ -63,6 +63,10 @@ async def process_batch(client, graph, mcp, batch_event: dict):
         errors=result.get("errors", []),
     )
 
+    # Observability: emit a Langfuse span when configured (no-op otherwise).
+    from langfuse_trace import trace_extraction
+    trace_extraction(batch_id, client_book_id, len(result.get("classified_entities", [])))
+
     # Persist cross-linked groups back to the API (Prompt 3: the pipeline
     # dead-ended after extraction — groups were produced but never written).
     if groups:
