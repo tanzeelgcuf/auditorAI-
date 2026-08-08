@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
@@ -55,6 +57,10 @@ func main() {
 	} else {
 		slog.Warn("tracing disabled", "error", err)
 	}
+
+	// Initialize Sentry (GlitchTip, Sentry-compatible). Strict no-op unless
+	// GLITCHTIP_DSN is set; server must start identically to today.
+	initSentry()
 
 	// Initialize database pool
 	dsn := os.Getenv("DATABASE_URL")
@@ -182,6 +188,7 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
+	r.Use(middleware.SentryRecoverer) // must run BEFORE Recoverer to capture panics
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(30 * time.Second))
 	r.Use(cors.Handler(cors.Options{
@@ -387,12 +394,43 @@ func main() {
 		if err := srv.Shutdown(ctx); err != nil {
 			slog.Error("server shutdown error", "error", err)
 		}
+		sentry.Flush(2 * time.Second) // send queued error events before exit
 	}()
 
 	slog.Info("server starting", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
+	}
+}
+
+// initSentry wires error reporting to GlitchTip (Sentry-compatible) when
+// GLITCHTIP_DSN is set; otherwise it is a strict no-op.
+func initSentry() {
+	dsn := os.Getenv("GLITCHTIP_DSN")
+	if dsn == "" {
+		return
+	}
+	env := os.Getenv("APP_ENV")
+	if env == "" {
+		env = "dev"
+	}
+	release := "dev"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+				release = s.Value[:7]
+				break
+			}
+		}
+	}
+	if err := sentry.Init(sentry.ClientOptions{
+		Dsn:              dsn,
+		Environment:      env,
+		Release:          release,
+		TracesSampleRate: 0.0, // errors only; tracing stays in OTel
+	}); err != nil {
+		slog.Warn("sentry init failed — error reporting disabled", "error", err)
 	}
 }
 

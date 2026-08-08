@@ -6,10 +6,12 @@ import json
 import os
 import signal
 import structlog
+import sentry_sdk
 from typing import Optional
 
 from graph.schema import BookConfig
 from graph.graph_def import build_graph
+from glitchtip_trace import init_glitchtip
 
 logger = structlog.get_logger()
 
@@ -173,6 +175,7 @@ async def run_consumer():
                     await handler(client, graph, mcp, event)
                 except Exception as e:
                     logger.error("batch processing failed", error=str(e))
+                    sentry_sdk.capture_exception(e)  # GlitchTip (no-op when DSN unset)
                 finally:
                     await msg.ack()
         finally:
@@ -200,6 +203,7 @@ def setup_structlog():
 
 async def main():
     setup_structlog()
+    init_glitchtip()  # error reporting to GlitchTip (no-op when GLITCHTIP_DSN unset)
     logger.info("starting agent-runtime service")
 
     stop = asyncio.Event()

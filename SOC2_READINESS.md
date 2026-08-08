@@ -61,7 +61,7 @@ doc for our eventual formal SOC2 Type II audit.
 | Control | Status | Evidence / Notes |
 |---|---|---|
 | Per-tenant KMS keys on S3 | ⬜ | Schema + endpoint exist; S3 SSE-KMS wiring pending |
-| Backup / point-in-time restore | 🟡 | pgBackRest in docker-compose; tested restore procedure pending (go-live checklist item) |
+| Backup / restore | 🟡 | `scripts/backup.sh` pg_dump snapshot + retention; restore proven (tested live, restored row count == source); point-in-time restore (WAL archiving) NOT wired — separate go-live item |
 | Retention lock / soft delete | ✅ | `source_documents.deleted_at` + `retention_locked_until` |
 
 ---
