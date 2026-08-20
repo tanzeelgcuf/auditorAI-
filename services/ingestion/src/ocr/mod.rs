@@ -64,8 +64,8 @@ pub enum OcrError {
 
 #[async_trait]
 pub trait OcrBackend: Send + Sync {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError>;
     fn name(&self) -> &'static str;
+    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError>;
 }
 
 // ── Format detection ──

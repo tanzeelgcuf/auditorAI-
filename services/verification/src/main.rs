@@ -4,6 +4,7 @@
 mod grpc;
 mod decimal_math;
 mod zen;
+mod telemetry;
 
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -13,6 +14,7 @@ use clap::Parser;
 use crate::grpc::{VerificationServiceImpl};
 use crate::grpc::verification_service::verification_service_server::VerificationServiceServer;
 use crate::zen::RuleEngine;
+use crate::telemetry::{init_glitchtip, install_panic_hook};
 
 #[derive(Parser, Debug)]
 #[command(name = "verification", version, about = "AI Auditor Verification Service")]
@@ -29,6 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    init_glitchtip();  // error reporting to GlitchTip (no-op when GLITCHTIP_DSN unset)
+    install_panic_hook();
 
     let args = Args::parse();
 

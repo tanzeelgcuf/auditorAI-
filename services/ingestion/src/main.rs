@@ -1,8 +1,11 @@
 // services/ingestion/src/main.rs
+#![deny(clippy::unwrap_used)]
+
 mod grpc;
 mod preprocess;
 mod ocr;
 mod bbox;
+mod telemetry;
 
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -31,6 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // GlitchTip error reporting — no-ops when GLITCHTIP_DSN is unset, so dev
+    // runs behave identically to today.
+    crate::telemetry::init_glitchtip();
+    crate::telemetry::install_panic_hook();
 
     let args = Args::parse();
 

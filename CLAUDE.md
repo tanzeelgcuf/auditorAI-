@@ -25,7 +25,7 @@
 | DB | PostgreSQL + PgBouncer, RLS enabled |
 | Vector | pgvector (or Qdrant) |
 | Infra | docker-compose (v1 launch), Terraform (future) |
-| Observability | Langfuse, GlitchTip, OpenTelemetry/Jaeger |
+| Observability | Langfuse, GlitchTip, OpenTelemetry/Jaeger — `GLITCHTIP_DSN` (Sentry-compatible) is consumed by ALL FOUR services: api (Go sentry-go), agent-runtime (Python sentry-sdk), ingestion + verification (Rust sentry crate). Empty = error reporting OFF everywhere (no-op). Defined in `.env.example`. |
 
 ## Key Paths
 

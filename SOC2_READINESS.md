@@ -74,7 +74,7 @@ doc for our eventual formal SOC2 Type II audit.
 | Health/readiness endpoints | ✅ | `/healthz`, `/readyz` on all services |
 | Graceful shutdown (SIGTERM drain) | ✅ | Go `http.Server.Shutdown`, Rust tokio signal |
 | Circuit breakers on cross-service calls | 🟡 | gobreaker in `middleware.go`; per-service wiring in progress |
-| Observability (Langfuse, GlitchTip, Jaeger) | 🟡 | docker-compose services present; instrumentation wiring in progress |
+| Observability (Langfuse, GlitchTip, Jaeger) | 🟡 | Sentry/GlitchTip error reporting wired in all 4 services (Go panic wrapper + capture, Python `capture_exception`, Rust panic hooks both services); Langfuse extraction traces wired; Jaeger end-to-end spans pending |
 | NATS JetStream queueing for bursty ingestion | ✅ | `pipeline` package + docker-compose NATS |
 | Verification-engine hard-fail on error (never silent wrong number) | ✅ | `#![deny(clippy::unwrap_used)]`, `Result<T, ServiceError>` everywhere in verification |
 
@@ -121,7 +121,7 @@ doc for our eventual formal SOC2 Type II audit.
 1. **AWS KMS integration** for per-firm data keys + S3 SSE-KMS (CC6.6) — before first enterprise deal
 2. **Tested backup/restore**, including single-tenant restore isolation (CC7.1)
 3. **ClamAV in upload pipeline** (CC6.10)
-4. **Full observability instrumentation** — Langfuse traces on every LLM call, Jaeger end-to-end spans (CC7.1)
+4. **Observability residual** — GlitchTip/Sentry error reporting DONE (all 4 services); remaining: Langfuse traces on every LLM call, Jaeger end-to-end spans, AND capture non-panic error returns (gRPC `Status::internal`, graph-load failures) in Rust + Go — currently only panics + agent-runtime exceptions reach GlitchTip (CC7.1)
 5. **Formal incident-response plan** + breach-notification flow (CC7.4 / legal)
 6. **DPA + Privacy Policy** ready before first enterprise sales conversation
 7. **Synthetic vs production data policy** — never test against real financial data (already convention in seed-demo; document it)
