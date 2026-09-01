@@ -5,9 +5,10 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useLogin } from "../../../lib/hooks";
 import { setTokens } from "../../../lib/api";
-import { Button } from "../../../components/ui/button";
 import { Input } from "../../../components/ui/input";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "../../../components/ui/card";
+import { Lock, Loader2, Mail, User, AlertCircle } from "lucide-react";
+import { MotionDiv, StaggerContainer, MotionButton } from "../../../components/ui/motion";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -34,63 +35,95 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle>Sign in</CardTitle>
-          <CardDescription>AI Auditor — reconciliation platform</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1">
-              <label className="text-sm font-medium">Email</label>
-              <Input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@firm.com"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm font-medium">Password</label>
-              <Input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm font-medium">2FA code (optional)</label>
-              <Input
-                value={totpCode}
-                onChange={(e) => setTotpCode(e.target.value)}
-                placeholder="000000"
-                inputMode="numeric"
-              />
-            </div>
+    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+      <MotionDiv variant="slideUp" className="w-full max-w-sm">
+        <Card>
+          <CardHeader className="text-center">
+            <CardTitle className="text-2xl">Sign in</CardTitle>
+            <CardDescription>AI Auditor — reconciliation platform</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <StaggerContainer staggerChildren={0.04} staggerDelay={0.1}>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <MotionDiv variant="slideUp">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-foreground">Email</label>
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                      <Input
+                        type="email"
+                        required
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="you@firm.com"
+                        className="pl-10"
+                      />
+                    </div>
+                  </div>
+                </MotionDiv>
+                <MotionDiv variant="slideUp">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-foreground">Password</label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                      <Input
+                        type="password"
+                        required
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="pl-10"
+                      />
+                    </div>
+                  </div>
+                </MotionDiv>
+                <MotionDiv variant="slideUp">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-foreground">2FA code (optional)</label>
+                    <div className="relative">
+                      <User className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                      <Input
+                        value={totpCode}
+                        onChange={(e) => setTotpCode(e.target.value)}
+                        placeholder="000000"
+                        inputMode="numeric"
+                        className="pl-10"
+                      />
+                    </div>
+                  </div>
+                </MotionDiv>
 
-            {error && (
-              <p className="rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-700">
-                {error}
-              </p>
-            )}
+                {error && (
+                  <MotionDiv variant="slideDown" className="flex items-center gap-2 rounded-md border border-destructive/20 bg-destructive-bg p-3 text-sm text-destructive">
+                    <AlertCircle className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
+                    {error}
+                  </MotionDiv>
+                )}
 
-            <Button type="submit" className="w-full" disabled={login.isPending}>
-              {login.isPending ? "Signing in…" : "Sign in"}
-            </Button>
-          </form>
+                <MotionDiv variant="slideUp">
+                  <MotionButton type="submit" className="w-full gap-2" disabled={login.isPending}>
+                    {login.isPending ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        Signing in…
+                      </>
+                    ) : (
+                      "Sign in"
+                    )}
+                  </MotionButton>
+                </MotionDiv>
+              </form>
 
-          <p className="mt-4 text-center text-sm text-slate-500">
-            No account?{" "}
-            <Link href="/signup" className="font-medium text-slate-900 hover:underline">
-              Create your firm
-            </Link>
-          </p>
-        </CardContent>
-      </Card>
+              <MotionDiv variant="slideUp" className="mt-6 text-center text-sm text-muted-foreground">
+                No account?{" "}
+                <Link href="/signup" className="font-medium text-primary hover:underline">
+                  Create your firm
+                </Link>
+              </MotionDiv>
+            </StaggerContainer>
+          </CardContent>
+        </Card>
+      </MotionDiv>
     </div>
   );
 }

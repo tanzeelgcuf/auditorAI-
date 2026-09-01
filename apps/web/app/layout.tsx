@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { QueryProvider } from "../components/providers/query-provider";
+import { ThemeProvider } from "../components/providers/theme-provider";
 
 export const metadata: Metadata = {
   title: "AI Auditor",
@@ -13,9 +14,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <body className="antialiased">
-        <QueryProvider>{children}</QueryProvider>
+        <ThemeProvider attribute="data-theme" defaultTheme="system" enableSystem>
+          <QueryProvider>{children}</QueryProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

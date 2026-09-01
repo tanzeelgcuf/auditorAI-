@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CitationOverlay, CitationTarget } from "./citation-overlay";
+import { Loader2, Minus, Plus, RotateCw, Download } from "lucide-react";
+import { MotionDiv, MotionButton } from "../ui/motion";
 
 interface PdfViewerProps {
   url: string;
@@ -21,12 +23,15 @@ export function PdfViewer({ url, citation, onSelectCitation }: PdfViewerProps) {
   const [pageNum, setPageNum] = useState(1);
   const [scale, setScale] = useState(1.4);
   const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     let doc: PDFDocumentProxy | null = null;
 
     async function load() {
+      setIsLoading(true);
+      setError(null);
       try {
         const pdfjs = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
@@ -35,8 +40,10 @@ export function PdfViewer({ url, citation, onSelectCitation }: PdfViewerProps) {
         doc = loaded;
         setPdf(loaded);
         setPageNum(1);
+        setIsLoading(false);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load PDF");
+        setIsLoading(false);
       }
     }
     load();
@@ -66,19 +73,67 @@ export function PdfViewer({ url, citation, onSelectCitation }: PdfViewerProps) {
     };
   }, [pdf, pageNum, scale]);
 
+  const handleZoomIn = () => setScale((s) => Math.min(3, s + 0.2));
+  const handleZoomOut = () => setScale((s) => Math.max(0.5, s - 0.2));
+  const handleRotate = () => {
+    // Rotation would require more complex canvas manipulation
+    // For now, we just reset scale
+    setScale(1.4);
+  };
+
   return (
-    <div className="relative w-full overflow-hidden rounded-lg border border-slate-200 bg-slate-100">
+    <div className="relative w-full overflow-hidden rounded-lg border border-border bg-muted">
       {error ? (
-        <div className="flex h-64 items-center justify-center text-sm text-red-600">{error}</div>
+        <MotionDiv variant="fadeIn" className="flex h-64 items-center justify-center text-sm text-destructive">
+          {error}
+        </MotionDiv>
+      ) : isLoading ? (
+        <div className="flex h-64 items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" aria-hidden="true" />
+          <span className="sr-only">Loading PDF…</span>
+        </div>
       ) : (
         <>
           <canvas ref={canvasRef} className="mx-auto max-w-full" />
           {pdf && pdf.numPages > 1 && (
-            <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-md bg-white/90 px-2 py-1 text-xs shadow">
-              <button onClick={() => setScale((s) => Math.max(0.5, s - 0.2))} aria-label="Zoom out">−</button>
-              <span>Page {pageNum}/{pdf.numPages}</span>
-              <button onClick={() => setScale((s) => Math.min(3, s + 0.2))} aria-label="Zoom in">+</button>
-            </div>
+            <MotionDiv variant="slideUp" className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-card/95 px-3 py-2 text-xs shadow-lg border border-border backdrop-blur supports-[backdrop-filter]:bg-card/80">
+              <MotionButton
+                variant="ghost"
+                size="icon"
+                onClick={handleZoomOut}
+                aria-label="Zoom out"
+                className="h-8 w-8"
+              >
+                <Minus className="h-4 w-4" aria-hidden="true" />
+              </MotionButton>
+              <span className="px-2 font-mono text-foreground">{pageNum}/{pdf.numPages}</span>
+              <MotionButton
+                variant="ghost"
+                size="icon"
+                onClick={handleZoomIn}
+                aria-label="Zoom in"
+                className="h-8 w-8"
+              >
+                <Plus className="h-4 w-4" aria-hidden="true" />
+              </MotionButton>
+              <div className="w-px h-6 bg-border mx-1" />
+              <MotionButton
+                variant="ghost"
+                size="icon"
+                onClick={handleRotate}
+                aria-label="Reset view"
+                className="h-8 w-8"
+              >
+                <RotateCw className="h-4 w-4" aria-hidden="true" />
+              </MotionButton>
+              <a
+                href={url}
+                download
+                className="h-8 w-8 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <Download className="h-4 w-4" aria-hidden="true" />
+              </a>
+            </MotionDiv>
           )}
           <CitationOverlay
             active={citation}

@@ -2,16 +2,16 @@ import * as React from "react";
 import { cn } from "../../lib/utils";
 
 interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
-  variant?: "default" | "success" | "warning" | "danger" | "info";
+  variant?: "default" | "success" | "warning" | "destructive" | "info";
 }
 
 export function Badge({ className, variant = "default", ...props }: BadgeProps) {
   const variants = {
-    default: "bg-slate-100 text-slate-700 border-slate-200",
-    success: "bg-green-50 text-green-700 border-green-200",
-    warning: "bg-amber-50 text-amber-700 border-amber-200",
-    danger: "bg-red-50 text-red-700 border-red-200",
-    info: "bg-blue-50 text-blue-700 border-blue-200",
+    default: "bg-muted text-muted-foreground border-border",
+    success: "bg-success-bg text-success border-success/20",
+    warning: "bg-warning-bg text-warning border-warning/20",
+    destructive: "bg-destructive/10 text-destructive border-destructive/20",
+    info: "bg-info-bg text-info border-info/20",
   };
   return (
     <span

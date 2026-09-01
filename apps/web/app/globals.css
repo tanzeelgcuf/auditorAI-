@@ -2,26 +2,223 @@
 @tailwind components;
 @tailwind utilities;
 
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Light mode — professional B2B fintech tokens */
+  --color-primary: 15 23 42;             /* slate-900 */
+  --color-primary-foreground: 255 255 255;
+  --color-secondary: 100 116 139;        /* slate-500 */
+  --color-secondary-foreground: 255 255 255;
+  --color-accent: 3 105 161;             /* sky-700 */
+  --color-accent-foreground: 255 255 255;
+  --color-destructive: 220 38 38;        /* red-600 */
+  --color-destructive-foreground: 255 255 255;
+  --color-ring: 3 105 161;               /* sky-700 */
+
+  --color-background: 248 250 252;       /* slate-50 */
+  --color-foreground: 15 23 42;          /* slate-900 */
+
+  --color-muted: 226 232 240;            /* slate-200 */
+  --color-muted-foreground: 100 116 139; /* slate-500 */
+
+  --color-border: 203 213 225;           /* slate-300 */
+  --color-input: 255 255 255;            /* white */
+  --color-card: 255 255 255;             /* white */
+  --color-card-foreground: 15 23 42;     /* slate-900 */
+
+  /* Semantic status tokens */
+  --color-success: 21 128 61;            /* green-700 */
+  --color-success-foreground: 255 255 255;
+  --color-success-bg: 236 253 245;       /* green-50 */
+
+  --color-warning: 180 83 9;             /* amber-700 */
+  --color-warning-foreground: 255 255 255;
+  --color-warning-bg: 255 251 235;       /* amber-50 */
+
+  --color-info: 14 116 144;              /* cyan-700 */
+  --color-info-foreground: 255 255 255;
+  --color-info-bg: 236 254 255;          /* cyan-50 */
+
+  /* Motion tokens */
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 200ms;
+  --motion-duration-slow: 300ms;
+  --motion-easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-easing-exit: cubic-bezier(0.4, 0, 1, 1);
+  --motion-easing-enter: cubic-bezier(0, 0, 0.2, 1);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --color-primary: 248 250 252;
+    --color-primary-foreground: 15 23 42;
+    --color-secondary: 148 163 184;
+    --color-secondary-foreground: 15 23 42;
+    --color-accent: 56 189 248;
+    --color-accent-foreground: 15 23 42;
+    --color-destructive: 248 113 113;
+    --color-destructive-foreground: 15 23 42;
+    --color-ring: 56 189 248;
+
+    --color-background: 15 23 42;
+    --color-foreground: 248 250 252;
+
+    --color-muted: 30 41 59;
+    --color-muted-foreground: 148 163 184;
+
+    --color-border: 51 65 85;
+    --color-input: 30 41 59;
+    --color-card: 30 41 59;
+    --color-card-foreground: 248 250 252;
+
+    --color-success: 74 222 128;
+    --color-success-foreground: 15 23 42;
+    --color-success-bg: 6 95 35;
+
+    --color-warning: 251 191 36;
+    --color-warning-foreground: 15 23 42;
+    --color-warning-bg: 120 53 15;
+
+    --color-info: 103 232 249;
+    --color-info-foreground: 15 23 42;
+    --color-info-bg: 14 116 144;
   }
 }
 
-body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+[data-theme="light"] {
+  --color-primary: 15 23 42;
+  --color-primary-foreground: 255 255 255;
+  --color-secondary: 100 116 139;
+  --color-secondary-foreground: 255 255 255;
+  --color-accent: 3 105 161;
+  --color-accent-foreground: 255 255 255;
+  --color-destructive: 220 38 38;
+  --color-destructive-foreground: 255 255 255;
+  --color-ring: 3 105 161;
+
+  --color-background: 248 250 252;
+  --color-foreground: 15 23 42;
+
+  --color-muted: 226 232 240;
+  --color-muted-foreground: 100 116 139;
+
+  --color-border: 203 213 225;
+  --color-input: 255 255 255;
+  --color-card: 255 255 255;
+  --color-card-foreground: 15 23 42;
+
+  --color-success: 21 128 61;
+  --color-success-foreground: 255 255 255;
+  --color-success-bg: 236 253 245;
+
+  --color-warning: 180 83 9;
+  --color-warning-foreground: 255 255 255;
+  --color-warning-bg: 255 251 235;
+
+  --color-info: 14 116 144;
+  --color-info-foreground: 255 255 255;
+  --color-info-bg: 236 254 255;
+}
+
+[data-theme="dark"] {
+  --color-primary: 248 250 252;
+  --color-primary-foreground: 15 23 42;
+  --color-secondary: 148 163 184;
+  --color-secondary-foreground: 15 23 42;
+  --color-accent: 56 189 248;
+  --color-accent-foreground: 15 23 42;
+  --color-destructive: 248 113 113;
+  --color-destructive-foreground: 15 23 42;
+  --color-ring: 56 189 248;
+
+  --color-background: 15 23 42;
+  --color-foreground: 248 250 252;
+
+  --color-muted: 30 41 59;
+  --color-muted-foreground: 148 163 184;
+
+  --color-border: 51 65 85;
+  --color-input: 30 41 59;
+  --color-card: 30 41 59;
+  --color-card-foreground: 248 250 252;
+
+  --color-success: 74 222 128;
+  --color-success-foreground: 15 23 42;
+  --color-success-bg: 6 95 35;
+
+  --color-warning: 251 191 36;
+  --color-warning-foreground: 15 23 42;
+  --color-warning-bg: 120 53 15;
+
+  --color-info: 103 232 249;
+  --color-info-foreground: 255 255 255;
+  --color-info-bg: 14 116 144;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+
+  /* Motion utilities */
+  .motion-reduce *,
+  .motion-reduce *::before,
+  .motion-reduce *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-fade-in {
+    animation: fadeIn var(--motion-duration-base) var(--motion-easing-enter);
+  }
+  .animate-slide-up {
+    animation: slideUp var(--motion-duration-base) var(--motion-easing-enter);
+  }
+  .animate-slide-down {
+    animation: slideDown var(--motion-duration-base) var(--motion-easing-enter);
+  }
+  .animate-scale-in {
+    animation: scaleIn var(--motion-duration-fast) var(--motion-easing-enter);
+  }
+  .animate-shimmer {
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes scaleIn {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
   }
 }
