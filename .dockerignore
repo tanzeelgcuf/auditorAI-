@@ -1,0 +1,64 @@
+# Repo-root .dockerignore
+#
+# All four service images build from the REPOSITORY ROOT as their context, not
+# from their own subdirectory. That is not a stylistic choice:
+# services/{ingestion,verification}/build.rs calls
+# tonic_build::compile_protos("../../proto/<svc>.proto"), so proto/ must be
+# inside the build context or the Rust builds fail at build-script time.
+# One shared context for every image keeps the four Dockerfiles consistent.
+#
+# The repo is ~3.6MB without build artifacts, so the goal here is correctness
+# (never ship a host-built binary or a .env into an image) more than speed.
+
+# --- VCS / tooling ---
+.git
+.gitignore
+.github
+.claude
+**/*.md
+
+# --- secrets: never let a real .env into a layer ---
+.env
+.env.local
+.env.*.local
+
+# --- host build artifacts (would shadow the in-image build) ---
+# Only names that actually occur as generated output in this repo are listed.
+# Speculative patterns are a hazard here: a blanket `**/build` or `**/dist`
+# would silently swallow a future Next.js route directory of the same name and
+# the failure would surface as a missing page, not a build error.
+**/node_modules
+**/target
+**/.next
+**/.venv
+**/__pycache__
+**/*.pyc
+
+# --- local state that must never be baked in ---
+# NOT `**/reports`: that pattern matched
+# apps/web/app/books/[bookId]/reports/, the report-viewer route, and would have
+# built a web image with the reports page missing. REPORTS_DIR defaults to
+# "reports" relative to the api's CWD, so the real artifact path is this one.
+services/api/reports
+**/*.log
+**/*.sqlite
+**/*.db
+**/.terraform
+**/*.tfstate
+**/*.tfstate.backup
+
+# --- editor / OS noise ---
+**/.idea
+**/.vscode
+**/*.swp
+**/*.swo
+**/.DS_Store
+**/Thumbs.db
+
+# --- other apps: not part of any server image ---
+apps/mobile
+
+# --- compose files: read by the daemon's client, never needed in an image ---
+infra/docker-compose.yml
+infra/docker-compose.dev.yml
+docker-compose.override.yml
