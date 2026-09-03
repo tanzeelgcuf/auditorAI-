@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sony/gobreaker"
 
@@ -121,10 +123,15 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to acquire database connection")
 				return
 			}
+			// ONE deferred cleanup for every exit path, including a panic. Before
+			// this, RESET+Release were written inline after next.ServeHTTP, so a
+			// panicking handler (caught upstream by Recoverer) leaked the pool
+			// connection permanently — with pgx's default pool of 4*NumCPU, a
+			// handful of panics exhausts the pool and the API stops serving.
+			defer ReleaseRLSConn(r.Context(), conn)
 
 			_, err = conn.Exec(r.Context(), "SELECT set_config('app.current_firm', $1, false)", firmIDStr)
 			if err != nil {
-				conn.Release()
 				slog.Error("failed to set app.current_firm", "error", err)
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to set session context")
 				return
@@ -132,8 +139,6 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 
 			assignedBooks, err := getAssignedBooks(r.Context(), conn, firmIDStr, userIDStr, roleStr)
 			if err != nil {
-				_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
-				conn.Release()
 				slog.Error("failed to get assigned books", "error", err)
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to load permissions")
 				return
@@ -142,8 +147,6 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			booksStr := strings.Join(assignedBooks, ",")
 			_, err = conn.Exec(r.Context(), "SELECT set_config('app.assigned_books', $1, false)", booksStr)
 			if err != nil {
-				_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
-				conn.Release()
 				slog.Error("failed to set app.assigned_books", "error", err)
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "Failed to set session context")
 				return
@@ -153,10 +156,96 @@ func RLSInjector(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			ctx = context.WithValue(ctx, connKey, conn)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
-			_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
-			conn.Release()
 		})
 	}
+}
+
+// AcquireScoped takes a connection from pool, sets app.current_firm and
+// app.assigned_books on it, and returns it together with a context that
+// GetConn can find it in.
+//
+// It exists for the one authenticated surface that does NOT go through
+// RLSInjector: the client portal, whose tokens carry a book id instead of a firm
+// id and whose middleware previously stashed an UNPRIMED connection under its own
+// private context key. Unprimed meant every policy predicate on that connection
+// raised on the unset GUC — invisible while the app connected as the owner,
+// a total portal outage the moment it stopped.
+//
+// Callers must `defer ReleaseRLSConn(ctx, conn)` with the ORIGINAL request
+// context.
+func AcquireScoped(ctx context.Context, pool *pgxpool.Pool, firmID string, books []string) (*pgxpool.Conn, context.Context, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, ctx, err
+	}
+	if _, err := conn.Exec(ctx,
+		"SELECT set_config('app.current_firm', $1, false)", firmID); err != nil {
+		ReleaseRLSConn(ctx, conn)
+		return nil, ctx, err
+	}
+	if _, err := conn.Exec(ctx,
+		"SELECT set_config('app.assigned_books', $1, false)", strings.Join(books, ",")); err != nil {
+		ReleaseRLSConn(ctx, conn)
+		return nil, ctx, err
+	}
+	scoped := context.WithValue(ctx, AssignedBooksKey, books)
+	scoped = context.WithValue(scoped, connKey, conn)
+	return conn, scoped, nil
+}
+
+// ReleaseRLSConn scrubs the tenant GUCs off a request connection and returns it
+// to the pool. If the scrub cannot be confirmed the connection is CLOSED instead
+// of reused, because a pooled connection still carrying app.current_firm is a
+// cross-tenant read waiting to happen.
+func ReleaseRLSConn(reqCtx context.Context, conn *pgxpool.Conn) {
+	// context.WithoutCancel is the load-bearing part. reqCtx is cancelled when
+	// the client disconnects or chi's 30s Timeout fires, and Exec on a cancelled
+	// context never reaches the server — so the previous inline
+	// `conn.Exec(r.Context(), "RESET ...")` was a silent no-op on exactly the
+	// requests most likely to be aborted mid-flight. The GUCs then survived into
+	// the next request that acquired this connection.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), 5*time.Second)
+	defer cancel()
+
+	if _, err := conn.Exec(ctx, "RESET app.current_firm, app.assigned_books"); err != nil {
+		slog.Error("failed to reset RLS session vars — closing connection instead of pooling it",
+			"error", err)
+		// pgxpool.Conn.Release() destroys the underlying resource rather than
+		// returning it when the connection is already closed, so this is the
+		// supported way to take a suspect connection out of circulation.
+		_ = conn.Conn().Close(ctx)
+	}
+	conn.Release()
+}
+
+// Querier is the slice of pgx's API that request-scoped code uses. Both
+// *pgxpool.Pool and *pgxpool.Conn implement it, which is what makes DB() below a
+// drop-in replacement at a call site without changing any signature.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// DB returns the RLS-wired request connection when there is one, otherwise the
+// pool passed in.
+//
+// Why this exists: policies call current_setting('app.current_firm') with no
+// missing_ok argument, so they RAISE on a connection that never had the GUC set.
+// A handler that reaches for its own *pgxpool.Pool therefore does not "see all
+// rows" once the app connects as auditor_app — it 500s. Both outcomes are wrong,
+// and the pool one used to be invisible because the owner role ignored policies
+// entirely.
+//
+// Handlers should call middleware.DB(ctx, s.db) instead of s.db. Background
+// goroutines and pre-auth handlers have no request connection and must be given
+// the BYPASSRLS sys pool explicitly rather than relying on this fallback.
+func DB(ctx context.Context, fallback Querier) Querier {
+	if c := GetConn(ctx); c != nil {
+		return c
+	}
+	return fallback
 }
 
 // GetConn returns the RLS-wired DB connection from context, or nil.

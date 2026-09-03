@@ -186,7 +186,7 @@ func (s *Service) HandleBulkConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, id := range req.LinkIDs {
-		_, err := s.db.Exec(r.Context(),
+		_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(),
 			"UPDATE reconciliation_groups SET status = 'confirmed' WHERE id = $1 AND client_book_id = $2",
 			id, bookID)
 		if err != nil {
