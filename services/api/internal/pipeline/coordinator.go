@@ -31,6 +31,11 @@ import (
 // ErrNoIngestion indicates the coordinator has no live ingestion connection.
 var ErrNoIngestion = errors.New("no ingestion connection")
 
+// maxDeliveryAttempts bounds JetStream redelivery for document.uploaded. After
+// this many failed attempts the document is marked 'failed' rather than being
+// retried forever; see the ConsumerConfig comment in Run.
+const maxDeliveryAttempts = 5
+
 type Coordinator struct {
 	nc          *nats.Conn
 	db          *pgxpool.Pool
@@ -83,6 +88,27 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		Durable:       "coordinator",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
+
+		// FilterSubject is REQUIRED, not cosmetic. The DOCUMENTS stream carries
+		// three subjects (pipeline.go:41) and this consumer previously received
+		// all of them, discarding two with a bare Ack in the loop below. Now that
+		// handleUploaded publishes document.processing.failed to that same
+		// stream, an unfiltered consumer would be delivered its own failure
+		// events — a self-feedback loop it then acks and drops.
+		FilterSubject: "document.uploaded",
+
+		// MaxDeliver is REQUIRED because the error paths below now Nak instead of
+		// dropping. The default is -1 (unlimited): a document that fails
+		// deterministically — a corrupt PDF that always fails the ingestion gRPC
+		// — would be redelivered forever at full speed. Five attempts, then the
+		// document is marked failed and the message is acked.
+		MaxDeliver: maxDeliveryAttempts,
+
+		// The default AckWait is 30s. OCR of a 25MB scanned PDF through the docTR
+		// sidecar can exceed that, and an expired AckWait means the message is
+		// redelivered while the first attempt is still running — duplicate
+		// entities for one document. Two minutes is sized for the slow path.
+		AckWait: 2 * time.Minute,
 	})
 	_ = attachCtx
 	if err != nil {
@@ -108,9 +134,71 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 }
 
-func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
-	defer msg.Ack()
+// fail handles a processing error for one document.
+//
+// Before this existed, every error path in handleUploaded was `slog.Error(...)
+// + return` under a `defer msg.Ack()`. That combination ACKNOWLEDGED AND
+// DISCARDED the event: no retry, no dead letter, and — worse — no state change,
+// so source_documents.ocr_status stayed 'pending' forever while the UI showed a
+// document that was quietly never going to be processed. For a reconciliation
+// product that is silent data loss: the book reconciles against whatever
+// happened to load, and nothing says a document is missing.
+//
+// Retry vs. give up is decided by the delivery count, not by guessing which
+// errors are transient: a MinIO blip and a corrupt file look identical here, and
+// the cheap correct policy is to retry a bounded number of times and then record
+// the failure where a human can see it.
+func (c *Coordinator) fail(ctx context.Context, msg jetstream.Msg, docID, stage string, cause error) {
+	attempt := uint64(1)
+	if md, err := msg.Metadata(); err == nil {
+		attempt = md.NumDelivered
+	}
 
+	if attempt < maxDeliveryAttempts {
+		slog.Warn("coordinator: retrying document",
+			"doc", docID, "stage", stage, "attempt", attempt,
+			"max", maxDeliveryAttempts, "error", cause)
+		// Nak asks JetStream to redeliver. AckWait/MaxDeliver on the consumer
+		// bound how long and how often.
+		if err := msg.Nak(); err != nil {
+			slog.Error("coordinator: nak failed", "doc", docID, "error", err)
+		}
+		return
+	}
+
+	slog.Error("coordinator: document failed permanently",
+		"doc", docID, "stage", stage, "attempts", attempt, "error", cause)
+
+	// The status write is what makes the failure visible to the API and the UI.
+	// It is best-effort by necessity — if the database is the thing that is
+	// broken, there is nowhere left to record the problem — but unlike the
+	// previous silent return, a failure to record it is itself logged.
+	if docID != "" {
+		if _, err := c.db.Exec(ctx,
+			`UPDATE source_documents SET ocr_status = 'failed' WHERE id = $1`, docID); err != nil {
+			slog.Error("coordinator: could not mark document failed",
+				"doc", docID, "error", err)
+		}
+	}
+
+	// document.processing.failed is declared on the DOCUMENTS stream
+	// (pipeline.go:41) and, until now, had NO PRODUCER anywhere in the
+	// repository — the failure signal was designed and never wired.
+	if payload, err := json.Marshal(map[string]string{
+		"document_id": docID, "stage": stage, "error": cause.Error(),
+	}); err == nil {
+		if _, err := c.js.Publish(ctx, "document.processing.failed", payload); err != nil {
+			slog.Error("coordinator: could not publish failure event", "doc", docID, "error", err)
+		}
+	}
+
+	// Ack only now: the event is terminal and must not come back.
+	if err := msg.Ack(); err != nil {
+		slog.Error("coordinator: ack failed", "doc", docID, "error", err)
+	}
+}
+
+func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 	var ev struct {
 		DocumentID   string `json:"document_id"`
 		ClientBookID string `json:"client_book_id"`
@@ -118,7 +206,11 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		DocType      string `json:"doc_type"`
 	}
 	if err := json.Unmarshal(msg.Data(), &ev); err != nil || ev.DocumentID == "" {
+		// A malformed payload will never become well-formed; retrying is
+		// pointless, so this one path acks immediately rather than going through
+		// fail(). There is no document_id to mark.
 		slog.Error("coordinator: bad document.uploaded payload", "data", string(msg.Data()))
+		_ = msg.Ack()
 		return
 	}
 
@@ -127,7 +219,13 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 	// Stream the file from MinIO — ingestion needs the bytes to parse.
 	raw, err := c.storage.StreamObject(ctx, ev.StorageKey)
 	if err != nil {
-		slog.Error("coordinator: stream object failed", "doc", ev.DocumentID, "error", err)
+		// This is the exact error the discarded-bytes bug produced: HandleUpload
+		// wrote a source_documents row and published this event without ever
+		// writing the object, so StreamObject returned NoSuchKey on a key that
+		// had never existed. That is fixed at the source in
+		// internal/documents.HandleUpload; this path remains for real storage
+		// faults.
+		c.fail(ctx, msg, ev.DocumentID, "stream_object", err)
 		return
 	}
 
@@ -148,13 +246,13 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		ColumnMap:     columnMap,
 	})
 	if err != nil {
-		slog.Error("coordinator: ingestion gRPC failed", "doc", ev.DocumentID, "error", err)
+		c.fail(ctx, msg, ev.DocumentID, "ingestion_grpc", err)
 		return
 	}
 
 	// Write parsed entities to extracted_entities.
 	if err := c.persistEntities(ctx, ev.ClientBookID, ev.DocumentID, resp.Entities); err != nil {
-		slog.Error("coordinator: persist entities failed", "doc", ev.DocumentID, "error", err)
+		c.fail(ctx, msg, ev.DocumentID, "persist_entities", err)
 		return
 	}
 
@@ -176,7 +274,13 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		_, _ = c.js.Publish(ctx, "link.requested", payload)
 	}
 
-	_ = raw
+	// Ack LAST, and only on the success path. The previous `defer msg.Ack()` at
+	// the top of this function acked before any of the work was attempted, which
+	// is what made every error path a silent drop.
+	if err := msg.Ack(); err != nil {
+		slog.Error("coordinator: ack failed after successful processing",
+			"doc", ev.DocumentID, "error", err)
+	}
 }
 
 // fetchColumnMap selects the csv_column_mapping whose source columns best match
