@@ -1,15 +1,15 @@
 # services/agent-runtime/tests/test_extract.py
-# Extraction + classification tests with a mocked Anthropic client (offline).
+# Classification tests with a mocked Anthropic client (offline).
 
 import sys
 import os
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from graph.schema import ExtractedEntity, GraphState
-from graph.extract import extract_entities, classify_entities, _extract_json, _parse_amount_cents
+from graph.extract import extract_entities, classify_entities, _extract_json, _row_cents
 
 BOOK_ID = UUID("11111111-1111-1111-1111-111111111111")
 DOC_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -48,6 +48,34 @@ def make_state(entries):
     }
 
 
+def source_row(**overrides):
+    """A row shaped like mcp.HandleGetPendingEntities returns (mcp.go:102-118).
+
+    The production input to this node is a DATABASE ROW whose amount_cents was
+    already parsed by services/ingestion — not a bare OCR string. The old
+    fixtures passed {"text": ...} only, which no production caller ever sends.
+    """
+    row = {
+        "id": str(uuid4()),
+        "client_book_id": str(BOOK_ID),
+        "source_document_id": str(DOC_ID),
+        "entity_type": "invoice_line_item",
+        "entity_subtype": "",
+        "amount_cents": 34250,
+        "currency": "USD",
+        "transaction_date": "2026-06-01",
+        "counterparty": "Acme Corp",
+        "description": "Web design services",
+        "gl_account_code": "",
+        "page_number": 1,
+        "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.04},
+        "extraction_confidence": 0.98,
+        "source_format": "structured",
+    }
+    row.update(overrides)
+    return row
+
+
 # ---- _extract_json robustness ----
 
 def test_extract_json_plain():
@@ -68,99 +96,157 @@ def test_extract_json_garbage():
     assert _extract_json("not json at all") == []
 
 
-# ---- _parse_amount_cents ----
+# ---- _row_cents: a READ of an exact integer, never a conversion ----
+# _parse_amount_cents (deleted) used to live here. Its tests asserted the bug:
+# `_parse_amount_cents("1250") == 1250` treated a bare integer as CENTS while
+# services/ingestion's parse_amount treats a bare integer as whole DOLLARS
+# (structured.rs AMOUNT_CASES: "100" -> 10000). The same string meant $12.50 in
+# Python and $1,250.00 in Rust, and both suites were green.
 
-def test_parse_amount_integer():
-    assert _parse_amount_cents(100) == 100
-
-
-def test_parse_amount_dollars_float():
-    assert _parse_amount_cents(12.50) == 1250
-
-
-def test_parse_amount_string_dollars():
-    assert _parse_amount_cents("$12.50") == 1250
-
-
-def test_parse_amount_string_cents():
-    assert _parse_amount_cents("1250") == 1250
+def test_row_cents_reads_integer():
+    assert _row_cents({"amount_cents": 34250}) == 34250
+    assert _row_cents({"amount_cents": -4500}) == -4500
+    assert _row_cents({"amount_cents": 0}) == 0
 
 
-def test_parse_amount_negative():
-    assert _parse_amount_cents("-500") == -500
+def test_row_cents_accepts_exact_float_integer():
+    # A lax JSON encoder may render 34250 as 34250.0 — exact, so admissible.
+    assert _row_cents({"amount_cents": 34250.0}) == 34250
 
 
-def test_parse_amount_parenthesized():
-    assert _parse_amount_cents("(500)") == -500
+def test_row_cents_refuses_dollars_as_float():
+    # 342.50 is DOLLARS. Converting it here is the arithmetic this module must
+    # not perform, so the row is refused rather than multiplied by 100.
+    assert _row_cents({"amount_cents": 342.50}) is None
 
 
-def test_parse_amount_garbage():
-    assert _parse_amount_cents("N/A") == 0
+def test_row_cents_refuses_strings_and_missing():
+    for value in ("34250", "$342.50", "342.50", "N/A", "", None):
+        assert _row_cents({"amount_cents": value}) is None, value
+    assert _row_cents({}) is None
 
 
-# ---- fixture eval set (doc 13 / Round 7) ----
-# Lock the 4 real invoice totals from invoices_batch_june2026.pdf. The extraction
-# contract outputs amount_raw (verbatim page string); the deterministic parser
-# converts. Asserting these exact cents catches a regression in either the
-# contract or the parser before it silently drifts — the permanent eval guard.
-def test_invoice_fixture_raw_strings_convert_exactly():
-    fixtures = {
-        "342.50": 34250,   # INV-1001
-        "128.75": 12875,   # INV-1002
-        "899.00": 89900,   # BCH-2291
-        "215.00": 21500,   # MP-5502
-        "$342.50": 34250,  # with symbol
-        "1,500.00": 150000,  # comma-thousands
-    }
-    for raw, want in fixtures.items():
-        assert _parse_amount_cents(raw) == want, f"{raw!r} -> {_parse_amount_cents(raw)}, want {want}"
-
-
-def test_parse_raw_string_negative():
-    assert _parse_amount_cents("-45.00") == -4500
-    assert _parse_amount_cents("-342.50") == -34250
+def test_row_cents_refuses_bool():
+    # bool is an int subclass in Python; True must not become 1 cent.
+    assert _row_cents({"amount_cents": True}) is None
 
 
 # ---- extract_entities ----
 
-def test_extract_entities_calls_llm_and_parses():
+def test_extract_entities_calls_llm_and_classifies():
+    rows = [
+        source_row(amount_cents=125000, description="Web design services"),
+        source_row(amount_cents=125000, description="ACH payment received",
+                   counterparty="Acme Corp", transaction_date="2026-06-05"),
+    ]
     canned = json.dumps([
-        {
-            "entity_type": "invoice_line_item",
-            "entity_subtype": "standard",
-            "amount_cents": 125000,
-            "currency": "USD",
-            "transaction_date": "2026-06-01",
-            "counterparty": "Acme Corp",
-            "description": "Web design services",
-            "gl_account_code": None,
-        },
-        {
-            "entity_type": "bank_transaction",
-            "entity_subtype": "standard",
-            "amount_cents": 125000,
-            "currency": "USD",
-            "transaction_date": "2026-06-05",
-            "counterparty": "Acme Corp",
-            "description": "ACH payment received",
-            "gl_account_code": None,
-        },
+        {"source_index": 1, "entity_type": "invoice_line_item", "entity_subtype": "standard"},
+        {"source_index": 2, "entity_type": "bank_transaction", "entity_subtype": "standard"},
     ])
 
     client = FakeAnthropic(canned)
-    state = make_state([
-        {"text": "INV-123 $1250.00 Web design services", "description": "OCR line 1"},
-        {"text": "ACH 1250.00 Acme Corp 06/05", "description": "OCR line 2"},
-    ])
+    result = extract_entities(make_state(rows), client)
 
-    result = extract_entities(state, client)
-
-    assert "Extract raw values only" in client.last_prompt or "NEVER calculate" in client.last_prompt
+    assert "NEVER calculate" in client.last_prompt
     entities = result["classified_entities"]
     assert len(entities) == 2
     assert entities[0].entity_type == "invoice_line_item"
-    assert entities[0].amount_cents == 125000
     assert entities[1].entity_type == "bank_transaction"
+    assert entities[0].amount_cents == 125000
+    assert result.get("errors", []) == []
+
+
+def test_amounts_come_from_the_row_not_the_model():
+    """The FK + money regression, asserted directly.
+
+    The model is given an amount-free context and its reply is not trusted for
+    money or identity. Even when it emits a contradictory amount and a different
+    source_document_id, the entity must carry the ROW's id and cents — otherwise
+    reconciliation_group_members.extracted_entity_id (a FOREIGN KEY to
+    extracted_entities) cannot resolve, and create_entity_link 404s.
+    """
+    row = source_row(amount_cents=89900, description="BCH-2291 balance due")
+    canned = json.dumps([{
+        "source_index": 1,
+        "entity_type": "invoice_line_item",
+        "entity_subtype": "standard",
+        # everything below is an attempt to move the number or the provenance:
+        "amount_cents": 1,
+        "amount_raw": "$1.00",
+        "id": str(uuid4()),
+        "source_document_id": str(uuid4()),
+        "currency": "EUR",
+    }])
+
+    result = extract_entities(make_state([row]), FakeAnthropic(canned))
+    e = result["classified_entities"][0]
+
+    assert e.amount_cents == 89900
+    assert str(e.id) == row["id"]
+    assert str(e.source_document_id) == str(DOC_ID)
+    assert e.currency == "USD"
+
+
+def test_prompt_context_carries_no_amounts():
+    row = source_row(amount_cents=89900, description="BCH-2291 balance due")
+    client = FakeAnthropic(json.dumps([{"source_index": 1, "entity_type": "invoice_line_item"}]))
+    extract_entities(make_state([row]), client)
+    assert "89900" not in client.last_prompt
+    assert "899.00" not in client.last_prompt
+    assert "BCH-2291 balance due" in client.last_prompt
+
+
+def test_row_without_exact_cents_is_refused_not_zeroed():
+    # The old code returned 0 here, producing a $0.00 entity that reconciles
+    # with zero variance. It must fail the row instead.
+    rows = [source_row(amount_cents="342.50"), source_row(amount_cents=12875)]
+    # Indices refer to the ORIGINAL enumeration, so the surviving row stays [2];
+    # refusing a row must not shift the labels of the rows after it.
+    client = FakeAnthropic(json.dumps([
+        {"source_index": 2, "entity_type": "invoice_line_item"},
+    ]))
+    result = extract_entities(make_state(rows), client)
+
+    assert "[2] " in client.last_prompt and "[1] " not in client.last_prompt
+    assert len(result["classified_entities"]) == 1
+    assert result["classified_entities"][0].amount_cents == 12875
+    assert any("no exact integer amount_cents" in err for err in result["errors"])
+
+
+def test_row_without_id_is_refused():
+    result = extract_entities(
+        make_state([source_row(id="")]),
+        FakeAnthropic(json.dumps([{"source_index": 1, "entity_type": "invoice_line_item"}])),
+    )
+    assert result["classified_entities"] == []
+    assert any("no id" in err for err in result["errors"])
+
+
+def test_unknown_source_index_is_dropped_with_an_error():
+    result = extract_entities(
+        make_state([source_row()]),
+        FakeAnthropic(json.dumps([{"source_index": 7, "entity_type": "invoice_line_item"}])),
+    )
+    assert result["classified_entities"] == []
+    assert any("never shown to the model" in err for err in result["errors"])
+
+
+def test_missing_source_index_is_dropped_with_an_error():
+    result = extract_entities(
+        make_state([source_row()]),
+        FakeAnthropic(json.dumps([{"entity_type": "invoice_line_item"}])),
+    )
+    assert result["classified_entities"] == []
+    assert any("source_index missing" in err for err in result["errors"])
+
+
+def test_unclassified_row_is_reported():
+    result = extract_entities(
+        make_state([source_row(), source_row()]),
+        FakeAnthropic(json.dumps([{"source_index": 1, "entity_type": "invoice_line_item"}])),
+    )
+    assert len(result["classified_entities"]) == 1
+    assert any("never classified" in err for err in result["errors"])
 
 
 def test_extract_entities_error_appends_error():
@@ -171,7 +257,7 @@ def test_extract_entities_error_appends_error():
         def create(self, **kwargs):
             raise RuntimeError("boom")
 
-    state = make_state([{"text": "line 1"}])
+    state = make_state([source_row()])
     result = extract_entities(state, BrokenClient())
     assert "errors" in result
     assert len(result["errors"]) == 1

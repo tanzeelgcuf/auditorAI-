@@ -61,20 +61,13 @@ Raw OCR entries (zero-based index -> text):
 """
 
 
-def _raw_to_cents(value):
-    """Deterministic 'verbatim amount string' -> integer cents. The model never
-    does this conversion (doc 13). '$342.50' -> 34250, '128.75' -> 12875."""
-    if value is None:
-        return 0
-    s = str(value).strip()
-    if not s:
-        return 0
-    neg = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
-    s = "".join(c for c in s if c.isdigit() or c == ".")
-    try:
-        return int(round(float(s) * 100)) if "." in s else int(s or 0)
-    except ValueError:
-        return 0
+# Money parsing is NOT done here. `_raw_to_cents` is the shared harness mirror of
+# services/ingestion/src/ocr/structured.rs::parse_amount — one implementation, in
+# one file, subordinate to the Rust contract. It used to be a private copy in this
+# module and a second copy in tests/test_pilot_fixtures.py; the copies disagreed
+# with each other and with Rust (bare int as cents vs dollars, inverted accounting
+# negatives, European separators 1000x off, fail-open-to-0). Never re-inline it.
+from harness_amount_mirror import parse_amount_cents as _raw_to_cents
 
 
 def _ground_citations(cited, texts, total_cents):
