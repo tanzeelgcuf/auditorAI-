@@ -62,10 +62,25 @@ func main() {
 	// GLITCHTIP_DSN is set; server must start identically to today.
 	initSentry()
 
-	// Initialize database pool
+	// Initialize database pools. TWO of them, deliberately.
+	//
+	// pool    -> DATABASE_URL,     role auditor_app: NOSUPERUSER, NOBYPASSRLS,
+	//            not the table owner. Every RLS policy in infra/init.sql applies.
+	//            This is the only pool a request handler may touch.
+	// sysPool -> SYS_DATABASE_URL, role auditor_sys: NOSUPERUSER but BYPASSRLS.
+	//            For work that has no single firm to scope to: pre-auth identity
+	//            lookups (login must find firm_id FROM the email; signup creates
+	//            the firm row a policy would need to already exist) and the
+	//            cross-firm background sweepers.
+	//
+	// Splitting these is what makes the 30 policies real. While the API connected
+	// as `auditor` — initdb's bootstrap SUPERUSER and the owner of every table —
+	// Postgres exempted it from row security unconditionally, so all 30 policies
+	// were decoration. See the long comment above the roles section of
+	// infra/init.sql.
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://auditor:auditor@localhost:5432/ai_auditor?sslmode=disable"
+		dsn = "postgres://auditor_app:auditor@localhost:5432/ai_auditor?sslmode=disable"
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -74,13 +89,44 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Seed chart-of-accounts templates (idempotent; warn-only on failure)
-	if err := settings.SeedTemplates(ctx, pool); err != nil {
+	// No silent fallback to `pool`. If SYS_DATABASE_URL is missing, login,
+	// signup, password reset, the portal and all three background workers would
+	// run as auditor_app with no app.current_firm set — every policy predicate
+	// raises on the unset GUC, so the failure would be a wall of 500s at the
+	// worst possible moment rather than a clear message now.
+	sysDSN := os.Getenv("SYS_DATABASE_URL")
+	if sysDSN == "" {
+		slog.Error("SYS_DATABASE_URL is not set",
+			"detail", "the API needs a second DSN for the BYPASSRLS role auditor_sys; "+
+				"see .env.example. Pre-auth lookups and background workers cannot run on "+
+				"the RLS-enforced pool because they are what determines the firm id.")
+		os.Exit(1)
+	}
+	sysPool, err := pgxpool.New(ctx, sysDSN)
+	if err != nil {
+		slog.Error("failed to connect to database as auditor_sys", "error", err)
+		os.Exit(1)
+	}
+	defer sysPool.Close()
+
+	// Refuse to serve if the roles are not what we think they are. This is an
+	// isolation test, not a config read: it asks Postgres what it actually
+	// enforces for these two connections.
+	if err := assertRolePosture(ctx, pool, sysPool); err != nil {
+		slog.Error("database role posture check failed — refusing to start", "error", err)
+		os.Exit(1)
+	}
+
+	// Seed chart-of-accounts templates (idempotent; warn-only on failure).
+	// sysPool: this runs at startup with no request behind it, so there is no
+	// app.current_firm to satisfy a policy predicate.
+	if err := settings.SeedTemplates(ctx, sysPool); err != nil {
 		slog.Warn("failed to seed COA templates", "error", err)
 	}
 
-	// Proactive stale document-request reminder loop (doc 10 §7)
-	go notify.Run(ctx, pool, notify.DefaultInterval)
+	// Proactive stale document-request reminder loop (doc 10 §7). Sweeps every
+	// firm, so it cannot be scoped to one — sysPool.
+	go notify.Run(ctx, sysPool, notify.DefaultInterval)
 
 	// Initialize pipeline event client (NATS JetStream)
 	var pipelineClient *pipeline.EventClient
@@ -95,8 +141,18 @@ func main() {
 	}
 
 	// Initialize services
+	//
+	// WHICH POOL: a service gets sysPool when the work it does cannot be scoped to
+	// one firm, and pool (RLS-enforced) otherwise.
+	//
+	// auth is the clearest sysPool case. Every /v1/auth route is mounted PUBLIC —
+	// there is no JWT yet, so RLSInjector has not run and no app.current_firm
+	// exists. Worse, the work is inherently cross-firm: login has to find firm_id
+	// FROM the submitted email, and signup INSERTs the firms row that a policy
+	// predicate would need to already exist. On the RLS pool every one of those
+	// statements raises on the unset GUC.
 	authSvc := auth.NewService()
-	authSvc.SetDB(pool)
+	authSvc.SetDB(sysPool)
 	authSvc.SetEmailSender(email.NewResend())
 
 	tenantSvc := tenant.NewService()
@@ -118,7 +174,7 @@ func main() {
 	// extracted_entities -> entity.extraction.requested (doc 12 §1).
 	if pipelineClient != nil && st != nil {
 		if ingURL := os.Getenv("INGESTION_GRPC_ADDR"); ingURL != "" {
-			coord, err := pipeline.NewCoordinator(os.Getenv("NATS_URL"), ingURL, pool, st)
+			coord, err := pipeline.NewCoordinator(os.Getenv("NATS_URL"), ingURL, sysPool, st)
 			if err != nil {
 				slog.Warn("pipeline coordinator unavailable", "error", err)
 			} else {
@@ -137,7 +193,7 @@ func main() {
 	// totals -> Rust gRPC -> writes audit_findings (Prompt 3 wiring).
 	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
 		if vURL := os.Getenv("VERIFICATION_GRPC_ADDR"); vURL != "" {
-			vw, err := pipeline.NewVerifyWorker(natsURL, vURL, pool)
+			vw, err := pipeline.NewVerifyWorker(natsURL, vURL, sysPool)
 			if err != nil {
 				slog.Warn("verify worker unavailable", "error", err)
 			} else {
@@ -154,6 +210,11 @@ func main() {
 	entitySvc.SetDB(pool)
 	findingSvc := findings.NewService()
 	findingSvc.SetDB(pool)
+	// HandleAddAttachment takes a storage_key from the client and must verify the
+	// object exists before recording it, so findings needs the same storage client
+	// docSvc got. `st` is nil when storage.New() failed above; the handler answers
+	// 503 in that case rather than recording an unverifiable key.
+	findingSvc.SetStorage(st)
 	reviewSvc := review.NewService()
 	reviewSvc.SetDB(pool)
 	billingSvc := billing.NewService()
@@ -164,18 +225,34 @@ func main() {
 	settingsSvc := settings.NewService()
 	settingsSvc.SetDB(pool)
 	billingSvc.SetDB(pool)
+	// The Stripe webhook is a cross-firm actor with no JWT, so it cannot satisfy the
+	// `firms` RLS policy (init.sql:466 -> id = current_setting('app.current_firm')).
+	// Worse, that policy omits the missing_ok argument, so on a request with no
+	// app.current_firm set current_setting RAISES rather than returning NULL — the
+	// UPDATE would error, not merely match zero rows. sysPool (BYPASSRLS) is the
+	// established pattern for exactly this: see authSvc and webhooksSvc above.
+	// HandleCheckout keeps using the RLS-bound pool; only the webhook uses this one.
+	billingSvc.SetSysDB(sysPool)
 	mcpSvc := mcp.NewService()
 	mcpSvc.SetDB(pool)
 	if pipelineClient != nil {
 		mcpSvc.SetVerificationPublisher(pipelineClient)
 	}
 
+	// webhooksSvc has no HTTP routes — it is reached only through
+	// findingSvc.Notifier. Its DB work is interleaved with outbound HTTP delivery
+	// and retry backoffs (recordFailure runs AFTER the retries), so it can outlive
+	// the request that triggered it. Handing it the request connection would be a
+	// use-after-release; it gets sysPool and keeps its own `WHERE firm_id = $1`.
 	webhooksSvc := webhooks.NewService()
-	webhooksSvc.SetDB(pool)
+	webhooksSvc.SetDB(sysPool)
 	findingSvc.Notifier = webhooksSvc
 
+	// Portal needs both: sysPool for the pre-auth invite lookup and the
+	// book -> firm resolution, pool for everything a logged-in portal user reads.
 	portalSvc := portal.NewService()
 	portalSvc.SetDB(pool)
+	portalSvc.SetSysDB(sysPool)
 	portalSvc.SetAuth(authSvc)
 
 	pushSvc := push.NewService()
@@ -221,6 +298,27 @@ func main() {
 
 	// Client portal login (public — invite-token based, doc 07 §5)
 	r.With(middleware.RateLimit(authLimiter)).Post("/v1/portal/login", portalSvc.HandleLogin)
+
+	// Stripe webhook (public by necessity, 2026-09-04).
+	//
+	// This route USED TO BE registered inside the `r.Group` below that applies
+	// middleware.Authenticator. Stripe cannot present a JWT, so every delivery was
+	// rejected with 401 before the handler ran: subscription created/updated/deleted
+	// and payment-failure events never reached the application, and billing state
+	// diverged from Stripe silently.
+	//
+	// Public here does NOT mean unauthenticated. HandleStripeWebhook authenticates
+	// the caller the way Stripe intends and refuses to fail open:
+	//   - STRIPE_WEBHOOK_SECRET unset -> 503, no processing at all
+	//   - webhook.ConstructEvent verifies the Stripe-Signature HMAC over the raw
+	//     body -> 400 on mismatch
+	// That is a stronger check for this caller than a JWT group could ever be, since
+	// no JWT exists to check.
+	//
+	// Rate-limited with authLimiter because an unauthenticated POST that reads a
+	// request body is an abuse surface; the handler also caps the body it will read.
+	// Stripe's own delivery volume is far below 5 req/s.
+	r.With(middleware.RateLimit(authLimiter)).Post("/v1/webhooks/stripe", billingSvc.HandleStripeWebhook)
 
 	// Auth routes (public) — rate-limited against brute force.
 	r.Route("/v1/auth", func(r chi.Router) {
@@ -301,7 +399,9 @@ func main() {
 
 		// Billing
 		r.Post("/v1/billing/checkout", billingSvc.HandleCheckout)
-		r.Post("/v1/webhooks/stripe", billingSvc.HandleStripeWebhook)
+		// NOTE: /v1/webhooks/stripe is deliberately NOT here. It was, and that was
+		// the bug — see the public registration above. HandleCheckout stays in this
+		// group because it legitimately has a JWT and must be RLS-scoped.
 
 		// Periods (close workflow, doc 10 §1)
 		r.Get("/v1/books/{bookId}/periods", periodsSvc.HandleListPeriods)
@@ -358,8 +458,12 @@ func main() {
 	// MCP tools (internal, called by agent-runtime). Outside the user-auth
 	// group: authenticated with the shared internal key instead of a user JWT,
 	// scoping to the client_book_id in the request body (doc 05 §3).
+	//
+	// Both pools: sysPool resolves book -> firm (the step that establishes scope,
+	// so it cannot itself be scoped), then the handlers run on an RLS-primed
+	// connection from pool.
 	r.Group(func(r chi.Router) {
-		r.Use(middleware.InternalAuth(pool))
+		r.Use(middleware.InternalAuth(pool, sysPool))
 		r.Post("/mcp/tools/get_pending_entities", mcpSvc.HandleGetPendingEntities)
 		r.Post("/mcp/tools/create_entity_link", mcpSvc.HandleCreateEntityLink)
 		r.Post("/mcp/tools/flag_for_review", mcpSvc.HandleFlagForReview)
