@@ -80,7 +80,14 @@ impl VerificationServiceImpl {
             variance_cents,
             tolerance_cents: tolerance_cents as i64,
         };
-        let zen_output = self.rule_engine.evaluate(&zen_input);
+        // `evaluate` returns Result since the decision graph became the single
+        // source of tolerance policy: a variance this graph cannot band must fail
+        // the request, not be recorded with an invented severity attributed to
+        // this rule_version.
+        let zen_output = self
+            .rule_engine
+            .evaluate(&zen_input)
+            .map_err(|e| Status::internal(format!("rule evaluation failed: {}", e)))?;
 
         // Build formula string
         let formula = decimal_math::format_formula(
@@ -150,12 +157,15 @@ impl VerificationService for VerificationServiceImpl {
         let variance_cents = max_variance.to_i64()
             .ok_or_else(|| Status::internal("variance conversion overflow"))?;
 
-        // Evaluate against tolerance (zen engine decision graph)
+        // Evaluate against tolerance using the compiled decision-graph bands.
         let zen_input = ReconciliationInput {
             variance_cents,
             tolerance_cents: req.tolerance_cents as i64,
         };
-        let zen_output = self.rule_engine.evaluate(&zen_input);
+        let zen_output = self
+            .rule_engine
+            .evaluate(&zen_input)
+            .map_err(|e| Status::internal(format!("rule evaluation failed: {}", e)))?;
 
         // Build human-readable formula string
         let formula = decimal_math::format_formula(
@@ -213,10 +223,23 @@ mod tests {
     use std::sync::Arc;
     use verification_service::GroupReconciliation as GrpcGroupReconciliation;
 
-    // Helper: create a test RuleEngine from inline JSON
+    // Helper: the RuleEngine every test in this module runs against.
+    //
+    // This used to be `RuleEngine::from_json(r#"{"nodes":[],"edges":[]}"#, ...)`
+    // — an engine with ZERO rules. Every severity assertion below therefore
+    // asserted the output of a hardcoded ladder in zen/mod.rs while appearing to
+    // test decision-graph evaluation. The empty graph no longer loads, and this
+    // helper now loads the graph the service actually ships with, so these
+    // assertions test the policy that runs in production.
     fn test_engine() -> Arc<RuleEngine> {
-        let json = r#"{"nodes":[],"edges":[]}"#;
-        Arc::new(RuleEngine::from_json(json, "test_rule").unwrap())
+        let graph_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/decision-graphs/gl_reconciliation.json"
+        );
+        Arc::new(
+            RuleEngine::new(graph_path)
+                .expect("the shipped decision graph must compile for these tests"),
+        )
     }
 
     fn make_req(
@@ -270,7 +293,16 @@ mod tests {
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 0);
         assert!(!resp.exceeds_tolerance);
-        assert_eq!(resp.rule_id, "test_rule");
+        // rule_id is the decision-graph PATH (main.rs passes
+        // --decision-graph-path through unchanged). Asserted as a substring
+        // rather than an equality because the path is absolute and
+        // machine-specific; that rule_id is a path at all is a tracked
+        // weakness, not a property worth pinning exactly.
+        assert!(
+            resp.rule_id.contains("gl_reconciliation.json"),
+            "rule_id should identify the graph, got: {}",
+            resp.rule_id
+        );
         assert_eq!(resp.severity, "info");
         assert_eq!(resp.rule_version.len(), 16);
         assert!(resp.calculation_formula.contains("variance=0.00"));
@@ -453,8 +485,17 @@ mod tests {
 
     // ---- integration test: decision graph at runtime ----
 
+    /// Renamed from `test_runtime_decision_graph_changes_output`, which claimed
+    /// more than it tested: it varies the TOLERANCE (a per-request field), not
+    /// the decision graph, so it would have passed just as happily against the
+    /// hardcoded ladder this service used to run on. What it does prove is
+    /// worth keeping — tolerance is a runtime input, not compiled in.
+    ///
+    /// The test that actually proves graph contents drive the output is
+    /// `zen::tests::test_graph_thresholds_actually_drive_severity`, which holds
+    /// the input fixed and changes only the graph.
     #[tokio::test]
-    async fn test_runtime_decision_graph_changes_output() {
+    async fn test_tolerance_is_a_runtime_input() {
         // Load the real decision graph from disk
         let manifest_dir = std::env!("CARGO_MANIFEST_DIR");
         let graph_path = format!("{}/decision-graphs/gl_reconciliation.json", manifest_dir);
