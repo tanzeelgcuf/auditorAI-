@@ -111,52 +111,62 @@ impl DoctrBackend {
     /// only removes the deterministically-non-currency noise.
     fn extract_amount(text: &str) -> Option<i64> {
         let mut current = String::new();
-        let mut candidates: Vec<f64> = Vec::new();
+        // Candidates are CENTS (i64), not dollars (f64). The previous version
+        // collected f64 and finished with `(v * 100.0).round() as i64`, putting the
+        // OCR money path through binary floating point — the same defect fixed in
+        // structured::parse_amount, and the reason this file was swept after it.
+        let mut candidates: Vec<i64> = Vec::new();
 
         for c in text.chars() {
             if c.is_ascii_digit() || c == '.' || c == '-' || c == ',' || c == '$' {
                 current.push(c);
             } else if !current.is_empty() {
-                if let Some(v) = Self::parse_currency(&current) {
+                if let Some(v) = Self::parse_currency_cents(&current) {
                     candidates.push(v);
                 }
                 current.clear();
             }
         }
         if !current.is_empty() {
-            if let Some(v) = Self::parse_currency(&current) {
+            if let Some(v) = Self::parse_currency_cents(&current) {
                 candidates.push(v);
             }
         }
 
-        candidates
-            .iter()
-            .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|v| (v * 100.0).round() as i64)
+        // unsigned_abs(), not abs(): abs() panics on i64::MIN in debug builds.
+        candidates.into_iter().max_by_key(|v| v.unsigned_abs())
     }
 
-    /// Parse a candidate as a currency value: optional `$`, digits with comma
-    /// thousands, and EXACTLY two decimal digits. Returns None for anything not
-    /// shaped like a dollar amount (ZIPs, dates, IDs, bare integers).
-    fn parse_currency(candidate: &str) -> Option<f64> {
+    /// Parse a candidate as currency CENTS: optional `$`, comma thousands, and
+    /// EXACTLY two decimal digits. Returns None for anything not shaped like a
+    /// dollar amount (ZIPs, dates, IDs, bare integers).
+    ///
+    /// The two-decimal shape gate is the noise filter documented on extract_amount
+    /// and it stays here deliberately: structured::parse_amount accepts a bare
+    /// integer as whole dollars, which is correct for a CSV amount column but would
+    /// readmit "97401" (a ZIP) as $974.01 on an OCR'd page. Shape is decided here;
+    /// the conversion to cents is delegated so there is exactly one money parser.
+    ///
+    /// KNOWN LIMITATION: extract_amount's tokenizer treats "(" and ")" as
+    /// separators, so an accounting-negative "(45.00)" reaches this function as
+    /// "45.00" and is read as positive. Only the leading-minus form is honored on
+    /// the OCR path. The structured path (CSV/XLSX/OFX), which is where GL and bank
+    /// exports actually carry parenthesised credits, handles it correctly.
+    fn parse_currency_cents(candidate: &str) -> Option<i64> {
         let s = candidate.trim();
-        let neg = s.starts_with('-');
-        let digits_only = |x: &str| {
-            let d: String = x.chars().filter(|c| *c != ',' && *c != '$').collect();
-            d
-        };
-        let core = digits_only(s.trim_start_matches(['-', '$']));
-        // Must have exactly two decimal places (currency cents), no more.
-        if core.contains('.') {
-            let (whole, frac) = core.split_once('.')?;
-            if !frac.is_empty() && frac.len() == 2 && frac.chars().all(|c| c.is_ascii_digit())
-                && !whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit())
-            {
-                let v: f64 = core.parse().ok()?;
-                return Some(if neg { -v } else { v });
-            }
+        let core: String = s
+            .trim_start_matches(['-', '$'])
+            .chars()
+            .filter(|c| *c != ',' && *c != '$')
+            .collect();
+        let (whole, frac) = core.split_once('.')?;
+        if frac.len() != 2 || !frac.chars().all(|c| c.is_ascii_digit()) {
+            return None;
         }
-        None
+        if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        super::structured::parse_amount(s)
     }
 
     /// Extract date from text via sliding window pattern matching.
