@@ -82,19 +82,27 @@ func (c *Coordinator) Close() {
 // Run consumes document.uploaded events forever (blocking). Each event triggers
 // ingestion gRPC, then writes the parsed entities, then requests extraction.
 func (c *Coordinator) Run(ctx context.Context) error {
+	// attachCtx bounds CONSUMER SETUP only — the message loop below runs for the
+	// process lifetime and must use ctx. The timeout matters because both calls
+	// below are round trips to NATS: without it, a NATS server that accepts the
+	// TCP connection but never answers leaves the coordinator blocked here
+	// forever with no log line, and documents queue up with nothing consuming
+	// them. It was previously created, deferred-cancelled and then discarded with
+	// `_ = attachCtx`, so the bound it exists for did not apply to either call.
 	attachCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cons, err := c.js.CreateOrUpdateConsumer(ctx, "DOCUMENTS", jetstream.ConsumerConfig{
+	cons, err := c.js.CreateOrUpdateConsumer(attachCtx, "DOCUMENTS", jetstream.ConsumerConfig{
 		Durable:       "coordinator",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 
-		// FilterSubject is REQUIRED, not cosmetic. The DOCUMENTS stream carries
-		// three subjects (pipeline.go:41) and this consumer previously received
-		// all of them, discarding two with a bare Ack in the loop below. Now that
-		// handleUploaded publishes document.processing.failed to that same
-		// stream, an unfiltered consumer would be delivered its own failure
-		// events — a self-feedback loop it then acks and drops.
+		// FilterSubject is REQUIRED, not cosmetic. This consumer previously took
+		// every subject on the DOCUMENTS stream and discarded the ones it did not
+		// recognise with a bare Ack — on a WorkQueue stream, acking is deleting, so
+		// it was destroying events meant for nobody's benefit. DOCUMENTS now
+		// carries only document.uploaded (the notification subjects moved to
+		// PIPELINE_EVENTS — see pipeline.go), and the filter pins that contract so
+		// a future subject added to this stream cannot be silently eaten here.
 		FilterSubject: "document.uploaded",
 
 		// MaxDeliver is REQUIRED because the error paths below now Nak instead of
@@ -110,16 +118,31 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		// entities for one document. Two minutes is sized for the slow path.
 		AckWait: 2 * time.Minute,
 	})
-	_ = attachCtx
 	if err != nil {
-		// Non-fatal: a consumer may already exist; try to load it.
-		cons, err = c.js.Consumer(ctx, "DOCUMENTS", "coordinator")
+		// Non-fatal: a consumer may already exist. Note this fallback also swallows
+		// a rejected CONFIG CHANGE — if the durable exists with the old settings
+		// (no FilterSubject, MaxDeliver -1, AckWait 30s) and the server refuses the
+		// update, this silently binds to the OLD consumer and every guarantee
+		// documented above is absent at runtime. Logged at WARN, because the
+		// previous bare fallback made that indistinguishable from a clean start.
+		slog.Warn("coordinator: consumer create/update failed, binding to the existing "+
+			"durable — its config may predate FilterSubject/MaxDeliver/AckWait",
+			"error", err)
+		cons, err = c.js.Consumer(attachCtx, "DOCUMENTS", "coordinator")
 		if err != nil {
 			return err
 		}
 	}
 
 	for {
+		// The loop is otherwise infinite, and cons.Next() returns an error rather
+		// than blocking once the connection closes — so without this check a
+		// shutdown left this goroutine spinning at one warning per second for the
+		// remaining life of the process.
+		if err := ctx.Err(); err != nil {
+			slog.Info("coordinator stopping", "reason", err)
+			return err
+		}
 		msg, err := cons.Next()
 		if err != nil {
 			slog.Warn("coordinator consumer error", "error", err)
@@ -129,7 +152,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		if subj := msg.Subject(); subj == "document.uploaded" {
 			c.handleUploaded(ctx, msg)
 		} else {
-			msg.Ack() // ignore other subjects on the stream
+			// Unreachable while FilterSubject is set; kept as defence in case a
+			// pre-existing durable without the filter is bound above.
+			_ = msg.Ack() // ignore other subjects on the stream
 		}
 	}
 }
@@ -181,9 +206,11 @@ func (c *Coordinator) fail(ctx context.Context, msg jetstream.Msg, docID, stage 
 		}
 	}
 
-	// document.processing.failed is declared on the DOCUMENTS stream
-	// (pipeline.go:41) and, until now, had NO PRODUCER anywhere in the
-	// repository — the failure signal was designed and never wired.
+	// document.processing.failed was declared as a stream subject and had NO
+	// PRODUCER anywhere in the repository — the failure signal was designed and
+	// never wired. This is its first publisher. It goes to PIPELINE_EVENTS, a
+	// LIMITS stream: it has no consumer either, and on the WorkQueue stream where
+	// the subject used to be declared, an unconsumed message is never deleted.
 	if payload, err := json.Marshal(map[string]string{
 		"document_id": docID, "stage": stage, "error": cause.Error(),
 	}); err == nil {
@@ -256,22 +283,48 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	// Mark the source document done.
-	_, _ = c.db.Exec(ctx,
-		"UPDATE source_documents SET ocr_status = 'done' WHERE id = $1", ev.DocumentID)
+	// Mark the source document done. Routed through fail() like every other
+	// step: if this UPDATE is lost the entities are in the table but the UI shows
+	// the document as 'pending' forever, which is the same "quietly never going to
+	// be processed" state fail() exists to prevent. Retrying it is safe because
+	// persistEntities is idempotent per source_document_id (see its comment).
+	if _, err := c.db.Exec(ctx,
+		"UPDATE source_documents SET ocr_status = 'done' WHERE id = $1", ev.DocumentID); err != nil {
+		c.fail(ctx, msg, ev.DocumentID, "mark_done", err)
+		return
+	}
 
 	// Request agent-runtime to extract this document's entities (per-doc — a
 	// single LLM prompt must not span the whole book).
+	//
+	// These two publishes were `_, _ = c.js.Publish(...)` inside `if err == nil`
+	// marshal guards, so a publish failure — or a marshal failure — skipped the
+	// step and fell through to the Ack. That is the ack-before-work bug in its
+	// quietest form: ingestion ran, entities landed, the document was marked
+	// 'done', and nothing ever extracted or linked it. The document looks
+	// processed and contributes nothing to any reconciliation.
 	req := map[string]string{"client_book_id": ev.ClientBookID, "batch_id": ev.DocumentID}
-	if payload, err := json.Marshal(req); err == nil {
-		_, _ = c.js.Publish(ctx, "entity.extraction.requested", payload)
+	payload, err := json.Marshal(req)
+	if err != nil {
+		c.fail(ctx, msg, ev.DocumentID, "marshal_extraction_request", err)
+		return
+	}
+	if _, err := c.js.Publish(ctx, "entity.extraction.requested", payload); err != nil {
+		c.fail(ctx, msg, ev.DocumentID, "publish_extraction_request", err)
+		return
 	}
 
 	// Then trigger a BOOK-WIDE link pass: 3-way reconciliation needs entities
 	// from the invoice + bank + GL documents together, which per-doc extraction
 	// can't produce. The link handler fetches the whole book's pending set.
-	if payload, err := json.Marshal(map[string]string{"client_book_id": ev.ClientBookID}); err == nil {
-		_, _ = c.js.Publish(ctx, "link.requested", payload)
+	linkPayload, err := json.Marshal(map[string]string{"client_book_id": ev.ClientBookID})
+	if err != nil {
+		c.fail(ctx, msg, ev.DocumentID, "marshal_link_request", err)
+		return
+	}
+	if _, err := c.js.Publish(ctx, "link.requested", linkPayload); err != nil {
+		c.fail(ctx, msg, ev.DocumentID, "publish_link_request", err)
+		return
 	}
 
 	// Ack LAST, and only on the success path. The previous `defer msg.Ack()` at
@@ -382,14 +435,69 @@ func bboxJSON(e *ingestionpb.ExtractedEntity) string {
 	return "{}"
 }
 
+// persistEntities writes a document's parsed entities in ONE transaction, and is
+// idempotent per source_document_id.
+//
+// Both properties are required by the retry policy added to this file, and
+// neither existed before. The previous implementation looped `c.db.Exec` with no
+// transaction, so:
+//
+//   - A failure on row 40 of 100 left rows 1..39 committed. fail() then Naks, the
+//     message is redelivered, and the whole document is ingested again — so the
+//     book now holds 39 duplicate entities. For a reconciliation product that is
+//     worse than the silent loss the retry was added to fix: duplicated legs
+//     change a group's totals, and the finding is then confidently wrong.
+//   - Even with atomicity, a crash between COMMIT and Ack redelivers a document
+//     whose entities are already in the table. extracted_entities has NO natural
+//     unique key to lean on — verified in infra/init.sql: the only indexes on it
+//     are idx_extracted_entities_ref, _book and _doc, all non-unique — so
+//     ON CONFLICT is not available and the guard has to be an explicit check.
+//
+// The check is a presence count taken INSIDE the transaction, after locking the
+// source_documents row. The lock is what makes the count trustworthy: without it
+// two concurrent deliveries could both read zero and both insert. DOCUMENTS is a
+// WorkQueue with a single consumer, so that race should not arise — the lock
+// costs one row-level lock per document and removes the dependence on "should".
+//
+// Skip-if-present is used rather than delete-and-reinsert deliberately.
+// extracted_entities.id is referenced by reconciliation_group_members and by
+// corrects_entity_id, so a DELETE on a document that has already been linked
+// would either fail on the foreign key or cascade away group membership and the
+// findings built on it.
 func (c *Coordinator) persistEntities(ctx context.Context, bookID, docID string, ents []*ingestionpb.ExtractedEntity) error {
 	if len(ents) == 0 {
 		slog.Info("coordinator: no entities parsed", "doc", docID)
 		return nil
 	}
+
+	tx, err := c.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	// No-op once Commit has run; the return value is deliberately discarded
+	// because a rollback error after a successful commit carries no information.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var lockedID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id::text FROM source_documents WHERE id = $1 FOR UPDATE`, docID).Scan(&lockedID); err != nil {
+		return err
+	}
+
+	var existing int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM extracted_entities WHERE source_document_id = $1`, docID).Scan(&existing); err != nil {
+		return err
+	}
+	if existing > 0 {
+		slog.Info("coordinator: entities already present, skipping re-insert",
+			"doc", docID, "existing", existing, "parsed", len(ents))
+		return tx.Commit(ctx)
+	}
+
 	for _, e := range ents {
 		txnDate := nullableDate(e.TransactionDate)
-		_, err := c.db.Exec(ctx,
+		_, err := tx.Exec(ctx,
 			`INSERT INTO extracted_entities
 				(client_book_id, source_document_id, entity_type, amount_cents, transaction_date,
 				 counterparty, description, gl_account_code, transaction_ref, page_number, bbox, extraction_confidence, source_format)
@@ -401,6 +509,9 @@ func (c *Coordinator) persistEntities(ctx context.Context, bookID, docID string,
 		if err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	slog.Info("coordinator: persisted entities", "doc", docID, "count", len(ents))
 	return nil

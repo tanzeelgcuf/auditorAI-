@@ -75,20 +75,46 @@ class MCPClient:
 
     async def persist_groups(self, groups: List[Any], client_book_id: str) -> int:
         """Persist cross-linked ReconciliationGroups to the API. Returns count
-        written.
+        written. RAISES if any persistable group could not be written.
 
-        Called after the LangGraph link node. Each group with ≥1 bank and ≥1 GL
+        Called after the LangGraph link node. Each group with >=1 bank and >=1 GL
         leg is written via create_entity_link; the API publishes
         verification.requested on creation, so the verify worker evaluates it.
-        Groups without bank+gl legs are skipped (not persistable, doc 09).
+        Groups without bank+gl legs are skipped (not persistable, doc 09) and are
+        NOT counted as failures.
+
+        WHY THIS RAISES NOW. Every per-group failure used to be caught here and
+        logged, and the count of successes was returned regardless. That made the
+        caller's retry logic in main.py vacuous: if all 50 groups failed, this
+        returned 0, main.py logged "groups persisted written=0" and acked the
+        event. The linking work was paid for and thrown away, with one ERROR line
+        per group and nothing that retried or surfaced it. Moving the ack decision
+        out of main.py accomplished nothing while this swallow was still here.
+
+        WHY IT RAISES AFTER THE LOOP, NOT ON THE FIRST FAILURE. Retrying the whole
+        link event is safe and cheap precisely because a retry does not redo the
+        groups that succeeded: get_pending_entities filters with
+        `AND id NOT IN (SELECT extracted_entity_id FROM reconciliation_group_members)`
+        (services/api/internal/mcp/mcp.go:87), so an entity already in a group is
+        excluded from the next pass. Finishing the loop therefore maximises forward
+        progress per delivery, and the retry re-links only what is left.
+
+        Note the guard being relied on is the pending-entity FILTER, not a
+        constraint: reconciliation_group_members is UNIQUE on
+        (reconciliation_group_id, extracted_entity_id), which does not stop the
+        same entity joining a second group. If that filter is ever relaxed,
+        re-running a link pass starts duplicating groups and this rationale no
+        longer holds.
         """
         written = 0
+        failed: List[str] = []
         for g in groups:
+            gid = str(getattr(g, "id", "?"))
             inv = [str(i) for i in (getattr(g, "invoice_entity_ids", None) or [])]
             bank = [str(i) for i in (getattr(g, "bank_entity_ids", None) or [])]
             gl = [str(i) for i in (getattr(g, "gl_entity_ids", None) or [])]
             if not bank or not gl:
-                logger.warning("skipping group without bank+gl legs", group=str(getattr(g, "id", "?")))
+                logger.warning("skipping group without bank+gl legs", group=gid)
                 continue
             try:
                 resp = await self.create_entity_link(
@@ -98,10 +124,16 @@ class MCPClient:
                     confidence=getattr(g, "link_confidence", 0.0),
                     status=getattr(g, "status", "needs_review"),
                 )
-                logger.info("group persisted", group=str(getattr(g, "id", "?")), status=resp.get("status", "?"))
+                logger.info("group persisted", group=gid, status=resp.get("status", "?"))
                 written += 1
             except Exception as e:
-                logger.error("group persist failed", group=str(getattr(g, "id", "?")), error=str(e))
+                logger.error("group persist failed", group=gid, error=str(e))
+                failed.append(gid)
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} of {len(failed) + written} persistable group(s) failed "
+                f"to write for book {client_book_id}: {', '.join(failed[:10])}"
+            )
         return written
 
     async def aclose(self):

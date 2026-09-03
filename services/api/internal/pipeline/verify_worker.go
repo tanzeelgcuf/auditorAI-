@@ -11,6 +11,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -64,19 +65,41 @@ func (w *VerifyWorker) Close() {
 
 // Run consumes verification.requested forever (blocking).
 func (w *VerifyWorker) Run(ctx context.Context) error {
-	cons, err := w.js.CreateOrUpdateConsumer(ctx, "VERIFY", jetstream.ConsumerConfig{
+	// Bounded like the coordinator's: both calls below are NATS round trips, and
+	// an unbounded wait here blocks the worker forever with no log line while
+	// linked groups pile up unverified.
+	attachCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cons, err := w.js.CreateOrUpdateConsumer(attachCtx, "VERIFY", jetstream.ConsumerConfig{
 		Durable:       "verify-worker",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
+
+		// Same three settings, for the same reasons, as the coordinator's consumer
+		// — see coordinator.go. They are required here now that the error paths
+		// Nak instead of dropping: without MaxDeliver a group that fails
+		// deterministically is redelivered forever, and the default 30s AckWait is
+		// shorter than a BatchEvaluate round trip against a cold verification
+		// service, which would redeliver while the first attempt is still running.
+		FilterSubject: "verification.requested",
+		MaxDeliver:    maxDeliveryAttempts,
+		AckWait:       2 * time.Minute,
 	})
 	if err != nil {
-		cons, err = w.js.Consumer(ctx, "VERIFY", "verify-worker")
+		slog.Warn("verify worker: consumer create/update failed, binding to the existing "+
+			"durable — its config may predate FilterSubject/MaxDeliver/AckWait",
+			"error", err)
+		cons, err = w.js.Consumer(attachCtx, "VERIFY", "verify-worker")
 		if err != nil {
 			return err
 		}
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			slog.Info("verify worker stopping", "reason", err)
+			return err
+		}
 		msg, err := cons.Next()
 		if err != nil {
 			slog.Warn("verify worker consumer error", "error", err)
@@ -86,20 +109,73 @@ func (w *VerifyWorker) Run(ctx context.Context) error {
 		if msg.Subject() == "verification.requested" {
 			w.handleVerification(ctx, msg)
 		} else {
-			msg.Ack()
+			_ = msg.Ack()
 		}
 	}
 }
 
-func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg) {
-	defer msg.Ack()
+// fail handles a processing error for one reconciliation group.
+//
+// This is the same bug class as coordinator.fail, found in this file by sweeping
+// for it after fixing the first instance. handleVerification opened with
+// `defer msg.Ack()` and every error path was `slog.Error(...) + return`, so the
+// event was acknowledged and discarded — and the consequence here is worse than a
+// stuck document. A group was linked, verification.requested was published, the
+// worker failed (DB blip, verification service down, empty gRPC result), the
+// event was dropped, and NO FINDING WAS EVER WRITTEN. The group then reads as
+// linked with nothing flagged against it, which is indistinguishable from
+// "reconciled cleanly". An audit product that loses findings silently reports the
+// wrong answer with full confidence.
+//
+// On permanent failure the group is moved to 'needs_review' so a human sees it.
+// That deliberately reuses an existing status value rather than adding
+// 'verification_failed' to the CHECK constraint: a new value means touching the
+// CHECK in infra/init.sql, the review-queue status filter (review.go:71) and the
+// TS union in apps/web/lib/hooks.ts:34, and the conflation it costs is that
+// "the matcher was unsure" and "verification could not run" land in the same
+// queue. Worth separating later; not worth blocking the correctness fix on now.
+func (w *VerifyWorker) fail(ctx context.Context, msg jetstream.Msg, groupID, stage string, cause error) {
+	attempt := uint64(1)
+	if md, err := msg.Metadata(); err == nil {
+		attempt = md.NumDelivered
+	}
 
+	if attempt < maxDeliveryAttempts {
+		slog.Warn("verify worker: retrying group",
+			"group", groupID, "stage", stage, "attempt", attempt,
+			"max", maxDeliveryAttempts, "error", cause)
+		if err := msg.Nak(); err != nil {
+			slog.Error("verify worker: nak failed", "group", groupID, "error", err)
+		}
+		return
+	}
+
+	slog.Error("verify worker: group failed permanently — no finding will be written",
+		"group", groupID, "stage", stage, "attempts", attempt, "error", cause)
+
+	if groupID != "" {
+		if _, err := w.db.Exec(ctx,
+			`UPDATE reconciliation_groups SET status = 'needs_review'
+			  WHERE id = $1 AND status = 'auto_linked'`, groupID); err != nil {
+			slog.Error("verify worker: could not flag group for review",
+				"group", groupID, "error", err)
+		}
+	}
+
+	if err := msg.Ack(); err != nil {
+		slog.Error("verify worker: ack failed", "group", groupID, "error", err)
+	}
+}
+
+func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg) {
 	var ev struct {
 		GroupID      string `json:"group_id"`
 		ClientBookID string `json:"client_book_id"`
 	}
 	if err := json.Unmarshal(msg.Data(), &ev); err != nil || ev.GroupID == "" {
+		// Malformed will not become well-formed, and there is no group id to flag.
 		slog.Error("verify worker: bad payload", "data", string(msg.Data()))
+		_ = msg.Ack()
 		return
 	}
 
@@ -127,7 +203,10 @@ func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg
 		 GROUP BY cb.reconciliation_tolerance_cents`, ev.GroupID).Scan(
 		&invTotal, &bankTotal, &glTotal, &hasInv, &hasBank, &hasGl, &tolerance)
 	if err != nil {
-		slog.Error("verify worker: load group failed", "group", ev.GroupID, "error", err)
+		// Includes pgx.ErrNoRows, which is not necessarily permanent: the group and
+		// its members are written by a different path, so an event that arrives
+		// before those rows are visible must be retried rather than dropped.
+		w.fail(ctx, msg, ev.GroupID, "load_group", err)
 		return
 	}
 
@@ -146,11 +225,16 @@ func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg
 		}},
 	})
 	if err != nil {
-		slog.Error("verify worker: gRPC evaluate failed", "group", ev.GroupID, "error", err)
+		w.fail(ctx, msg, ev.GroupID, "grpc_evaluate", err)
 		return
 	}
 	if len(res.Results) == 0 {
-		slog.Error("verify worker: no result returned", "group", ev.GroupID)
+		// An empty result for a request that carried exactly one group means the
+		// verification service and this caller disagree about the contract. Retried
+		// like any other failure, then surfaced — the alternative, dropping it,
+		// leaves the group looking reconciled.
+		w.fail(ctx, msg, ev.GroupID, "empty_result",
+			errors.New("verification returned no results for a single-group request"))
 		return
 	}
 	r := res.Results[0]
@@ -170,11 +254,19 @@ func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg
 		r.VarianceCents, tolerance, r.ExceedsTolerance,
 		r.CalculationFormula, r.Severity)
 	if err != nil {
-		slog.Error("verify worker: insert finding failed", "group", ev.GroupID, "error", err)
+		w.fail(ctx, msg, ev.GroupID, "insert_finding", err)
 		return
 	}
 
 	slog.Info("finding created",
 		"group", ev.GroupID, "variance_cents", r.VarianceCents,
 		"severity", r.Severity, "exceeds", r.ExceedsTolerance)
+
+	// Ack last, success path only. The INSERT is guarded by NOT EXISTS on
+	// reconciliation_group_id, so a redelivery after a crash between the write and
+	// this ack is a no-op rather than a duplicate finding.
+	if err := msg.Ack(); err != nil {
+		slog.Error("verify worker: ack failed after successful processing",
+			"group", ev.GroupID, "error", err)
+	}
 }
