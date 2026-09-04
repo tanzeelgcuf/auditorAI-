@@ -142,6 +142,76 @@ Session reports live at the workspace root next to the repo:
     draining process writing after it was told to stop — the three allowlisted
     sites in that guard are allowlisted for exactly that reason.
 
+13. **The source address is resolved once, at the top, and every audited write
+    reads that one answer.** `access_log`, `config_change_log` and
+    `period_reopen_log` each carry `source_ip INET`, and the value comes from
+    `middleware.SourceIP`, mounted **directly below
+    `middleware.RealIP(trustedProxies)`** in `main.go`, which copies the by-then
+    rewritten `RemoteAddr` onto the request context. `auth.SourceIPFrom(ctx)` /
+    `middleware.GetSourceIP(ctx)` is how a writer gets it — never a new
+    parameter, and never a second read of `X-Forwarded-For`. Twelve
+    `RecordAccess` call sites each re-deriving "which IP is this?" is precisely
+    the shape of the bypass rule 7 exists to prevent, and it would also let the
+    audit trail and the rate limiter disagree about who called.
+
+    Three ways this breaks silently, all pinned by
+    `scripts/check_audit_ip_arity.py` because none of them is visible at
+    runtime:
+    - **Mount order.** `SourceIP` above `RealIP` reads the untouched
+      `RemoteAddr` and records the *proxy* on every request behind a trusted
+      proxy. No error, no log line, a permanently wrong audit trail. It is a
+      source-order property, so no unit test on either function alone can see
+      it; `sourceip_test.go` carries a negative control that builds the chain
+      wrongly and asserts the wrong answer, because an ordering claim nobody
+      has ever seen fail is not evidence.
+    - **Positional binds.** pgx binds *and* scans by position. A column added
+      without its argument errors at runtime — and `RecordAccess` /
+      `LogConfigChange` swallow that error into a `slog.Warn` (rule 12), so the
+      row simply vanishes. Two columns of the same type **transposed** raises
+      nothing at all and writes a confidently wrong row, which for this product
+      is worse than an empty one. The guard cross-matches column names against
+      argument names and counts select-list length against Scan-target length.
+    - **`continue` on a Scan error.** `HandleConfigHistory` skips rows whose
+      Scan fails, so a select list one item longer than its Scan list returns
+      `{"items": []}` for every book, forever, with a 200.
+
+    The column is **nullable on purpose**. `SourceIPFrom` returns `""` for a
+    background worker, a CLI, a unit test or an unparseable `RemoteAddr`, and
+    that is stored as SQL NULL via `NULLIF($n,'')::inet` — mirroring the proven
+    in-repo `NULLIF($n,'')::uuid` idiom, which also sidesteps any pgx `inet`
+    codec question; the read side is `COALESCE(source_ip::text,'')`. NOT NULL
+    would mean discarding an entire audit row to protect one field, and a row
+    that admits it does not know beats one asserting a bogus address.
+
+14. **A write against an RLS table runs on the request's primed connection, not
+    on the pool.** `middleware.DB(ctx, db)` returns the connection
+    `RLSInjector` set `app.current_firm` and `app.assigned_books` on; a bare
+    `db.Exec(...)` takes an arbitrary pooled connection with neither GUC set.
+    All 30 policies call `current_setting('app.…')` with **no `missing_ok`** and
+    there is no database- or role-level default, so such a write either raises
+    on the unset parameter or — on a connection recycled after `RESET` — tests
+    against `''` and violates the policy. It cannot succeed.
+
+    Survivable where the error is returned: the request 500s and someone
+    notices. Invisible where the error is swallowed, which is the intersection
+    with rule 12 and how `humanoverride.LogConfigChange` came to be a write
+    that could only fail, into a `slog.Warn`. The most likely reading is that
+    `config_change_log` never received a row in any deployment and
+    `GET /v1/books/{bookId}/config-history` answered `{"items": []}` with a 200
+    the whole time. **Not runtime-verified** — no Postgres in the environment
+    that found it, so this is reasoned from the policy text plus documented GUC
+    semantics, and it stays amber in `SOC2_READINESS.md` until the
+    `DATABASE_URL_TEST` suite lands a row.
+
+    `check_audit_ip_arity.py` pins `LogConfigChange` and `RecordAccess` to
+    `middleware.DB(ctx, db)` **by name**, because reverting that one-line fix
+    was tested against every other guard in the repo and produced exit 0
+    everywhere. `sysPool` callers (`auth.go` ×8, `webhooks.go` ×3) are correct
+    by design — they must see across firms — and the ~9 remaining suspect
+    app-pool handler sites are listed in `SOC2_READINESS.md` roadmap item 9.
+    Before adding any statement against an RLS table, answer two questions:
+    which pool does it run on, and is its error returned?
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
@@ -210,9 +280,13 @@ Two consequences worth keeping in mind:
   addresses available to it, not by attempts against one account. `/v1/auth/login`
   gained a second, per-account ceiling on 2026-09-04 — see **Per-account lockout**
   below. `/v1/portal/login` and `/v1/totp/*` still have only this per-IP layer.
-  `access_log` also records no source IP at all, which is its own ⬜ row in
-  `SOC2_READINESS.md` — so the per-IP decision is not itself auditable after the
-  fact.
+- Since 2026-09-05 the three audit tables record that same resolved address in
+  `source_ip`, so a per-IP decision is auditable after the fact and cannot
+  disagree with what the limiter bucketed — `middleware.SourceIP` is mounted
+  directly below `RealIP` and both read one resolution. **That adjacency is
+  load-bearing and is checked in CI**; see rule 13. Nothing yet *reads*
+  `access_log` through the API, so the address is stored and surfaced to nobody
+  (`SOC2_READINESS.md` roadmap item 10).
 
 ## Pipeline durability
 
@@ -451,6 +525,21 @@ the JWT's own user), `SeedTemplates`, `notify.Run`, the coordinator, the verify 
 outlive the request), `billing`'s Stripe webhook, and `portal`'s pre-auth invite
 lookup. Everything a request handler touches uses `pool`.
 
+Getting `pool` is only half of it: a statement against an RLS table must also run
+on the **request's** connection via `middleware.DB(ctx, db)`, or the GUCs
+`RLSInjector` set are not on it and the statement cannot succeed. See rule 14 —
+this was a live bug in `LogConfigChange`, and roughly nine app-pool handler sites
+have not been cleared yet.
+
+The three audit tables (`access_log`, `config_change_log`, `period_reopen_log`)
+each carry `source_ip INET`, **nullable**, plus a partial index
+`idx_access_log_source_ip ON access_log(source_ip, occurred_at DESC) WHERE
+source_ip IS NOT NULL`. Written as `NULLIF($n,'')::inet`, read as
+`COALESCE(source_ip::text,'')`. Rule 13 has the reasoning; the short version is
+that an audit row admitting it does not know where a request came from is worth
+more than one asserting a bogus address, and NOT NULL would have thrown away the
+whole row to protect that one field.
+
 `SYS_DATABASE_URL` unset is **fatal at boot**, not a fallback to `pool`: the
 `firms` policy (`init.sql:466`) calls `current_setting` *without* `missing_ok`, so
 an unset GUC RAISEs rather than returning NULL — the fallback would be a wall of
@@ -480,7 +569,7 @@ Per-language gates, stated accurately:
 - **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists.
 - **Docker**: builds all 6 images with the same context/`-f` split as `infra/docker-compose.yml`, asserts binaries and the decision graph are actually inside the images, and `docker compose config -q` on both compose files.
 
-Four **static guards** — they exist because each proves something about code that
+Five **static guards** — they exist because each proves something about code that
 no test executes, and each was verified in both directions (clean on the current
 tree, red when the original bug is reintroduced) before being wired in:
 
@@ -489,7 +578,14 @@ tree, red when the original bug is reintroduced) before being wired in:
 | `scripts/check_schema_drift.py` | Schema Drift Guard | SQL in Go/Python referencing relations or columns `init.sql` does not define |
 | `scripts/check_storage_key_orphans.py` | Schema Drift Guard | a file that writes a `storage_key` without writing the bytes (`PutObject`) or verifying them (`ObjectExists`) |
 | `scripts/check_cancellable_audit_writes.py` | Schema Drift Guard | rule 12 — an audit/security write on a request context whose error is only logged, plus a positive check that the four known fixes still carry `context.WithoutCancel` |
+| `scripts/check_audit_ip_arity.py` | Schema Drift Guard | rule 13 and rule 14 — `source_ip` dropped from an audit INSERT, a column/placeholder/argument arity mismatch, two same-type columns **transposed** (which raises nothing and writes a confidently wrong row), a select list longer than its Scan list, `SourceIP` mounted above `RealIP` or unmounted, and either audit writer reverted from `middleware.DB(ctx, db)` to the raw pool. 11 plausible mutants were run against it, 11 caught, each by its own invariant. |
 | `scripts/check_amount_parity.py` | python | the Rust money parser and its Python mirror disagreeing (they once read `"1250"` as $1,250.00 and $12.50) |
+
+Every one of these fails by **name** as well as by pattern — the positive half
+means silently reverting a fix goes red, which is not hypothetical: reverting
+`LogConfigChange` to `db.Exec` was tested against the whole guard suite before
+that half existed and produced **exit 0 everywhere**. A guard that only detects
+*new* instances of a class lets the fixed instance rot back.
 
 Lint rules that bite in non-obvious ways:
 
@@ -516,6 +612,26 @@ checkers were used instead and are explicitly not compilers — they cannot see 
 errors, trait bounds, moved values, missing imports, or match exhaustiveness. The
 first real CI run should be expected to surface compile errors, and that is not
 evidence the design is wrong.
+
+Specific claims in this file that are **reasoned, not observed**, listed so nobody
+upgrades them by repetition:
+
+- **`config_change_log` has never received a row** (rule 14). Derived from the
+  policy text in `init.sql` plus documented `current_setting` semantics with no
+  `missing_ok`. There is no Postgres here to confirm it. What *is* observed is
+  that the write ran on the raw pool and its error went to a `slog.Warn`.
+- **The three `_test.go` files written for rules 11 and 13** —
+  `internal/auth/login_lockout_test.go`, `internal/auth/lockout_test.go` and
+  `internal/middleware/sourceip_test.go` — have never been compiled. Their
+  expected values were re-derived by Python ports (the lockout arithmetic, and a
+  15/15 port of `clientip.go`), which is evidence about the **assertions**, not
+  about the Go runtime. Precedent for why that distinction matters: the first
+  draft of the lockout test asserted a 24-hour ceiling of "40–60 attempts" when
+  the measured figure was 64.
+- **Every ✅ in `SOC2_READINESS.md`** rests on source reading, non-DB unit tests
+  and the static guards above. That combination has caught real defects — the
+  header bypass, the cancellable writes, the unprimed-pool INSERT — and is still
+  not the same claim as "behaves this way in production".
 
 ## Verification standard for this repo
 
