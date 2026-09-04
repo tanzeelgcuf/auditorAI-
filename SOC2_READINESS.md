@@ -53,7 +53,11 @@ doc for our eventual formal SOC2 Type II audit.
 | Control | Status | Evidence / Notes |
 |---|---|---|
 | Argon2id password hashing | ✅ | `auth.HashPassword` |
-| TOTP 2FA (firm_admin mandatory) | 🟡 | `auth.HandleEnableTOTP`/`HandleVerifyTOTP` exist; enforcement gate in login pending wiring |
+| TOTP 2FA — login enforcement | ✅ | `auth.CheckSecondFactor` is called by `HandleLogin`; a user with `totp_secret` set cannot obtain tokens without a valid code, and an accepted code cannot be reused inside its 90s validity (`totp_last_code`/`totp_last_used_at`). Unit-tested in `internal/auth/totp_test.go` (16 cases, no DB required). Wired 2026-09-04 — before that the column was written by `/totp/verify` and read by nothing. |
+| TOTP 2FA — enrollment ceremony | ✅ | `/v1/totp/enable` persists `totp_pending_secret`; `/v1/totp/verify` validates against the STORED secret and promotes it, stamping `totp_enabled_at`. Both routes are behind `Authenticator`. Before 2026-09-04 verify validated the code against a secret supplied in the same request body. |
+| TOTP 2FA — mandatory for firm_admin | ⬜ | NOT implemented. Nothing forces a firm_admin to enroll; the factor is enforced only for accounts that have enrolled. This row is the remaining gap in the "firm_admin mandatory" claim earlier versions of this file made. |
+| TOTP 2FA — recovery codes | ⬜ | NOT implemented, deliberately deferred. A user who loses their authenticator needs an operator to clear `users.totp_secret`; there is no self-service path and no break-glass code. |
+| TOTP 2FA — enrollment UI | ⬜ | No client calls `/v1/totp/enable` or `/v1/totp/verify` (`grep -rn totp apps/` returns only the login-form code field). Enrollment is API-only today. |
 | Email verification | ✅ | `users.email_verified` + verification flow |
 | Audit logging of sensitive access | ✅ | `internal/middleware/auditlog.go` → `access_log` table |
 

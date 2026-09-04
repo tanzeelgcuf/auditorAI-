@@ -7,7 +7,7 @@ question is already answered there.
 
 Session reports live at the workspace root next to the repo:
 `../AUDIT_2026-09-02.md`, `../SESSION_2026-09-04.md`,
-`../SESSION_2026-09-04_pipeline.md`.
+`../SESSION_2026-09-04_pipeline.md`, `../SESSION_2026-09-04_totp.md`.
 
 ## Core Non-Negotiable Rules
 
@@ -23,13 +23,31 @@ Session reports live at the workspace root next to the repo:
 3. **Traceability**: Every reported financial figure MUST carry a citation: `(source_document_id, page, bbox)` + the exact rule/calculation that produced it. No code path may skip this — even for "obviously correct" values.
    - **A recorded rule identifier is not provenance unless that rule produced the number.** Until 2026-09-04 every reconciliation result carried `rule_version` (a SHA-256 prefix of the decision-graph JSON) while `RuleEngine::evaluate` ignored the graph completely and used a hardcoded severity ladder. Editing a firm's tolerance bands changed the recorded `rule_version` and changed nothing about the answer. Fixed; see `services/verification/src/zen/mod.rs` header.
 
-4. **v1 Scope Lock**: ONLY 3-way reconciliation (invoice ↔ bank transaction ↔ GL entry) with full traceability. NO SOX/BSA-AML rule categories yet — those are documented v2 extensions. The `scope-lock` skill will flag any code expanding beyond this.
+4. **v1 Scope Lock**: ONLY 3-way reconciliation (invoice ↔ bank transaction ↔ GL
+   entry) with full traceability. NO SOX/BSA-AML rule categories yet — those are
+   documented v2 extensions. The `scope-lock` skill will flag any code expanding
+   beyond this.
+   - **The lock governs PRODUCT SURFACE, not security controls.** Auth hardening —
+     MFA, session handling, rate limits, RLS, audit logging — is baseline for any
+     multi-tenant product that touches a client's books, not a feature added to
+     v1's scope. Decided 2026-09-04, recorded here so the scope-lock check does
+     not flag the next piece of auth work as an expansion. What the lock still
+     forbids: new *reconciliation* categories, new rule domains, and anything
+     that makes this the system of record.
 
 5. **A NATS message is acked only after its work is durable.** Not in a `defer`,
    not in a `finally`, and not on an error path. Every consumer in this repo
    violated this at some depth, and the failure is silent by construction: the
    event is destroyed, so nothing retries it and nothing reports it. See
    **Pipeline durability** below before touching a consumer.
+
+6. **One definition per context key, and it lives at the bottom of the import
+   order.** The four request-scoped identity keys (`UserIDKey`, `FirmIDKey`,
+   `AssignedBooksKey`, `RoleKey`) are declared in `internal/auth/context.go` and
+   *aliased* in `internal/middleware`. Never read a context value with an untyped
+   string literal — `ctx.Value("user_id")` does not match a
+   `ContextKey("user_id")` write and returns nil forever, with no error anywhere.
+   See **Second factor** below for what that cost.
 
 ## Pipeline durability
 
@@ -79,6 +97,64 @@ consumer grows forever. `DOCUMENTS` carried two such subjects
 (LimitsPolicy, 7d, 100k). **`CreateStream` does not rewrite an existing stream's
 config** — an already-deployed `DOCUMENTS` keeps the old subject list until it is
 updated or deleted while drained. See the MIGRATION NOTE in `pipeline.go`.
+
+## Second factor (TOTP)
+
+Wired 2026-09-04. Before that date the feature was **write-only**: `/totp/verify`
+wrote `users.totp_secret` and no code path ever read it, so an account with 2FA
+"enabled" logged in with a password alone. Both shipped clients already collected
+and sent `totp_code`; the server had no field to decode it into.
+
+Three separate defects, only one of which was the one originally logged:
+
+| Defect | Effect |
+|--------|--------|
+| `loginRequest` had no `TOTPCode`, `HandleLogin` never selected `totp_secret` | the factor did not exist at login; enabling it changed nothing |
+| `HandleVerifyTOTP` validated `code` against `secret` **from the same request body** | proved only that the caller could run a TOTP library; a client could enroll a secret the user's authenticator had never seen |
+| both handlers read `r.Context().Value("user_id")` — untyped `string` key vs `contextKey` write — while mounted in the **public** `/v1/auth` group | 401 for every caller, which is the only reason the two defects above were never live |
+
+That last row is why fixing the context key *alone* would have been worse than
+leaving it: it would have converted a visibly broken endpoint into a working
+endpoint that enrolls unverified secrets and a login that ignores them.
+
+How it works now:
+
+- `auth.CheckSecondFactor(state, submitted, now)` in `internal/auth/totp.go` is a
+  pure function — no DB, no clock, no HTTP — and is the only place the
+  accept/reject decision is made. `HandleLogin` does the I/O around it.
+  `totp_secret == ""` means *not enrolled*, so every pre-existing user row (NULL)
+  keeps logging in unchanged.
+- **Enrollment is a two-step ceremony.** `/v1/totp/enable` generates a secret and
+  stores it in `totp_pending_secret`; `/v1/totp/verify` validates the submitted
+  code against **that stored secret**, then promotes it to `totp_secret` in one
+  `UPDATE ... WHERE totp_pending_secret IS NOT NULL` and stamps `totp_enabled_at`.
+  The request body of `/totp/verify` carries no secret at all any more.
+- **Routes moved** from `/v1/auth/totp/*` (public group) to `/v1/totp/*` behind
+  `Authenticator`, in their own small group rather than the big protected one:
+  both handlers query through the auth service's `sysPool` and never touch the
+  RLS-scoped pool, so putting them in the main group would make `RLSInjector`
+  check out a connection and set GUCs for a request that cannot use them. Safe
+  because identity comes from the verified JWT and every statement is scoped
+  `WHERE id = <that user>`. No client called the old paths (`grep -rn totp apps/`
+  → only the login form's code field), so nothing working was broken.
+- **Single-use codes.** `totp.Validate` accepts the current 30s step ±1, so one
+  code is good for ~90s. `totp_last_code`/`totp_last_used_at` remember the last
+  accepted code for 120s and reject it, so a code seen once — screenshot,
+  shoulder, phished form — cannot be spent again inside its own window. The
+  "still spent" test is `now < last_used + 120s`, which stays fail-closed if the
+  database clock reads ahead of the API's.
+
+Not implemented, and named so it is not mistaken for done: **recovery/backup
+codes** (losing the authenticator needs an operator to clear `totp_secret`),
+**mandatory enrollment for firm_admin** (the factor is enforced only for accounts
+that chose to enroll), and **any enrollment UI**. See `SOC2_READINESS.md` CC6.5,
+where each is its own row rather than one amber cell.
+
+Tests: `internal/auth/totp_test.go`, 16 table cases plus 4 standalone, no database
+required. The valid codes are produced by a hand-rolled RFC 6238 implementation
+(stdlib `hmac`/`sha1`) rather than by the `otp` package, so "valid code accepted"
+cross-checks two implementations of the spec instead of one library agreeing with
+itself.
 
 ## Stack
 
@@ -138,10 +214,12 @@ without them set aborts before creating a single table.
 posture, so collapsing back to one DSN goes red instead of quietly passing.
 
 **Which pool a service gets** (wired in `cmd/server/main.go`): `sysPool` only when
-the work cannot be scoped to one firm — `auth` (all `/v1/auth` routes are public,
+the work cannot be scoped to one firm — `auth` (every `/v1/auth` route is public,
 so no `app.current_firm` exists yet, and login must find `firm_id` *from* the
 submitted email while signup INSERTs the `firms` row a policy would need to
-already exist), `SeedTemplates`, `notify.Run`, the coordinator, the verify worker,
+already exist; the two `/v1/totp/*` routes ARE authenticated but share the same
+service and pool, which is safe because each statement is scoped `WHERE id =`
+the JWT's own user), `SeedTemplates`, `notify.Run`, the coordinator, the verify worker,
 `webhooks` (its DB writes run *after* outbound HTTP retry backoffs, so they can
 outlive the request), `billing`'s Stripe webhook, and `portal`'s pre-auth invite
 lookup. Everything a request handler touches uses `pool`.
