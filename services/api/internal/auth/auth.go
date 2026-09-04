@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -324,6 +325,23 @@ type loginRequest struct {
 	TOTPCode string `json:"totp_code"`
 }
 
+// invalidCredentials is the ONE response every rejected login gets: unknown
+// email, wrong password, and locked account are indistinguishable. Defined once
+// so the three call sites cannot drift apart, which is how a lockout turns into a
+// user-enumeration oracle.
+func invalidCredentials(w http.ResponseWriter) {
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+}
+
+// HandleLogin authenticates a user and issues tokens.
+//
+// IT RUNS IN ONE TRANSACTION WITH `SELECT ... FOR UPDATE` on the user row. That
+// is not incidental: the per-account failed-attempt counter (see lockout.go) is a
+// read-check-increment, and without the row lock two concurrent attempts both read
+// the same count and both write count+1, so the ceiling could be raised by
+// parallelism alone. The lock serialises attempts against ONE account, which is
+// exactly the contention this control wants to create. It costs nothing on the
+// happy path — Argon2id at 64MB already dominates the latency of this handler.
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -331,19 +349,40 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	conn, err := s.db.Acquire(r.Context())
+	if err != nil {
+		slog.Error("login: failed to acquire connection", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(r.Context())
+	if err != nil {
+		slog.Error("login: failed to begin transaction", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
 	var id, firmID, passwordHash, role string
 	var emailVerified bool
 	var totpSecret, totpLastCode *string
 	var totpLastUsedAt *time.Time
-	err := s.db.QueryRow(r.Context(),
+	var failedAttempts int
+	var lockedUntil, lastFailedAt *time.Time
+	err = tx.QueryRow(r.Context(),
 		`SELECT id, firm_id, password_hash, role, email_verified,
-		        totp_secret, totp_last_code, totp_last_used_at
-		   FROM users WHERE email = $1`,
+		        totp_secret, totp_last_code, totp_last_used_at,
+		        failed_login_attempts, locked_until, last_failed_login_at
+		   FROM users WHERE email = $1
+		   FOR UPDATE`,
 		req.Email).Scan(&id, &firmID, &passwordHash, &role, &emailVerified,
-		&totpSecret, &totpLastCode, &totpLastUsedAt)
+		&totpSecret, &totpLastCode, &totpLastUsedAt,
+		&failedAttempts, &lockedUntil, &lastFailedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+			invalidCredentials(w)
 			return
 		}
 		slog.Error("login query failed", "error", err)
@@ -351,12 +390,40 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
+	lock := LockoutState{FailedAttempts: failedAttempts}
+	if lockedUntil != nil {
+		lock.LockedUntil = *lockedUntil
+	}
+	if lastFailedAt != nil {
+		lock.LastFailedAt = *lastFailedAt
+	}
+
+	// LOCKED: return before the password is even looked at.
+	//
+	// Verifying the password here and reporting the lock separately would be
+	// friendlier to the real user and fatal to the control: an attacker would hammer
+	// through the lock window watching for the response that differs, and get an
+	// unlimited password-correctness oracle that never touches the counter. So the
+	// cost is accepted — a locked-out user sees "invalid email or password" until
+	// the window expires. See lockout.go, IsLocked contract rule 1.
+	if IsLocked(lock, now) {
+		slog.Warn("login attempt on locked account", "user_id", id,
+			"attempts", lock.FailedAttempts, "locked_until", lock.LockedUntil)
+		invalidCredentials(w)
+		return
+	}
+
 	if !VerifyPassword(req.Password, passwordHash) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+		s.persistLoginFailure(r.Context(), tx, id, lock, now, "bad_password")
+		invalidCredentials(w)
 		return
 	}
 
 	if !emailVerified {
+		// Neither a guess nor a success: the credentials were right, so nothing is
+		// counted, and the counter is NOT cleared either — a 403 path that zeroes it
+		// would be a free reset for anyone holding the password.
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "email not verified"})
 		return
 	}
@@ -373,7 +440,15 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if totpLastUsedAt != nil {
 		sf.LastUsedAt = *totpLastUsedAt
 	}
-	if err := CheckSecondFactor(sf, req.TOTPCode, time.Now().UTC()); err != nil {
+	if err := CheckSecondFactor(sf, req.TOTPCode, now); err != nil {
+		// A WRONG or REPLAYED code is a guess and counts. A MISSING code does not:
+		// no candidate secret was tested, and both shipped clients render the code
+		// as one optional field on the same form as the password, so an enrolled
+		// user submitting the form empty is ordinary user error. Counting it would
+		// lock real users out for something that reveals nothing.
+		if !errors.Is(err, ErrTOTPRequired) {
+			s.persistLoginFailure(r.Context(), tx, id, lock, now, "bad_totp")
+		}
 		slog.Warn("login blocked by second factor", "user_id", id, "reason", err.Error())
 		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
 			"error":         err.Error(),
@@ -381,19 +456,36 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// Fully authenticated. ONE statement clears the lockout and burns the TOTP code,
+	// because both must be true of the same commit:
+	//   - the counter must not clear before the second factor has passed (every TOTP
+	//     guess carries the correct password, so an earlier reset would hold the
+	//     counter at 1 forever and the six-digit ceiling would not exist);
+	//   - the code must not stay spendable after tokens are issued.
+	// A failure here fails the login rather than issuing tokens on half-written
+	// state.
+	burn := ""
 	if sf.Secret != "" {
-		// Burn the code so it cannot be replayed inside its remaining validity.
-		// A failure here MUST fail the login: continuing would issue tokens while
-		// leaving the code spendable again, which is the exact weakening this
-		// change exists to remove.
-		code := NormalizeTOTPCode(req.TOTPCode)
-		if _, err := s.db.Exec(r.Context(),
-			`UPDATE users SET totp_last_code = $1, totp_last_used_at = now() WHERE id = $2`,
-			code, id); err != nil {
-			slog.Error("failed to record used TOTP code", "error", err, "user_id", id)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
+		burn = NormalizeTOTPCode(req.TOTPCode)
+	}
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE users
+		    SET failed_login_attempts = 0,
+		        locked_until          = NULL,
+		        last_failed_login_at  = NULL,
+		        totp_last_code    = CASE WHEN $1 = '' THEN totp_last_code    ELSE $1    END,
+		        totp_last_used_at = CASE WHEN $1 = '' THEN totp_last_used_at ELSE now() END
+		  WHERE id = $2`,
+		burn, id); err != nil {
+		slog.Error("failed to record successful login", "error", err, "user_id", id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Error("failed to commit successful login", "error", err, "user_id", id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
 	}
 
 	tokens, err := s.GenerateTokens(id, firmID, role)
@@ -404,6 +496,66 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, tokens)
+}
+
+// persistLoginFailure records ONE failed attempt and COMMITS it.
+//
+// The commit is the whole point. The handler returns 401 immediately afterwards,
+// and the deferred Rollback would otherwise discard the increment — a
+// failed-attempt counter that rolls back is a counter that does not exist.
+//
+// IT ALSO SURVIVES THE CLIENT HANGING UP. `r.Context()` is cancelled the instant
+// the client's socket closes, and both the Exec and the Commit below would then
+// return context.Canceled and drop the increment. That is the one write in this
+// handler whose loss is fail-OPEN, so cancellation is stripped here and replaced
+// with a deadline of its own. The pooled database connection has nothing to do
+// with the client's socket, so it is still perfectly usable. HandleLogin's
+// SUCCESS commit deliberately keeps the request context: if that one is
+// cancelled, no tokens are issued, the code is not burned and the counter is not
+// cleared, which is fail-CLOSED and correct. The asymmetry is the point.
+//
+// A write error is logged and the caller still returns 401: the request is denied
+// either way, and turning a database problem into a 500 here would hand an
+// attacker a way to make logins fail loudly. The Error log is the signal that the
+// ceiling is not being recorded.
+func (s *Service) persistLoginFailure(ctx context.Context, tx pgx.Tx, userID string, st LockoutState, now time.Time, reason string) {
+	if IsLocked(st, now) {
+		// Unreachable from HandleLogin, which returns before it gets here. Kept
+		// because the invariant belongs with the write: a failure inside the window
+		// must not extend it (lockout.go, IsLocked contract rule 2).
+		return
+	}
+	next := LockoutAfterFailure(st, now)
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	var until *time.Time
+	if !next.LockedUntil.IsZero() {
+		until = &next.LockedUntil
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE users
+		    SET failed_login_attempts = $1,
+		        locked_until          = $2,
+		        last_failed_login_at  = $3
+		  WHERE id = $4`,
+		next.FailedAttempts, until, next.LastFailedAt, userID); err != nil {
+		slog.Error("failed to record login failure", "error", err, "user_id", userID, "reason", reason)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("failed to commit login failure", "error", err, "user_id", userID, "reason", reason)
+		return
+	}
+
+	if until != nil {
+		slog.Warn("account locked after repeated failed logins", "user_id", userID,
+			"reason", reason, "attempts", next.FailedAttempts, "locked_until", *until)
+		return
+	}
+	slog.Info("failed login recorded", "user_id", userID, "reason", reason,
+		"attempts", next.FailedAttempts, "threshold", LockoutThreshold)
 }
 
 type refreshRequest struct {
@@ -604,8 +756,21 @@ func (s *Service) HandleResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The lockout is cleared here as well. Without this, a user who got locked out,
+	// concluded they had forgotten their password, and reset it would still be
+	// refused with "invalid email or password" until the window expired — with a
+	// password they now know is correct. Safe to clear: reaching this line requires
+	// the single-use token that was mailed to the address on the account, which is a
+	// stronger proof than the counter is protecting.
 	_, err = s.db.Exec(r.Context(),
-		`UPDATE users SET password_hash = $1, password_reset_token = NULL, password_reset_expires = NULL WHERE id = $2`,
+		`UPDATE users
+		    SET password_hash          = $1,
+		        password_reset_token   = NULL,
+		        password_reset_expires = NULL,
+		        failed_login_attempts  = 0,
+		        locked_until           = NULL,
+		        last_failed_login_at   = NULL
+		  WHERE id = $2`,
 		hash, req.UserID)
 	if err != nil {
 		slog.Error("failed to update password", "error", err)

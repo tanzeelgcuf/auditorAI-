@@ -120,6 +120,36 @@ CREATE TABLE users (
     totp_enabled_at TIMESTAMPTZ,
     totp_last_code TEXT,
     totp_last_used_at TIMESTAMPTZ,
+    -- Per-account brute-force ceiling (added 2026-09-04). Until this existed the
+    -- ONLY brute-force control was the per-IP token bucket in
+    -- internal/middleware/ratelimit.go, which is keyed on the source address — so
+    -- an attempt spread across many addresses was bounded only by how many
+    -- addresses the attacker had, and the 10^6 TOTP surface was reachable.
+    --
+    -- THE TIER ARITHMETIC LIVES IN GO, in auth.LockoutAfterFailure. Do NOT
+    -- reimplement it in a trigger, a DEFAULT, or a CHECK here. A second copy of a
+    -- money-or-security rule in a second language is the bug class this repo has
+    -- already paid for three times (see CLAUDE.md rules 8-10); these three columns
+    -- are storage, not policy.
+    --
+    -- Policy as of 2026-09-04: 5 consecutive failures locks for 1m, 10 for 5m,
+    -- 15 for 15m, 20+ for 30m (cap). At or above the threshold EVERY further
+    -- failure re-locks, so there are no free guesses between tiers. The counter
+    -- clears on a login that actually issues tokens, or after 60m with no failure.
+    -- 60m is deliberately LONGER than the 30m cap: were they equal, the lock
+    -- expiring and the counter resetting would coincide and the steady-state
+    -- ceiling would jump from 1 attempt per 30m to 5.
+    --
+    -- Both a wrong password and a wrong/replayed TOTP code increment this. Only
+    -- counting the password would let an attacker who already has the password
+    -- switch to guessing the six-digit factor with no account-level ceiling at all.
+    failed_login_attempts INT NOT NULL DEFAULT 0,
+    -- NULL = not locked. Written with the DATABASE's now(); auth.IsLocked compares
+    -- it against the API process's clock and treats a value that reads in the
+    -- future as locked, so clock skew between the two fails closed.
+    locked_until TIMESTAMPTZ,
+    -- Drives the 60m idle reset. NULL = no failure on record.
+    last_failed_login_at TIMESTAMPTZ,
     email_verified BOOLEAN NOT NULL DEFAULT false,
     email_verification_token TEXT,
     email_verification_expires TIMESTAMPTZ,
