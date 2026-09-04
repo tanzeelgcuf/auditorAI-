@@ -194,7 +194,16 @@ CREATE TABLE reconciliation_groups (
     -- 'superseded' folded from migration 000008 §2. humanoverride.go:186 (split)
     -- and :274 (merge) both write it; without it those two writes violated this
     -- CHECK and the endpoints 500'd.
-    status TEXT NOT NULL DEFAULT 'auto_linked' CHECK (status IN ('auto_linked','needs_review','confirmed','rejected','superseded')),
+    --
+    -- DEFAULT is 'needs_review', not 'auto_linked'. An INSERT that omits status
+    -- is a caller that did not decide, and the fail-open reading of that ("this
+    -- reconciles, no human needed") is the most expensive possible default for an
+    -- audit product: the group is then invisible to review.go, which selects the
+    -- queue on status. All five in-repo INSERTs supply status explicitly
+    -- (mcp.go:234 validated to auto_linked|needs_review, humanoverride.go:199 and
+    -- :265 literal 'needs_review', seed-demo, security_test), so this changes no
+    -- current behaviour — it changes what the NEXT writer gets for free.
+    status TEXT NOT NULL DEFAULT 'needs_review' CHECK (status IN ('auto_linked','needs_review','confirmed','rejected','superseded')),
     -- Folded from migration 000010 (doc 12 §2): AP vs AR reconciled separately.
     -- mcp.go:234 INSERTs this on the agent's create_entity_link write path.
     group_scope TEXT NOT NULL DEFAULT 'ap' CHECK (group_scope IN ('ap', 'ar', 'other')),

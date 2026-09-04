@@ -168,6 +168,29 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 	if req.Status == "" {
 		req.Status = "needs_review"
 	}
+	// A caller may only propose a MACHINE disposition. The two human ones
+	// ('confirmed', 'rejected') and 'superseded' are decisions this endpoint has
+	// no standing to record, and accepting them here reopened the exact hole that
+	// verify_worker.go's downgrade closes: that downgrade is guarded by
+	// `AND status = 'auto_linked'` so it never overwrites a human decision, so a
+	// group created as 'confirmed' is permanently immune to it. It would carry an
+	// open exceeds_tolerance finding, read as human-confirmed, and never appear in
+	// the review queue (review.go selects on status) — with no human involved at
+	// any point. This endpoint is called by the agent runtime
+	// (agent-runtime/mcp_client.py persist_groups), which only ever proposes
+	// 'auto_linked' or 'needs_review'.
+	//
+	// Rejecting instead of silently coercing: a caller asking for a status it
+	// cannot set is a wiring bug in the caller, and quietly turning it into
+	// 'needs_review' would hide that while still throwing away the intent.
+	// Unrecognized values previously reached the INSERT and failed the CHECK
+	// constraint on reconciliation_groups.status as a bare 500 "insert failed".
+	if req.Status != "auto_linked" && req.Status != "needs_review" {
+		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request",
+			"status must be 'auto_linked' or 'needs_review'; human dispositions are "+
+				"recorded through the review endpoints, not at link creation")
+		return
+	}
 
 	c := middleware.GetConn(r.Context())
 	if c == nil {
