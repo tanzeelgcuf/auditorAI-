@@ -62,7 +62,7 @@ export function LoginScreen({ onLoggedIn }: Props) {
       />
       <TextInput
         style={styles.input}
-        placeholder="2FA code (optional)"
+        placeholder="2FA code (required if enabled)"
         value={totp}
         onChangeText={setTotp}
         keyboardType="number-pad"
