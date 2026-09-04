@@ -234,6 +234,29 @@ jobs:
       - name: Check for orphan storage keys
         run: python3 scripts/check_storage_key_orphans.py --verbose
 
+      # Cancellable audit writes. `r.Context()` dies when the client's socket
+      # closes, so a database write on it whose error is swallowed into a log
+      # line can be deleted by the party it records — they hang up, the row is
+      # never written, and the action itself stands because it already committed.
+      # Four instances found: middleware.ReleaseRLSConn (tenant GUCs surviving
+      # into the next request on a pooled connection), auth.persistLoginFailure
+      # (the failed-login increment that IS the per-account lockout ceiling),
+      # middleware.RecordAccess (all 12 access_log call sites) and
+      # humanoverride.LogConfigChange (config_change_log). Three of the four were
+      # pre-existing, which is why this is a standing guard and not a one-off fix.
+      #
+      # The guard has two halves, and the positive one is the half that survives
+      # a refactor: it asserts those four sites still carry
+      # context.WithoutCancel, so reverting one fails by name even if the search
+      # patterns stop matching. Verified in four directions before being added
+      # here: exit 0 on the current tree ("all 4 known fixes in place"); exit 1
+      # naming ONLY RecordAccess when its strip is removed; exit 1 naming ONLY a
+      # newly planted handler that writes access_log on r.Context() and logs the
+      # error; exit 1 with an explicit "this guard is inert" message when pointed
+      # at a tree the patterns do not match.
+      - name: Check for cancellable audit writes
+        run: python3 scripts/check_cancellable_audit_writes.py --verbose
+
   # services/agent-runtime has four test modules (tests/test_extract.py,
   # test_link.py, test_mcp_client.py, test_pilot_fixtures.py) and
   # requirements.txt already pins pytest and pytest-asyncio — but nothing in CI

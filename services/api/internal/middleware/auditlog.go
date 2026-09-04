@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,6 +16,18 @@ import (
 // tenant GUCs (app.current_firm / app.assigned_books) are set; access_log RLS
 // allows inserting when client_book_id is NULL or in assigned_books.
 //
+// CANCELLATION IS STRIPPED FIRST. Every one of the 12 call sites passes
+// `r.Context()`, which is cancelled the moment the client's socket closes — so
+// before 2026-09-04 a caller could drop their own audit row by hanging up
+// immediately after the request, and the action itself would still stand because
+// it had already committed. For a product whose value proposition is traceability
+// that is the wrong way round. context.WithoutCancel keeps the ctx VALUES, which
+// is what DB(ctx, db) needs to find the RLS-wired request connection, and drops
+// only the cancellation; the bounded deadline replaces the one it dropped. The
+// call is still synchronous, so the request connection is alive throughout. Same
+// bug class as auth.persistLoginFailure — a write whose loss is fail-open must
+// not be cancellable by the party it is recording.
+//
 // KNOWN GAP, deliberately left as-is for now: when there is no request
 // connection the fallback pool has no GUC, so the INSERT raises and this
 // function degrades to a slog.Warn — an audit row is dropped without failing the
@@ -23,6 +36,9 @@ import (
 // audit write fails, which is a product decision, not a wiring fix. Tracked
 // rather than silently "fixed" here.
 func RecordAccess(ctx context.Context, db *pgxpool.Pool, userID, clientBookID, action, resourceID string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
 	_, err := DB(ctx, db).Exec(ctx,
 		`INSERT INTO access_log (user_id, client_book_id, action, resource_id)
 		 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid)`,

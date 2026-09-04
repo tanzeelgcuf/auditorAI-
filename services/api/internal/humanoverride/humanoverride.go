@@ -300,10 +300,21 @@ func (s *Service) HandleMergeGroups(w http.ResponseWriter, r *http.Request) {
 // ---- §3 Config change audit ----
 
 // LogConfigChange records a settings mutation. Called by settings/tenant handlers.
+//
+// Cancellation is stripped for the same reason as middleware.RecordAccess and
+// auth.persistLoginFailure: the only call site passes `r.Context()`
+// (tenant.go:318), the error degrades to a slog.Warn, and `config_change_log` is
+// an audit table — so before 2026-09-04 the person changing a book's settings
+// could suppress the record of that change by closing the connection, and the
+// change itself would still stand. Whoever is being recorded must not hold the
+// cancel button. The bounded deadline replaces the one WithoutCancel drops.
 func LogConfigChange(ctx context.Context, db *pgxpool.Pool, bookID, userID, field string, oldV, newV interface{}) {
 	if db == nil || bookID == "" {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
 	_, err := db.Exec(ctx,
 		`INSERT INTO config_change_log (client_book_id, changed_by, field_name, old_value, new_value)
 		 VALUES ($1, $2, $3, $4, $5)`,
