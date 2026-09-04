@@ -330,8 +330,30 @@ func main() {
 		r.Get("/verify-email", authSvc.HandleVerifyEmail)
 		r.Post("/forgot-password", authSvc.HandleForgotPassword)
 		r.Post("/reset-password", authSvc.HandleResetPassword)
-		r.Post("/totp/enable", authSvc.HandleEnableTOTP)
-		r.Post("/totp/verify", authSvc.HandleVerifyTOTP)
+		// NOTE: /totp/enable and /totp/verify used to be registered HERE, inside
+		// this public group. They read the caller's identity from the request
+		// context, which only middleware.Authenticator populates, so in the public
+		// group they had no identity to read and returned 401 to everyone. They now
+		// live at /v1/totp/* in the authenticated group below.
+	})
+
+	// Second-factor enrollment (2026-09-04) — authenticated, but deliberately NOT
+	// inside the big protected group below, because these two handlers query the
+	// `users` table through the auth service's own sysPool and never touch the
+	// RLS-scoped pool; mounting them there would make RLSInjector check out a
+	// connection and set GUCs on it for the whole request for no reason.
+	//
+	// Identity comes from the verified JWT (auth.UserIDFrom), and every statement
+	// is scoped `WHERE id = <that user>`, so BYPASSRLS here does not widen access:
+	// a caller can only ever enroll a factor on their own account.
+	//
+	// Rate-limited with authLimiter: /totp/verify is a 6-digit guess surface, and
+	// without a limiter 10^6 is a small number.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Authenticator(authSvc))
+		r.Use(middleware.RateLimit(authLimiter))
+		r.Post("/v1/totp/enable", authSvc.HandleEnableTOTP)
+		r.Post("/v1/totp/verify", authSvc.HandleVerifyTOTP)
 	})
 
 	// Protected routes

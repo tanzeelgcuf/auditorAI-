@@ -317,6 +317,11 @@ func (s *Service) HandleSignup(w http.ResponseWriter, r *http.Request) {
 type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	// TOTPCode is the second factor. Both shipped clients already send this
+	// field (apps/web login page, apps/mobile LoginScreen); until 2026-09-04 the
+	// server had no field to decode it into, so it was silently discarded and a
+	// user with 2FA "enabled" could log in with a password alone.
+	TOTPCode string `json:"totp_code"`
 }
 
 func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
@@ -328,9 +333,14 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 
 	var id, firmID, passwordHash, role string
 	var emailVerified bool
+	var totpSecret, totpLastCode *string
+	var totpLastUsedAt *time.Time
 	err := s.db.QueryRow(r.Context(),
-		"SELECT id, firm_id, password_hash, role, email_verified FROM users WHERE email = $1",
-		req.Email).Scan(&id, &firmID, &passwordHash, &role, &emailVerified)
+		`SELECT id, firm_id, password_hash, role, email_verified,
+		        totp_secret, totp_last_code, totp_last_used_at
+		   FROM users WHERE email = $1`,
+		req.Email).Scan(&id, &firmID, &passwordHash, &role, &emailVerified,
+		&totpSecret, &totpLastCode, &totpLastUsedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
@@ -349,6 +359,41 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if !emailVerified {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "email not verified"})
 		return
+	}
+
+	// Second factor. Ordered after the password on purpose: a caller who cannot
+	// present the password learns nothing about whether the account has 2FA.
+	sf := SecondFactorState{}
+	if totpSecret != nil {
+		sf.Secret = *totpSecret
+	}
+	if totpLastCode != nil {
+		sf.LastCode = *totpLastCode
+	}
+	if totpLastUsedAt != nil {
+		sf.LastUsedAt = *totpLastUsedAt
+	}
+	if err := CheckSecondFactor(sf, req.TOTPCode, time.Now().UTC()); err != nil {
+		slog.Warn("login blocked by second factor", "user_id", id, "reason", err.Error())
+		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			"error":         err.Error(),
+			"totp_required": true,
+		})
+		return
+	}
+	if sf.Secret != "" {
+		// Burn the code so it cannot be replayed inside its remaining validity.
+		// A failure here MUST fail the login: continuing would issue tokens while
+		// leaving the code spendable again, which is the exact weakening this
+		// change exists to remove.
+		code := NormalizeTOTPCode(req.TOTPCode)
+		if _, err := s.db.Exec(r.Context(),
+			`UPDATE users SET totp_last_code = $1, totp_last_used_at = now() WHERE id = $2`,
+			code, id); err != nil {
+			slog.Error("failed to record used TOTP code", "error", err, "user_id", id)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
 	}
 
 	tokens, err := s.GenerateTokens(id, firmID, role)
@@ -571,16 +616,25 @@ func (s *Service) HandleResetPassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Password reset"})
 }
 
+// HandleEnableTOTP begins enrollment: it generates a secret, persists it as
+// PENDING, and returns it once so the caller can load it into an authenticator.
+// The secret does not become the account's second factor until
+// HandleVerifyTOTP proves the device can compute codes from it.
+//
+// Must be mounted behind middleware.Authenticator — it reads the caller's
+// identity from the request context and will refuse the request without it.
 func (s *Service) HandleEnableTOTP(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("user_id")
-	if userID == nil {
+	userID := UserIDFrom(r.Context())
+	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
 
 	var email string
+	var alreadyEnabled bool
 	err := s.db.QueryRow(r.Context(),
-		"SELECT email FROM users WHERE id = $1", userID).Scan(&email)
+		"SELECT email, totp_secret IS NOT NULL FROM users WHERE id = $1", userID).
+		Scan(&email, &alreadyEnabled)
 	if err != nil {
 		slog.Error("failed to get user email for TOTP", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -601,20 +655,42 @@ func (s *Service) HandleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"secret":  key.Secret(),
-		"qr_code": key.URL(),
+	// Persist as pending. Any earlier unfinished enrollment is overwritten, which
+	// is correct: only one device can be mid-enrollment at a time, and the live
+	// totp_secret is untouched until verify succeeds — so a re-enroll that is
+	// abandoned halfway cannot lock the user out of an already-working factor.
+	if _, err := s.db.Exec(r.Context(),
+		"UPDATE users SET totp_pending_secret = $1 WHERE id = $2", key.Secret(), userID); err != nil {
+		slog.Error("failed to store pending TOTP secret", "error", err, "user_id", userID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	slog.Info("TOTP enrollment started", "user_id", userID, "replacing_existing", alreadyEnabled)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"secret":           key.Secret(),
+		"qr_code":          key.URL(),
+		"already_enabled":  alreadyEnabled,
+		"confirm_endpoint": "/v1/totp/verify",
 	})
 }
 
 type verifyTOTPRequest struct {
-	Code   string `json:"code"`
-	Secret string `json:"secret"`
+	Code string `json:"code"`
 }
 
+// HandleVerifyTOTP completes enrollment by validating a code against the secret
+// this server generated and stored, then promoting it to the live factor.
+//
+// It deliberately takes NO secret from the request body. Until 2026-09-04 it did:
+// it validated `code` against `secret` from the same JSON object, so the check
+// proved only that the caller could run a TOTP library — an attacker (or an
+// honest client with a bug) could generate a keypair locally, send a matching
+// pair, and have the server store a secret the real user's authenticator had
+// never seen. The stored secret is now the only one considered.
 func (s *Service) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("user_id")
-	if userID == nil {
+	userID := UserIDFrom(r.Context())
+	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
@@ -624,26 +700,60 @@ func (s *Service) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if req.Code == "" || req.Secret == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "code and secret are required"})
+	code := NormalizeTOTPCode(req.Code)
+	if len(code) != 6 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "a 6-digit code is required"})
 		return
 	}
 
-	valid := totp.Validate(req.Code, req.Secret)
-	if !valid {
+	var pending *string
+	err := s.db.QueryRow(r.Context(),
+		"SELECT totp_pending_secret FROM users WHERE id = $1", userID).Scan(&pending)
+	if err != nil {
+		slog.Error("failed to read pending TOTP secret", "error", err, "user_id", userID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if pending == nil || *pending == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "no pending enrollment; call /v1/totp/enable first",
+		})
+		return
+	}
+
+	if !totp.Validate(code, *pending) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid TOTP code"})
 		return
 	}
 
-	_, err := s.db.Exec(r.Context(),
-		"UPDATE users SET totp_secret = $1 WHERE id = $2", req.Secret, userID)
+	// Promote pending to live in one statement, and seed the replay memory with
+	// the code just used so it cannot immediately be replayed at login. The
+	// `totp_pending_secret IS NOT NULL` guard makes this a no-op if a concurrent
+	// request already consumed the same enrollment.
+	tag, err := s.db.Exec(r.Context(),
+		`UPDATE users
+		    SET totp_secret = totp_pending_secret,
+		        totp_pending_secret = NULL,
+		        totp_enabled_at = now(),
+		        totp_last_code = $1,
+		        totp_last_used_at = now()
+		  WHERE id = $2 AND totp_pending_secret IS NOT NULL`,
+		code, userID)
 	if err != nil {
 		slog.Error("failed to store TOTP secret", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
+	if tag.RowsAffected() == 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "enrollment already completed"})
+		return
+	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "2FA enabled"})
+	slog.Info("TOTP enabled", "user_id", userID)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "2FA enabled",
+		"note":    "Recovery codes are not implemented; losing this device requires an operator to reset the factor.",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
