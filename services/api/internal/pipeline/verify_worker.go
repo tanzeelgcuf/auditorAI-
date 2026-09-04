@@ -239,10 +239,41 @@ func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg
 	}
 	r := res.Results[0]
 
+	// The finding and the group's disposition are written in ONE transaction.
+	//
+	// Before this, the success path wrote only the finding. A group the matcher
+	// shipped as 'auto_linked' that Rust then judged exceeds_tolerance kept
+	// status='auto_linked', and review.go:71 selects the queue on status — so the
+	// group carried an open over-tolerance finding that no human would ever be
+	// shown. The deterministic tier annotated but could not dispose.
+	//
+	// That was not a theoretical divergence between the tiers. link.py's
+	// build_candidate_groups gates invoice↔bank and invoice↔GL but never
+	// bank↔GL, and score_and_route's is_exact compares each present leg only
+	// against present_totals[0] — a star comparison, which transitively admits
+	// up to 2× tolerance between the other two legs. compute_three_way_variance
+	// computes all THREE pairwise variances and grpc/mod.rs takes the max. So at
+	// the shipped default tolerance of 1¢, invoice +89900 / bank -89899 / GL
+	// +89901 is 'exact' with confidence 1.0 to the matcher and a 2¢
+	// exceeds_tolerance 'low' finding to Rust, and the window scales: each leg
+	// may sit one tolerance off the invoice, so the bank↔GL gap reaches 2×
+	// tolerance. Measured across 600 randomised books: 139 auto_linked groups
+	// that Rust judged over tolerance.
+	//
+	// Two writes, one transaction, because the failure mode of splitting them is
+	// exactly the state being fixed: a finding recorded with the group still
+	// reading as reconciled.
+	tx, err := w.db.Begin(ctx)
+	if err != nil {
+		w.fail(ctx, msg, ev.GroupID, "begin_tx", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// Write the finding (idempotent: skip if a finding already exists for this
 	// group — re-verification of an existing group is a review-cycle concern,
 	// out of v1 scope).
-	_, err = w.db.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`INSERT INTO audit_findings
 			(client_book_id, reconciliation_group_id, rule_id, rule_version,
 			 calculated_variance_cents, tolerance_cents, exceeds_tolerance,
@@ -258,13 +289,53 @@ func (w *VerifyWorker) handleVerification(ctx context.Context, msg jetstream.Msg
 		return
 	}
 
+	// Rust's verdict decides the disposition. Only ever a DOWNGRADE:
+	//
+	//   - `AND status = 'auto_linked'` so a human decision ('confirmed',
+	//     'rejected') is never overwritten by a redelivered event, and so a
+	//     second delivery is a 0-row no-op rather than a second state change.
+	//   - exceeds_tolerance == false does NOT promote 'needs_review' to
+	//     'auto_linked'. A group is in review for reasons this tier cannot see
+	//     (date window, counterparty similarity, a pass-5 mismatch flag); an
+	//     amount that happens to reconcile is not evidence those concerns are
+	//     resolved. Promotion here would silently retire human review.
+	var downgraded int64
+	if r.ExceedsTolerance {
+		tag, err := tx.Exec(ctx,
+			`UPDATE reconciliation_groups SET status = 'needs_review'
+			  WHERE id = $1 AND status = 'auto_linked'`, ev.GroupID)
+		if err != nil {
+			w.fail(ctx, msg, ev.GroupID, "downgrade_group", err)
+			return
+		}
+		downgraded = tag.RowsAffected()
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		w.fail(ctx, msg, ev.GroupID, "commit", err)
+		return
+	}
+
 	slog.Info("finding created",
 		"group", ev.GroupID, "variance_cents", r.VarianceCents,
-		"severity", r.Severity, "exceeds", r.ExceedsTolerance)
+		"severity", r.Severity, "exceeds", r.ExceedsTolerance,
+		"downgraded_to_review", downgraded)
 
-	// Ack last, success path only. The INSERT is guarded by NOT EXISTS on
-	// reconciliation_group_id, so a redelivery after a crash between the write and
-	// this ack is a no-op rather than a duplicate finding.
+	// An over-tolerance group that was NOT downgraded is either already in
+	// review or already decided by a human. Logged rather than silent, because
+	// "over tolerance and still auto_linked" is the state this fix exists to
+	// prevent and the only way to notice it recurring is to say so.
+	if r.ExceedsTolerance && downgraded == 0 {
+		slog.Warn("verify worker: over-tolerance group was not auto_linked, "+
+			"disposition left as-is",
+			"group", ev.GroupID, "variance_cents", r.VarianceCents,
+			"severity", r.Severity)
+	}
+
+	// Ack last, success path only. Both writes are in one committed transaction
+	// and the INSERT is guarded by NOT EXISTS on reconciliation_group_id, so a
+	// redelivery after a crash between the commit and this ack re-runs as a
+	// no-op rather than a duplicate finding or a second status change.
 	if err := msg.Ack(); err != nil {
 		slog.Error("verify worker: ack failed after successful processing",
 			"group", ev.GroupID, "error", err)
