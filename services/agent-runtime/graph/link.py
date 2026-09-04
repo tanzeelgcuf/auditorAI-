@@ -121,16 +121,38 @@ def _score_group(
 
     # Amount match score (0.5). Compare only PRESENT legs — a 2-member group
     # (bank+GL, no invoice) must not be penalized by the absent invoice leg.
-    present = [("inv", total_inv), ("bank", total_bank), ("gl", total_gl)]
-    amounts = [abs(v) for _, v in present if v != 0]
+    #
+    # Two corrections here, the same pair found in score_and_route's is_exact:
+    #
+    # 1. Variance is |‖a‖ − ‖b‖|, not |a − b|. This used signed subtraction, and
+    #    every legitimate 3-way group carries opposite signs by convention (a
+    #    billed invoice +, its bank debit −, its GL credit +). |89900 − (−89899)|
+    #    is 179799, so a group one cent out of tolerance scored avg_variance
+    #    ≈ 1.33 × max_amt, amount_score clamped to 0.0, and the whole non-exact
+    #    path collapsed to 0.2·date + 0.3·counterparty ≤ 0.5. At review_floor
+    #    0.50 that sits exactly on the boundary: a slightly fuzzy counterparty
+    #    (0.95 → 0.285) drops it to 0.485 and score_and_route then routes it to
+    #    NEITHER queue — a real over-tolerance discrepancy disappearing rather
+    #    than being reviewed. _amounts_match and services/verification's
+    #    compute_three_way_variance both compare absolute values; this now does
+    #    too, so the near-miss score degrades smoothly with the actual gap.
+    #
+    # 2. Presence is membership, not a non-zero total. A leg whose amounts net to
+    #    zero (an invoice and its full credit note) is present and must be
+    #    compared, because verify_worker.go's BOOL_OR(m.role=…) tells the
+    #    verification tier it is present and it will be compared there.
+    legs = [
+        ("inv", total_inv, bool(invoice_entities)),
+        ("bank", total_bank, bool(bank_entities)),
+        ("gl", total_gl, bool(gl_entities)),
+    ]
+    present = [(label, value) for label, value, is_present in legs if is_present]
+    amounts = [abs(v) for _, v in present]
     max_amt = max(amounts) if amounts else 1
     variances = []
     for i in range(len(present)):
         for j in range(i + 1, len(present)):
-            li, vi = present[i]
-            lj, vj = present[j]
-            if vi != 0 and vj != 0:
-                variances.append(abs(vi - vj))
+            variances.append(abs(abs(present[i][1]) - abs(present[j][1])))
     avg_variance = sum(variances) / len(variances) if variances else 0.0
     amount_score = max(0.0, 1.0 - (avg_variance / max_amt)) if max_amt > 0 else 0.0
 
@@ -351,13 +373,46 @@ def score_and_route(
         inv_total = sum(e.amount_cents for e in invs)
         bank_total = sum(e.amount_cents for e in banks)
         gl_total = sum(e.amount_cents for e in gls)
-        # Exact = every PRESENT leg matches within tolerance (abs — sign is a
-        # convention). A 2-member group (bank+GL, no invoice) is exact when the
-        # two match; a 3-member group needs all three.
-        present_totals = [t for t in (inv_total, bank_total, gl_total) if t != 0]
+
+        # Exact = EVERY PAIR of present legs matches within tolerance (abs — sign
+        # is a convention). A 2-member group (bank+GL, no invoice) is exact when
+        # the two match; a 3-member group needs all three pairs.
+        #
+        # Two things here were wrong and both let a real variance through as
+        # "exact", confidence 1.0:
+        #
+        # 1. This compared every leg against present_totals[0] only — a star, not
+        #    all pairs. build_candidate_groups likewise gates invoice↔bank and
+        #    invoice↔GL but never bank↔GL. Two legs each one tolerance off the
+        #    invoice, in opposite directions, are 2× tolerance apart from each
+        #    other and passed both checks. services/verification computes all
+        #    three pairwise variances and takes the max, so the tiers disagreed:
+        #    invoice +89900 / bank -89899 / GL +89901 at the default 1¢ tolerance
+        #    was 1.0 "exact" here and a 2¢ exceeds_tolerance finding there.
+        #    Measured over 600 randomised books: 139 auto_linked groups that the
+        #    verification tier judged over tolerance.
+        #
+        # 2. Presence was `t != 0`, so a leg WITH members whose amounts net to
+        #    zero (an invoice and its full credit note) counted as absent and was
+        #    dropped from the comparison. The verification tier decides presence
+        #    from membership (verify_worker.go BOOL_OR(m.role=...) → has_invoice),
+        #    so it compares that leg as 0 against the full bank amount. Presence
+        #    is now membership here too, which is the same question the DB asks.
+        #
+        # This is a candidate-quality gate, not the authority on disposition:
+        # verify_worker.go downgrades an over-tolerance group regardless of what
+        # this scores. Both exist because a group that is wrong here is also
+        # wrong in the confidence number the audit trail records.
+        present_totals = [
+            t for t, present in (
+                (inv_total, bool(invs)),
+                (bank_total, bool(banks)),
+                (gl_total, bool(gls)),
+            ) if present
+        ]
         is_exact = len(present_totals) >= 2 and all(
-            _amounts_match(present_totals[0], t, config.tolerance_cents)
-            for t in present_totals[1:]
+            _amounts_match(a, b, config.tolerance_cents)
+            for a, b in combinations(present_totals, 2)
         )
 
         score = _score_group(invs, banks, gls, config, is_exact)
@@ -375,7 +430,25 @@ def score_and_route(
                 matched_ids.add(str(eid))
             continue
 
-        if score >= config.auto_link_threshold:
+        # CONFIDENCE IS NOT TOLERANCE, and `is_exact` is the tolerance question.
+        #
+        # This was `if score >= config.auto_link_threshold:` alone. The score
+        # measures how likely these records describe the same transaction —
+        # amount proximity, date proximity, counterparty similarity — and a 2¢
+        # gap on an $899 invoice is 0.99998 of it. So a group whose legs are
+        # KNOWN not to reconcile within the book's tolerance was auto-linked on
+        # the strength of being obviously the same transaction, which it is. Those
+        # are two different questions and only one of them was being asked.
+        #
+        # This is a deliberate change to documented routing (doc 06 §2 describes
+        # the threshold, not this conjunct). The weights and thresholds are
+        # untouched; what changes is that clearing the threshold is now necessary
+        # and not sufficient. A non-exact group still gets its score, still ranks
+        # in the review queue by it, and is still linked as a group — it just
+        # requires a human to accept the variance. The alternative is a product
+        # that reports a reconciliation as clean while its own verification tier
+        # has an open over-tolerance finding against it.
+        if score >= config.auto_link_threshold and is_exact:
             group.status = "auto_linked"
             auto_linked.append(group)
             for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:
