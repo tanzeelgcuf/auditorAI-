@@ -282,6 +282,12 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(middleware.RealIP(trustedProxies))
+	// MUST stay directly below RealIP. SourceIP copies the (by now rewritten)
+	// RemoteAddr onto the context for the audit writers, so above RealIP it would
+	// record the proxy instead of the client, silently and forever. It is also the
+	// reason access_log.source_ip cannot disagree with the address the rate
+	// limiter bucketed: both read the same single resolution.
+	r.Use(middleware.SourceIP)
 	r.Use(middleware.SentryRecoverer) // must run BEFORE Recoverer to capture panics
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(30 * time.Second))

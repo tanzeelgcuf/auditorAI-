@@ -35,14 +35,25 @@ import (
 // wrong trade, but changing it means deciding what a request should do when its
 // audit write fails, which is a product decision, not a wiring fix. Tracked
 // rather than silently "fixed" here.
+//
+// source_ip is read from the context, not from an added parameter. All 12 call
+// sites already pass r.Context() so this costs them nothing, but the real reason
+// is that a parameter would have meant 12 independent resolutions of "which IP is
+// this?" — the exact shape of the X-Forwarded-For bypass fixed in clientip.go the
+// same week. One resolution (middleware.SourceIP), one reader, so the audit trail
+// cannot disagree with the rate limiter about who called.
 func RecordAccess(ctx context.Context, db *pgxpool.Pool, userID, clientBookID, action, resourceID string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
+	// "" when the request never passed through middleware.SourceIP; NULLIF turns
+	// that into SQL NULL rather than a row asserting the call came from nowhere.
+	sourceIP := GetSourceIP(ctx)
+
 	_, err := DB(ctx, db).Exec(ctx,
-		`INSERT INTO access_log (user_id, client_book_id, action, resource_id)
-		 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid)`,
-		userID, clientBookID, action, resourceID)
+		`INSERT INTO access_log (user_id, client_book_id, action, resource_id, source_ip)
+		 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::inet)`,
+		userID, clientBookID, action, resourceID, sourceIP)
 	if err != nil {
 		// Audit logging must never break the request path — degrade to a log line.
 		slog.Warn("failed to record access log", "action", action, "resource_id", resourceID, "error", err)

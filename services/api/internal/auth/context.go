@@ -28,6 +28,13 @@ const (
 	AssignedBooksKey ContextKey = "assigned_books"
 	// RoleKey holds the user's role: "staff" or "firm_admin" (string).
 	RoleKey ContextKey = "role"
+	// SourceIPKey holds the canonical client address for the request (string),
+	// set once by middleware.SourceIP and never re-derived per call site. It is
+	// NOT identity — it survives here rather than in `middleware` for the reason
+	// in the type comment above: the key has to sit below every package that
+	// reads it, and the audit writers that read it are spread across
+	// `middleware`, `humanoverride` and `periods`.
+	SourceIPKey ContextKey = "source_ip"
 )
 
 // UserIDFrom returns the authenticated user ID, or "" when the request did not
@@ -52,6 +59,21 @@ func FirmIDFrom(ctx context.Context) string {
 // RoleFrom returns the authenticated user's role, or "" if absent.
 func RoleFrom(ctx context.Context) string {
 	if v, ok := ctx.Value(RoleKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SourceIPFrom returns the client address recorded for this request, or "" when
+// the request did not pass through middleware.SourceIP (background workers, CLI
+// tools, and unit tests that build a bare context).
+//
+// "" is a legitimate answer and callers must persist it as SQL NULL rather than
+// as the string "" — an audit row that claims the request came from nowhere is
+// worse than one that admits it does not know. Every INSERT that stores this
+// uses NULLIF($n, '')::inet for exactly that reason.
+func SourceIPFrom(ctx context.Context) string {
+	if v, ok := ctx.Value(SourceIPKey).(string); ok {
 		return v
 	}
 	return ""

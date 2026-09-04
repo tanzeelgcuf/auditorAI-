@@ -27,6 +27,7 @@ const (
 	FirmIDKey        = auth.FirmIDKey
 	AssignedBooksKey = auth.AssignedBooksKey
 	RoleKey          = auth.RoleKey
+	SourceIPKey      = auth.SourceIPKey
 )
 
 // contextKey is for values that never cross a package boundary.

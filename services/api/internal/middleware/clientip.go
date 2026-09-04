@@ -28,6 +28,7 @@ package middleware
 // security problem, silent).
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
@@ -190,6 +191,40 @@ func RealIP(tp TrustedProxies) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// SourceIP stashes the resolved client address on the request context so that the
+// audit writers can record "from where" without any of them resolving it again.
+//
+// MOUNT IT IMMEDIATELY AFTER RealIP AND NOWHERE ELSE. It reads peerIP(r), which
+// by that point is RealIP's already-rewritten RemoteAddr, so the value stored is
+// the same address ClientIP resolved and the same one the rate limiter bucketed.
+// Mounted BEFORE RealIP it would silently record the proxy's address instead of
+// the client's on every request behind a trusted proxy — no error, no log line,
+// just a permanently wrong audit trail. router_order_test.go pins the ordering.
+//
+// It is a separate middleware rather than two extra lines inside RealIP because
+// RealIP's documented contract is that it "does nothing at all unless the peer is
+// a trusted proxy", and a context write on every request would falsify that.
+//
+// Note it does NOT skip the write when the value is empty: canonicalIP returns ""
+// for an unparseable RemoteAddr, and storing "" is how SourceIPFrom's documented
+// "" -> SQL NULL path gets exercised rather than a stale value being inherited.
+func SourceIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), SourceIPKey, peerIP(r))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// GetSourceIP is the only way to read the value SourceIP wrote. It delegates to
+// auth.SourceIPFrom, where the key is defined; both spellings exist so that
+// middleware-package callers do not need to import auth for one accessor.
+func GetSourceIP(ctx context.Context) string {
+	if v, ok := ctx.Value(SourceIPKey).(string); ok {
+		return v
+	}
+	return ""
 }
 
 // LogTrustedProxies states the resolved posture at boot. An empty set in

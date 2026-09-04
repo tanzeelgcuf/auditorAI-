@@ -319,6 +319,7 @@ CREATE TABLE period_reopen_log (
     reconciliation_period_id UUID NOT NULL REFERENCES reconciliation_periods(id),
     reopened_by UUID NOT NULL REFERENCES users(id),
     reason TEXT NOT NULL,
+    source_ip INET,
     reopened_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -417,12 +418,21 @@ CREATE TABLE webhook_subscriptions (
 );
 
 -- ===== ACCESS LOG =====
+-- source_ip answers "from where", which an audit product has to be able to answer
+-- and until 2026-09-04 this one could not. Deliberately NULLABLE: the INSERT in
+-- middleware.RecordAccess degrades a failure to a log line, so NOT NULL here would
+-- discard an entire audit row to protect one field. It is written from a single
+-- context value set by middleware.SourceIP, which runs immediately after
+-- middleware.RealIP, so it is the same address the rate limiter bucketed -- not a
+-- 12th independent re-resolution of X-Forwarded-For (that shape was the bypass
+-- fixed in clientip.go the same week).
 CREATE TABLE access_log (
     id BIGSERIAL PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id),
     client_book_id UUID REFERENCES client_books(id),
     action TEXT NOT NULL,
     resource_id UUID,
+    source_ip INET,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -498,6 +508,7 @@ CREATE TABLE config_change_log (
     field_name TEXT NOT NULL,
     old_value TEXT,
     new_value TEXT,
+    source_ip INET,
     changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -748,6 +759,12 @@ CREATE INDEX idx_counterparty_aliases_book ON counterparty_aliases(client_book_i
 CREATE INDEX idx_document_requests_book ON document_requests(client_book_id);
 CREATE INDEX idx_access_log_user ON access_log(user_id);
 CREATE INDEX idx_access_log_book ON access_log(client_book_id);
+-- "what else came from this address, and when" is the forensic query source_ip
+-- exists for; without occurred_at in the index it degrades to a heap scan per
+-- answer. Partial, because rows written before 2026-09-04 (and any row whose
+-- middleware chain did not set the value) are NULL and never the subject of it.
+CREATE INDEX idx_access_log_source_ip ON access_log(source_ip, occurred_at DESC)
+    WHERE source_ip IS NOT NULL;
 
 -- ============================================================================
 -- APPLICATION ROLES  —  this is what makes the 30 policies above do anything
