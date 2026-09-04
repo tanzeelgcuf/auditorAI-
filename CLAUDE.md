@@ -49,6 +49,54 @@ Session reports live at the workspace root next to the repo:
    `ContextKey("user_id")` write and returns nil forever, with no error anywhere.
    See **Second factor** below for what that cost.
 
+7. **A request header is never an identity.** `X-Forwarded-For`, `X-Real-IP`,
+   `True-Client-IP` and friends are attacker-controlled unless the machine that
+   opened the connection is one we chose to trust, and `X-Forwarded-For` is read
+   **right to left** because conforming proxies append. Client-IP resolution lives
+   in exactly one place, `internal/middleware/clientip.go`, gated on
+   `TRUSTED_PROXY_CIDRS`, which is **empty by default and means trust nothing**.
+   Do not reintroduce `chimiddleware.RealIP` — it rewrites `RemoteAddr` from those
+   headers with no trusted-proxy check. See **Client IP and rate limits** below.
+
+## Client IP and rate limits
+
+Until 2026-09-04 every per-IP control in `services/api` was bypassable with one
+header, and the bug was in two places at once — the pattern this repo keeps
+hitting, where a control looks present because two halves each assume the other
+validated something.
+
+| Where | What it did |
+|-------|-------------|
+| `main.go` `r.Use(chimiddleware.RealIP)` | rewrote `r.RemoteAddr` from `True-Client-IP` / `X-Real-IP` / `X-Forwarded-For`, unconditionally |
+| `ratelimit.go` `clientIP` | read the **leftmost** `X-Forwarded-For` element and **preferred it over** `RemoteAddr` |
+
+Leftmost is the element the *client* writes. So `X-Forwarded-For: <anything new>`
+on each request minted a fresh token bucket, and the 5 req/s ceiling on
+`/v1/auth/login`, `/v1/portal/login`, `/v1/totp/verify`, uploads and admin key
+rotation was not a ceiling. `infra/docker-compose.yml` publishes the api as
+`8080:8080` and no service carries traefik labels, so the header arrived from the
+internet untouched — nothing was sanitising it. Measured against a burst-1
+bucket: **1000 of 1000 forged requests admitted before the fix, 1 after**, with
+1000 distinct buckets minted from a single peer.
+
+A green test asserted the vulnerable behaviour as correct
+(`TestRateLimitHonorsXForwardedFor`: "same forwarded IP → same bucket"). It was
+replaced, not deleted quietly — `TestRateLimitIgnoresSpoofedXForwardedFor` names
+what it supersedes and why.
+
+Two consequences worth keeping in mind:
+
+- The bucket map's key used to be an unvalidated caller-supplied string, so the
+  file's own comment claiming "an attacker can't exhaust memory by rotating IPs"
+  was false — no IPs needed rotating. Keys are now canonicalised addresses
+  (`::ffff:1.2.3.4` and `1.2.3.4` collapse to one bucket) and unparseable peers
+  share a single `"unresolved"` key.
+- **Still missing:** a per-account failed-attempt counter and lockout. The limit
+  is per source address only, so `/v1/totp/verify` and `/v1/auth/login` are
+  bounded by the addresses an attacker has, not by attempts against one account.
+  `access_log` also records no source IP at all, which is its own ⬜ row in
+  `SOC2_READINESS.md`.
+
 ## Pipeline durability
 
 Three consumers, all fixed 2026-09-04, all found by grepping for the first one's

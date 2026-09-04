@@ -59,7 +59,9 @@ doc for our eventual formal SOC2 Type II audit.
 | TOTP 2FA — recovery codes | ⬜ | NOT implemented, deliberately deferred. A user who loses their authenticator needs an operator to clear `users.totp_secret`; there is no self-service path and no break-glass code. |
 | TOTP 2FA — enrollment UI | ⬜ | No client calls `/v1/totp/enable` or `/v1/totp/verify` (`grep -rn totp apps/` returns only the login-form code field). Enrollment is API-only today. |
 | Email verification | ✅ | `users.email_verified` + verification flow |
+| Brute-force ceiling on auth endpoints | 🟡 | Per-IP token bucket (`internal/middleware/ratelimit.go`) on `/v1/auth/*`, `/v1/portal/login`, `/v1/totp/*`, uploads and admin key ops. **Was bypassable until 2026-09-04**: `clientIP` read the leftmost `X-Forwarded-For` element — the one the client writes — and preferred it over the peer address, and `chimiddleware.RealIP` poisoned the peer address from the same headers, so one header per request gave a caller unlimited private buckets. Measured against a burst-1 bucket: 1000/1000 forged requests admitted before, 1 after. Now trusted-proxy aware (`clientip.go`, `TRUSTED_PROXY_CIDRS`, empty = ignore headers). Amber not green because there is still **no per-account failed-attempt counter and no lockout** — the limit is per source address only, so a distributed attempt is bounded only by the addresses available to it. |
 | Audit logging of sensitive access | ✅ | `internal/middleware/auditlog.go` → `access_log` table |
+| Source IP recorded on audited access | ⬜ | `access_log` has no IP column (`user_id`, `client_book_id`, `action`, `resource_id`, `occurred_at`). An audit product should be able to answer "from where"; today it cannot. |
 
 ### CC6.6 — Key management / CC6.7 — Data loss prevention
 | Control | Status | Evidence / Notes |
@@ -137,4 +139,4 @@ doc for our eventual formal SOC2 Type II audit.
 - Incident response documented as plan, not yet drilled
 
 ---
-*Last updated: 2026-08-01. Owner: engineering. Reviewed by: (to be assigned when formal audit scoped).*
+*Last updated: 2026-09-04. Owner: engineering. Reviewed by: (to be assigned when formal audit scoped).*

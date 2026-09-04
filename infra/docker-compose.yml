@@ -161,6 +161,14 @@ services:
       SYS_DATABASE_URL: postgres://auditor_sys:${SYS_DB_PASSWORD}@postgres:5432/ai_auditor
       JWT_SECRET: ${JWT_SECRET}
       APP_ENV: ${APP_ENV}
+      # Trusted reverse proxies for client-IP resolution. EMPTY = trust nothing,
+      # which is correct for this file as it stands: `ports: 8080:8080` below
+      # publishes the api directly and no service carries traefik labels, so
+      # nothing sanitises X-Forwarded-For before it reaches the process. If you
+      # put a proxy in front, set this to ITS address range — otherwise every
+      # client shares one rate-limit bucket. See clientip.go for why the empty
+      # default is the safe one.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       S3_ENDPOINT: ${S3_ENDPOINT}
       S3_BUCKET: ${S3_BUCKET}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY}
