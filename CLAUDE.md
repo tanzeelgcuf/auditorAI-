@@ -7,7 +7,8 @@ question is already answered there.
 
 Session reports live at the workspace root next to the repo:
 `../AUDIT_2026-09-02.md`, `../SESSION_2026-09-04.md`,
-`../SESSION_2026-09-04_pipeline.md`, `../SESSION_2026-09-04_totp.md`.
+`../SESSION_2026-09-04_pipeline.md`, `../SESSION_2026-09-04_totp.md`,
+`../SESSION_2026-09-04_clientip.md`.
 
 ## Core Non-Negotiable Rules
 
