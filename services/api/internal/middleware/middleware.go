@@ -17,15 +17,22 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 )
 
+// The four identity keys are DEFINED IN internal/auth (see auth/context.go) and
+// only aliased here, because middleware imports auth and the reverse would be an
+// import cycle. Do not redeclare them locally: a second definition of
+// "user_id" under a second key type is exactly the bug that made both TOTP
+// handlers return 401 for every caller until 2026-09-04.
+const (
+	UserIDKey        = auth.UserIDKey
+	FirmIDKey        = auth.FirmIDKey
+	AssignedBooksKey = auth.AssignedBooksKey
+	RoleKey          = auth.RoleKey
+)
+
+// contextKey is for values that never cross a package boundary.
 type contextKey string
 
-const (
-	UserIDKey       contextKey = "user_id"
-	FirmIDKey       contextKey = "firm_id"
-	AssignedBooksKey contextKey = "assigned_books"
-	RoleKey         contextKey = "role"
-	connKey         contextKey = "rls_conn"
-)
+const connKey contextKey = "rls_conn"
 
 // Authenticator validates JWT and sets user context
 func Authenticator(authSvc *auth.Service) func(http.Handler) http.Handler {
