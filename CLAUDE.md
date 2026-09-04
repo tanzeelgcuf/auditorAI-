@@ -83,6 +83,65 @@ Session reports live at the workspace root next to the repo:
     an unset bool to **false**. An unset flag does not mean "unknown"; it means
     the money tier never compares that leg and returns "clean" for everything.
 
+11. **A locked account is never told it is locked, and a correct password never
+    clears the counter.** Both halves are ordering rules in `HandleLogin`, both
+    read as improvements in review, and either one alone removes the per-account
+    ceiling entirely:
+    - Verifying the password while `IsLocked` is true — even just to give the
+      user a clearer message — is an unlimited password-correctness oracle that
+      **does not consume the counter**. The locked branch returns before
+      `VerifyPassword` and answers with the same `invalidCredentials(w)` as a bad
+      password. A lockout that responds differently from a wrong password is also
+      a user-enumeration oracle.
+    - The counter is cleared only on the path that **issues tokens**, after the
+      second factor. Every TOTP guess in an attack carries the *correct*
+      password, so a reset on password-correct would pin the counter at 1 and the
+      10⁶ ceiling would not exist. A 403 (email unverified) neither increments
+      nor clears: no guess failed, and zeroing there is a free reset for anyone
+      holding the password.
+
+    Corollaries, each pinned by a test: the read-check-increment holds a
+    `FOR UPDATE` row lock; the increment **commits** (`HandleLogin` has a deferred
+    `Rollback`, so a 401-path write is discarded by default); a failure arriving
+    *during* a window does not extend it; and `ErrTOTPRequired` — a missing code,
+    not a wrong one — does not count.
+
+12. **The party being recorded does not hold the cancel button.** `r.Context()`
+    is cancelled the instant the client's socket closes. A database write on it
+    whose error is *swallowed into a log line* can therefore be deleted by the
+    caller — they hang up, the row is never written, nothing reports a failure
+    that mattered, and the action being recorded stands because it already
+    committed. A write whose error **is** returned is not in this class: losing it
+    fails the request, which is visible.
+
+    The fix, identical in all four places it was needed:
+
+    ```go
+    ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+    defer cancel()
+    ```
+
+    `WithoutCancel` keeps the ctx **values** — `RecordAccess` needs them for
+    `DB(ctx, db)` to find the RLS-wired request connection — and drops only
+    cancellation; the deadline replaces the one it dropped. The pooled DB
+    connection has nothing to do with the client's socket, so it stays usable.
+
+    The four: `middleware.ReleaseRLSConn` (a `RESET` that no-op'd on aborted
+    requests, leaking tenant GUCs into the next request on that connection),
+    `auth.persistLoginFailure` (the increment that *is* rule 11's ceiling),
+    `middleware.RecordAccess` (all 12 `access_log` call sites) and
+    `humanoverride.LogConfigChange` (`config_change_log`). Three were
+    pre-existing; the class is now a CI guard,
+    `scripts/check_cancellable_audit_writes.py`.
+
+    **The asymmetry is deliberate, so do not "make it consistent".** A *success*
+    commit must stay cancellable: losing it issues no tokens, burns no TOTP code
+    and clears no counter, which is fail-**closed**. Only writes whose loss is
+    fail-**open** get the strip. Cancellation is also the shutdown signal for
+    background loops and NATS consumers, so stripping it there would keep a
+    draining process writing after it was told to stop — the three allowlisted
+    sites in that guard are allowlisted for exactly that reason.
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
@@ -147,11 +206,13 @@ Two consequences worth keeping in mind:
   was false — no IPs needed rotating. Keys are now canonicalised addresses
   (`::ffff:1.2.3.4` and `1.2.3.4` collapse to one bucket) and unparseable peers
   share a single `"unresolved"` key.
-- **Still missing:** a per-account failed-attempt counter and lockout. The limit
-  is per source address only, so `/v1/totp/verify` and `/v1/auth/login` are
-  bounded by the addresses an attacker has, not by attempts against one account.
+- This limiter is per **source address**, so on its own it bounds an attack by the
+  addresses available to it, not by attempts against one account. `/v1/auth/login`
+  gained a second, per-account ceiling on 2026-09-04 — see **Per-account lockout**
+  below. `/v1/portal/login` and `/v1/totp/*` still have only this per-IP layer.
   `access_log` also records no source IP at all, which is its own ⬜ row in
-  `SOC2_READINESS.md`.
+  `SOC2_READINESS.md` — so the per-IP decision is not itself auditable after the
+  fact.
 
 ## Pipeline durability
 
@@ -260,7 +321,69 @@ required. The valid codes are produced by a hand-rolled RFC 6238 implementation
 cross-checks two implementations of the spec instead of one library agreeing with
 itself.
 
-## Stack
+## Per-account lockout
+
+Added 2026-09-04, the same day the `X-Forwarded-For` bypass was closed. Until
+then the **only** brute-force control in the service was the per-IP token bucket,
+which is keyed on the source address and therefore bounds nothing against a
+distributed attempt on one known email. Combined with the second factor shipping
+that morning, that left 10⁶ — a small number — reachable by anyone who already
+had the password.
+
+Policy, and it lives in exactly one place, `internal/auth/lockout.go`:
+
+| Consecutive failures | Locked for |
+|---|---|
+| 1-4 | not locked |
+| 5-9 | 1 minute |
+| 10-14 | 5 minutes |
+| 15-19 | 15 minutes |
+| 20+ | 30 minutes (cap) |
+
+The ladder is evaluated on **every** failure at or above the threshold, not only
+on the boundaries — otherwise attempts 6-9 are free guesses handed out the moment
+the 60-second lock expires. `LockoutResetWindow` is **60m and must stay strictly
+greater than the 30m cap**: if they were equal, the lock expiring and the counter
+zeroing would coincide and an attacker parked on the top tier would collect 5
+fresh attempts per 30 minutes instead of 1.
+
+Measured ceiling, not estimated: **64 attempts per 24 hours** against one account,
+with a gap of exactly 30 minutes from attempt 20 onward. The first draft of the
+test asserted "roughly 40-60" and was wrong; running the arithmetic is what caught
+it. Both a wrong password and a wrong-or-replayed TOTP code spend the same
+counter, so switching factors buys nothing.
+
+`HandleResetPassword` clears `failed_login_attempts`, `locked_until` and
+`last_failed_login_at`. Without that a user who got locked out, assumed they had
+forgotten the password, and reset it stays refused with "invalid email or
+password" while holding a password they know is correct.
+
+Not covered, and named rather than implied: the per-IP limiter is still the only
+control on `/v1/portal/login` and `/v1/totp/*` (the portal path is a 256-bit
+invite token, so it is not a guessable surface; the TOTP endpoints sit behind a
+verified JWT). There is also a **pre-existing timing side-channel** — an unknown
+email rejects immediately, a known one costs ~50 ms of Argon2id — left in place
+deliberately: a dummy-hash fix turns the login endpoint into a CPU-amplification
+DoS, and the lockout adds noise to that channel rather than widening it.
+
+Tests: `internal/auth/lockout_test.go` (13, pure) and
+`internal/auth/login_lockout_test.go` (12, source-invariant). Read the second
+one's header before trusting it — it asserts on the **text** of `auth.go` because
+`HandleLogin` needs a live Postgres, and the behavioural equivalent belongs in the
+`DATABASE_URL_TEST` suite and does not exist yet. Neither file has been compiled;
+both were mirrored in Python and run, including five mutants of the current
+`auth.go` in which only the ordering, the Scan arity, or the cancellation strip is
+wrong.
+
+One defect in this control was found *the same day, while writing its own session
+report*: `persistLoginFailure` performed its UPDATE and its Commit on
+`r.Context()`, so a client who hung up immediately cancelled the increment, the
+error went to `slog.Error`, and the ceiling above silently stopped existing. See
+rule 12 — the strip is now pinned by invariant 9 in `login_lockout_test.go` and by
+`scripts/check_cancellable_audit_writes.py`. It was fail-open, not an oracle:
+`persistLoginFailure` runs *before* `invalidCredentials(w)`, so aborting to kill
+the increment forfeits the answer too.
+
 
 | Layer | Tech |
 |-------|------|
@@ -357,7 +480,7 @@ Per-language gates, stated accurately:
 - **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists.
 - **Docker**: builds all 6 images with the same context/`-f` split as `infra/docker-compose.yml`, asserts binaries and the decision graph are actually inside the images, and `docker compose config -q` on both compose files.
 
-Three **static guards** — they exist because each proves something about code that
+Four **static guards** — they exist because each proves something about code that
 no test executes, and each was verified in both directions (clean on the current
 tree, red when the original bug is reintroduced) before being wired in:
 
@@ -365,6 +488,7 @@ tree, red when the original bug is reintroduced) before being wired in:
 |--------|-----|---------|
 | `scripts/check_schema_drift.py` | Schema Drift Guard | SQL in Go/Python referencing relations or columns `init.sql` does not define |
 | `scripts/check_storage_key_orphans.py` | Schema Drift Guard | a file that writes a `storage_key` without writing the bytes (`PutObject`) or verifying them (`ObjectExists`) |
+| `scripts/check_cancellable_audit_writes.py` | Schema Drift Guard | rule 12 — an audit/security write on a request context whose error is only logged, plus a positive check that the four known fixes still carry `context.WithoutCancel` |
 | `scripts/check_amount_parity.py` | python | the Rust money parser and its Python mirror disagreeing (they once read `"1250"` as $1,250.00 and $12.50) |
 
 Lint rules that bite in non-obvious ways:
@@ -373,7 +497,7 @@ Lint rules that bite in non-obvious ways:
 - That deny reaches into `#[cfg(test)]` modules and CI passes `--all-targets`, so the 64 test-module unwraps were deny-level errors. Both crates now ship a `clippy.toml` with `allow-unwrap-in-tests` / `allow-expect-in-tests`. Do not "simplify" those files away.
 - `cargo fmt --check` rejects tabs, trailing whitespace, and over-width **code** lines (rustfmt leaves comments alone, and does not split string literals).
 - `clippy -D warnings` rejects `format!` with no arguments (`useless_format`).
-- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts two guards.
+- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts three guards.
 
 ## What is NOT true (read this before repeating a claim from this file)
 
