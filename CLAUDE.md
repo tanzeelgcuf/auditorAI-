@@ -8,7 +8,7 @@ question is already answered there.
 Session reports live at the workspace root next to the repo:
 `../AUDIT_2026-09-02.md`, `../SESSION_2026-09-04.md`,
 `../SESSION_2026-09-04_pipeline.md`, `../SESSION_2026-09-04_totp.md`,
-`../SESSION_2026-09-04_clientip.md`.
+`../SESSION_2026-09-04_clientip.md`, `../SESSION_2026-09-04_disposition.md`.
 
 ## Core Non-Negotiable Rules
 
@@ -58,6 +58,61 @@ Session reports live at the workspace root next to the repo:
    `TRUSTED_PROXY_CIDRS`, which is **empty by default and means trust nothing**.
    Do not reintroduce `chimiddleware.RealIP` — it rewrites `RemoteAddr` from those
    headers with no trusted-proxy check. See **Client IP and rate limits** below.
+
+8. **Confidence is not tolerance.** `link_confidence` answers "are these records
+   the same transaction" (amount 0.5, date 0.2, counterparty 0.3). Whether the
+   amounts *reconcile* is a separate question that only `services/verification`
+   answers. A 2¢ gap on an $899 invoice scores 0.99998 on the first and fails the
+   second. Never gate a disposition on a confidence score, and never treat
+   `is_exact` as a tolerance verdict. See **Group disposition** below.
+
+9. **The deterministic tier disposes.** A verdict from `services/verification` is
+   not an annotation. Wherever it is obtained it must reach
+   `reconciliation_groups.status`, in the same transaction as the finding, and
+   **downgrade only** — `exceeds_tolerance == false` never promotes
+   `needs_review` to `auto_linked`, because a group is in review for reasons that
+   tier cannot see. Every status write carries `AND status = 'auto_linked'`.
+   Failure to verify fails **closed**.
+
+10. **Presence is membership, not a non-zero total.** A leg is present iff it has
+    ≥1 member. An invoice plus its full credit note nets to zero and is still
+    present, with total 0. This must agree in three places at once —
+    `verify_worker.go`'s `BOOL_OR(m.role=…)`, `link.py`'s `is_exact`, and the
+    `has_invoice/has_bank/has_gl` flags on the gRPC request, since
+    `grpc/mod.rs:130-141` builds each leg only `if req.has_X` and proto3 defaults
+    an unset bool to **false**. An unset flag does not mean "unknown"; it means
+    the money tier never compares that leg and returns "clean" for everything.
+
+## Group disposition
+
+Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
+every point where it could have changed a group's disposition. Five instances,
+one bug class — a group whose amounts do not reconcile was published as
+reconciled, carrying an open over-tolerance finding no human would ever be shown.
+Measured before the fix: **139 of 600 randomised books' auto_linked groups were
+over tolerance by Rust's own arithmetic.**
+
+| Where | What it did |
+|-------|-------------|
+| `pipeline/verify_worker.go` | Success path wrote the finding and stopped; `review.go:71` selects the queue on `status`, so the group never appeared in it. |
+| `link.py is_exact` | Compared each leg against `present_totals[0]` only — a **star**. Two legs one tolerance off the invoice in opposite directions are 2× tolerance apart and passed. Rust takes the **max of all three pairwise** variances. |
+| `link.py` presence | `total != 0`, so a zero-net invoice leg was invisible and the group auto-linked on the other two. |
+| `link.py _score_group` | `abs(vi - vj)` on **signed** totals. 3-way groups carry opposite signs by convention, so `amount_score` clamped to 0.0, the path collapsed to `0.2·date + 0.3·cp`, and a near-miss landed exactly on `review_floor` — a fuzzy counterparty then routed a real discrepancy to **neither queue**. |
+| `mcp.go HandleCreateEntityLink` | Took `req.Status` from the caller. A group created `'confirmed'` is immune to the downgrade *because* that UPDATE is guarded on `auto_linked`. |
+| `graph_def.py _verify_node` | Never sent the presence flags (so every leg arrived absent and no group could be flagged), never applied the result, and left the group `auto_linked` on exception. **Unreachable in production** — `main.py:212` passes no `verification_client` — fixed and pinned anyway. |
+| `infra/init.sql` | `status DEFAULT 'auto_linked'`. A default disposition must mean "nobody decided". Now `'needs_review'`. |
+
+The window in the star-comparison bug **scales with the book's tolerance**, not
+with the matcher's uncertainty: at `tolerance = 2500` it auto-linked a $50.00
+gap at confidence 1.0. That is why this class is worse than a low-confidence
+mismatch — it is silent and it grows with a customer-configurable number.
+
+Tests: `services/agent-runtime/tests/test_link_tolerance.py` (8),
+`tests/test_verify_node.py` (10), `internal/mcp/mcp_test.go`,
+`internal/pipeline/verify_worker_test.go`. Read the last one's header before
+trusting it — it asserts on source **text**, because a `jetstream.Msg` cannot be
+built outside a live connection, and the behavioural equivalent belongs in the
+`DATABASE_URL_TEST` suite and does not exist yet.
 
 ## Client IP and rate limits
 
@@ -341,6 +396,7 @@ evidence the design is wrong.
 ## Verification standard for this repo
 
 - A green suite that never exercised the real path is not evidence. Two examples already found here: the entire gRPC severity suite ran against a **zero-rule** engine via a `test_engine()` helper built from `{"nodes":[],"edges":[]}`, and `test_pilot_fixtures.py` parses CSV/OFX in Python instead of calling the Rust parser it is meant to prove.
+- **A test that also passes against the pre-fix code proves nothing.** Method used on 2026-09-04: `git archive HEAD` into a scratch tree, copy the new tests in, re-run. 18 new tests → 12 fail there, and the 6 that pass on both sides are over-correction guards. One test was caught this way *after* it was written and looked green: `test_zero_net_invoice_leg_is_compared_not_ignored` passed on both trees, because `build_candidate_groups` never admits a `50000` invoice into a group whose bank leg is `-89900`, so the assertion loop never ran. Rewritten to call `score_and_route` directly.
 - Before calling something a model/tool limitation, run an isolation test that changes one variable and confirms the result changes. The regression test for the graph bug is exactly this shape: same input, two graphs differing only in thresholds, asserted to produce **different** severities.
 - When you fix one instance of a bug class, sweep for the others before closing it. Every guard in the table above found a second or third instance after the first.
 - Report the literal command output, not a summary of what you expect it to say.
