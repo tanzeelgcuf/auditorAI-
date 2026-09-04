@@ -257,6 +257,37 @@ jobs:
       - name: Check for cancellable audit writes
         run: python3 scripts/check_cancellable_audit_writes.py --verbose
 
+      # Audit source IP. access_log could not answer "from where" until
+      # 2026-09-05; source_ip INET was added to all three audit tables
+      # (access_log, config_change_log, period_reopen_log). Everything about that
+      # change fails silently if it drifts, which is why it is guarded:
+      #
+      #   * pgx binds AND scans BY POSITION. A column added without its argument
+      #     errors at runtime and RecordAccess/LogConfigChange swallow the error
+      #     into slog.Warn, so the audit row just disappears. The SAME count in
+      #     the wrong order raises nothing at all and writes a confidently wrong
+      #     row, which for an audit product is worse than an empty one.
+      #   * HandleConfigHistory `continue`s on a Scan error inside for rows.Next(),
+      #     so a select list one longer than its Scan list returns {"items": []}
+      #     for every book, with a 200.
+      #   * middleware.SourceIP must stay BELOW middleware.RealIP in the root
+      #     chain. Above it, it copies the untouched RemoteAddr and records the
+      #     PROXY's address on every request behind a proxy — no error, no log
+      #     line, a permanently wrong audit trail. Source order, so no unit test
+      #     on either function can see it.
+      #   * LogConfigChange wrote on the RAW app pool until 2026-09-05.
+      #     config_change_log has FORCE RLS and its policy reads
+      #     current_setting('app.assigned_books') with no missing_ok and no
+      #     database/role default exists, so the INSERT could only fail — and did
+      #     so into a slog.Warn. That table had almost certainly never received a
+      #     row. Pinned by name so the raw-pool form cannot come back.
+      #
+      # 11 plausible mutants were run against this guard before it was added
+      # here, each caught by its own invariant, including "the guard parsed zero
+      # r.Use() entries" failing rather than passing.
+      - name: Check audit source-IP wiring
+        run: python3 scripts/check_audit_ip_arity.py --verbose
+
   # services/agent-runtime has four test modules (tests/test_extract.py,
   # test_link.py, test_mcp_client.py, test_pilot_fixtures.py) and
   # requirements.txt already pins pytest and pytest-asyncio — but nothing in CI
