@@ -262,9 +262,26 @@ func main() {
 	humanSvc.SetDB(pool)
 
 	// Router
+	//
+	// TRUSTED PROXIES. chimiddleware.RealIP used to sit here. It rewrites
+	// r.RemoteAddr from True-Client-IP / X-Real-IP / X-Forwarded-For with no
+	// notion of a trusted proxy, and the old ratelimit.clientIP then preferred
+	// the LEFTMOST X-Forwarded-For element over RemoteAddr — the element the
+	// client writes, since proxies append on the right. Result: one header made
+	// every per-IP limit in this service unbounded, including the six-digit guess
+	// surface at /v1/totp/verify. This compose file publishes api as 8080:8080
+	// and no service carries traefik labels, so that header arrived untouched.
+	//
+	// middleware.RealIP(trustedProxies) does nothing unless the peer is one of
+	// TRUSTED_PROXY_CIDRS, and then walks XFF right-to-left. Empty set = headers
+	// ignored, which fails closed: clients behind an unconfigured proxy share a
+	// bucket instead of each getting a private unlimited one.
+	trustedProxies, badProxyEntries := middleware.ParseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	middleware.LogTrustedProxies(trustedProxies, badProxyEntries, os.Getenv("APP_ENV"))
+
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	r.Use(middleware.RealIP(trustedProxies))
 	r.Use(middleware.SentryRecoverer) // must run BEFORE Recoverer to capture panics
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(30 * time.Second))
