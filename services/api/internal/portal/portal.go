@@ -2,7 +2,17 @@ package portal
 
 // Client portal (doc 07 §5) — a firm's client logs in READ-ONLY to see their own
 // book's audit_reports and audit_findings. Never extracted_entities or raw
-// documents, no mutations. Scoped by explicit book id (not RLS session vars).
+// documents, no mutations.
+//
+// Scoping is now BELT AND BRACES: every handler still filters by explicit book
+// id in SQL, and the connection those queries run on is primed with
+// app.current_firm / app.assigned_books so the 30 RLS policies apply as well.
+// Previously only the first of those was true — RequirePortal stashed an
+// UNPRIMED pooled connection, which was survivable only because the API
+// connected as the table owner and policies were never consulted. The moment the
+// app moved to the non-owner auditor_app role, every portal query on an
+// RLS-enabled table would have raised on the unset GUC: a total portal outage,
+// with no test covering it.
 
 import (
 	"context"
@@ -15,17 +25,24 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 )
 
 type Service struct {
-	db     *pgxpool.Pool
+	// db is the RLS-ENFORCED pool (auditor_app). Everything after login runs here.
+	db *pgxpool.Pool
+	// sysDB is the BYPASSRLS pool (auditor_sys), needed for exactly two things:
+	// the pre-auth login lookup (the caller has no firm scope yet — that is what
+	// login determines) and resolving book -> firm so the GUCs can be set.
+	sysDB   *pgxpool.Pool
 	authSvc *auth.Service
 }
 
 func NewService() *Service { return &Service{} }
 
-func (s *Service) SetDB(db *pgxpool.Pool)     { s.db = db }
-func (s *Service) SetAuth(a *auth.Service)    { s.authSvc = a }
+func (s *Service) SetDB(db *pgxpool.Pool)    { s.db = db }
+func (s *Service) SetSysDB(db *pgxpool.Pool) { s.sysDB = db }
+func (s *Service) SetAuth(a *auth.Service)   { s.authSvc = a }
 
 type ctxKey string
 
@@ -60,7 +77,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var id, bookID string
 	var storedToken *string
 	var expires *time.Time
-	err := s.db.QueryRow(r.Context(),
+	err := s.sysDB.QueryRow(r.Context(),
 		`SELECT id::text, client_book_id::text, invite_token, invite_expires
 		 FROM client_portal_users WHERE email = $1`, req.Email).
 		Scan(&id, &bookID, &storedToken, &expires)
@@ -98,8 +115,8 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RequirePortal validates a portal JWT, requires role=portal_user, and stores the
-// scoped book id + a pooled conn (no RLS session vars — handlers filter by book id).
+// RequirePortal validates a portal JWT, requires role=portal_user, and puts the
+// scoped book id plus an RLS-PRIMED connection in the request context.
 func (s *Service) RequirePortal(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -125,29 +142,54 @@ func (s *Service) RequirePortal(next http.Handler) http.Handler {
 			return
 		}
 
-		conn, err := s.db.Acquire(r.Context())
+		// The portal token carries a BOOK id, but app.current_firm needs a FIRM id,
+		// so resolve one from the other. This lookup has to run on sysDB: it is the
+		// step that establishes the tenant scope, so it cannot itself be scoped.
+		// It is a single indexed primary-key read.
+		var firmID string
+		if err := s.sysDB.QueryRow(r.Context(),
+			"SELECT firm_id::text FROM client_books WHERE id = $1",
+			claims.PortalBookID).Scan(&firmID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Book deleted since the token was issued. 403, not 404 — do not
+				// confirm or deny the existence of an id to an unscoped caller.
+				writeProblem(w, http.StatusForbidden, "https://ai-auditor.dev/errors/forbidden",
+					"book scope no longer valid")
+				return
+			}
+			slog.Error("portal firm lookup failed", "error", err)
+			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal",
+				"internal error")
+			return
+		}
+
+		// assigned_books is the portal user's ONE book. Any policy that consults
+		// app.assigned_books therefore restricts this session to it, on top of the
+		// explicit WHERE client_book_id = $1 each handler still applies.
+		conn, ctx, err := middleware.AcquireScoped(r.Context(), s.db, firmID,
+			[]string{claims.PortalBookID})
 		if err != nil {
+			slog.Error("portal scoped conn failed", "error", err)
 			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal",
 				"no db conn")
 			return
 		}
-		defer conn.Release()
+		// ReleaseRLSConn, not conn.Release(): the GUCs must be scrubbed before this
+		// connection can serve another tenant, and the scrub has to survive a
+		// cancelled request context.
+		defer middleware.ReleaseRLSConn(r.Context(), conn)
 
-		ctx := context.WithValue(r.Context(), portalBookKey, claims.PortalBookID)
-		ctx = context.WithValue(ctx, connKey, conn)
+		ctx = context.WithValue(ctx, portalBookKey, claims.PortalBookID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-type connKeyT string
-
-const connKey connKeyT = "portal_conn"
-
+// getConn returns the RLS-primed connection AcquireScoped put in the request
+// context. It delegates to middleware rather than keeping a private context key:
+// the old private key was the reason the portal's connection could be left
+// unprimed without anything noticing.
 func getConn(ctx context.Context) *pgxpool.Conn {
-	if c, ok := ctx.Value(connKey).(*pgxpool.Conn); ok {
-		return c
-	}
-	return nil
+	return middleware.GetConn(ctx)
 }
 
 // GetPortalBookID returns the portal user's scoped book id from context.

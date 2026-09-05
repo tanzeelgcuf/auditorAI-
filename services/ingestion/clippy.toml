@@ -1,0 +1,20 @@
+# Why this file exists (added 2026-09-04). Same defect as
+# services/verification/clippy.toml — found by sweeping for the class rather than
+# fixing the one crate where it was noticed first.
+#
+# src/main.rs:2 declares `#![deny(clippy::unwrap_used)]`, that deny reaches into
+# `#[cfg(test)]` modules, and CI runs
+#
+#     cargo clippy --all-targets -- -D warnings        (.github/workflows/ci.yml:131)
+#
+# `--all-targets` lints the test targets, and `allow-unwrap-in-tests` defaults to
+# false, so these 17 test-module `.unwrap()` calls are deny-level errors:
+#
+#     src/ocr/structured.rs   13  (cfg(test)@705)
+#     src/ocr/doctr.rs         3  (cfg(test)@391)
+#     src/grpc/mod.rs          1  (cfg(test)@222)
+#
+# PRODUCTION unwraps in this crate: 0, verified the same way. The deny still
+# covers every non-test line; only the test targets are exempted here.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

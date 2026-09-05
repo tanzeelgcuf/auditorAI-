@@ -7,7 +7,7 @@ import csv
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from uuid import UUID
 
 import pytest
@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from graph.schema import ExtractedEntity, BookConfig
 from graph.link import build_candidate_groups, score_and_route
+from harness_amount_mirror import parse_amount_cents
 
 BOOK_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 DOC_ID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -103,7 +104,13 @@ def parse_ofx(path: str) -> list:
         # cents); OFX debits carry a negative TRNAMT, so normalize to abs.
         cents = abs(_money_to_cents(amt.group(1)))
         out.append((
-            date.fromisoformat(posted.group(1)),
+            # OFX dates are ISO 8601 BASIC format (YYYYMMDD, here padded to
+            # YYYYMMDDHHMMSS). date.fromisoformat only learned to read the basic
+            # format in Python 3.11, so the previous call raised
+            # `ValueError: Invalid isoformat string: '20240115'` on 3.10 —
+            # invisible in CI (which pins 3.11 to match the Dockerfile) and a
+            # hard failure for anyone on an older local interpreter.
+            datetime.strptime(posted.group(1), "%Y%m%d").date(),
             cents,
             name.group(1) if name else "",
             memo.group(1) if memo else "",
@@ -112,19 +119,34 @@ def parse_ofx(path: str) -> list:
 
 
 def _money_to_cents(v: str) -> int:
-    """'1234.56' -> 123456; '-1234.56' -> -123456."""
-    v = v.strip().replace(",", "")
-    negative = v.startswith("-")
-    if negative:
-        v = v[1:]
-    if "." in v:
-        whole, frac = v.split(".", 1)
-        frac = (frac + "00")[:2]
-    else:
-        whole, frac = v, "00"
-    cents = int(whole) * 100 + int(frac)
-    if negative:
-        cents = -cents
+    """Fixture-column amount -> cents, via the ONE shared mirror of the Rust parser.
+
+    This used to be a fourth hand-rolled money parser. It disagreed with
+    services/ingestion in two ways that a harness must not paper over:
+    `(frac + "00")[:2]` silently TRUNCATED a third decimal (so "1.005" became
+    100 cents — a rounding decision, i.e. a calculation, made in Python), and
+    `.replace(",", "")` assumed US separators, so the European "1.500,00" became
+    150 cents instead of 150000.
+
+    Two deliberate, documented decisions live here rather than in the mirror:
+      - An EMPTY accounting column means "no amount posted on this side" and is
+        0. Real QuickBooks/Xero GL exports leave one of Debit/Credit blank;
+        `row.get("debit", "0")` only defaults when the KEY is absent, so a blank
+        cell used to reach int("") and raise. Blank -> 0 is an accounting fact,
+        not a guess about an unreadable value.
+      - Anything the mirror REFUSES raises here. A fixture value the production
+        parser could not read unambiguously must fail the test loudly; returning
+        0 would hand the link algorithm a $0.00 row that reconciles perfectly.
+    """
+    if v is None or not str(v).strip():
+        return 0
+    cents = parse_amount_cents(v)
+    if cents is None:
+        raise AssertionError(
+            f"fixture amount {v!r} is not an unambiguous amount to the same "
+            f"parser production uses (services/ingestion parse_amount); fix the "
+            f"fixture rather than guessing a value for it"
+        )
     return cents
 
 

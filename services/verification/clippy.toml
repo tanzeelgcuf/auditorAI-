@@ -1,0 +1,30 @@
+# Why this file exists (added 2026-09-04).
+#
+# src/main.rs:2 declares `#![deny(clippy::unwrap_used)]` at the crate root. Lint
+# levels propagate down the item tree, so that deny also applies inside
+# `#[cfg(test)] mod tests`. CI runs
+#
+#     cargo clippy --all-targets -- -D warnings        (.github/workflows/ci.yml:165)
+#
+# and `--all-targets` includes the test targets. `clippy::unwrap_used` does NOT
+# exempt test code by default (`allow-unwrap-in-tests` defaults to false), so the
+# 47 `.unwrap()` calls in this crate's test modules — 34 in
+# src/decimal_math/mod.rs (from cfg(test)@116) and 13 in src/grpc/mod.rs (from
+# cfg(test)@220) — are deny-level errors. The clippy step therefore fails before
+# `cargo test` is ever reached.
+#
+# Counted with: grep -c '\.unwrap(' on each file, then split on the first
+# `#[cfg(test)]` line. PRODUCTION unwraps in this crate: 0. That is the property
+# worth protecting, and this file does not weaken it — the deny still applies to
+# every non-test line, including all of src/zen and src/decimal_math's real code.
+#
+# The `#[allow(clippy::unwrap_used)]` at src/grpc/mod.rs:11 is NOT a substitute:
+# it covers only the `tonic::include_proto!` module (generated code), not the
+# test module 209 lines below it.
+allow-unwrap-in-tests = true
+
+# `expect_used` is not currently denied, so this is pre-emptive: src/zen/mod.rs's
+# tests use `.expect("...")` with explanatory messages throughout, and if the
+# crate root ever adds `#![deny(clippy::expect_used)]` those would break CI the
+# same way. An expectation message in a test is a feature, not a hazard.
+allow-expect-in-tests = true

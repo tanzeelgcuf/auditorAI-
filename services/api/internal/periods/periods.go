@@ -419,10 +419,16 @@ func (s *Service) HandleReopenPeriod(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusInternalServerError, errInternal, "update failed")
 		return
 	}
+	// Reopening a closed period is the single most audit-sensitive action in this
+	// product — it is the one that lets a already-signed-off number change — so it
+	// records the source address. Unlike RecordAccess and LogConfigChange this
+	// write escalates its error to a 500 rather than a log line, which is why it
+	// was never in the cancellable-write class: losing it fails the request, and a
+	// failed request is visible.
 	_, err = c.Exec(r.Context(),
-		`INSERT INTO period_reopen_log (reconciliation_period_id, reopened_by, reason)
-		 VALUES ($1, $2, $3)`,
-		periodID, userID, req.Reason)
+		`INSERT INTO period_reopen_log (reconciliation_period_id, reopened_by, reason, source_ip)
+		 VALUES ($1, $2, $3, NULLIF($4, '')::inet)`,
+		periodID, userID, req.Reason, middleware.GetSourceIP(r.Context()))
 	if err != nil {
 		slog.Error("failed to log reopen", "error", err)
 		writeProblem(w, http.StatusInternalServerError, errInternal, "insert failed")

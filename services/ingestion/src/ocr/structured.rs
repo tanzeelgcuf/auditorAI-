@@ -6,6 +6,8 @@ use calamine::{open_workbook_from_rs, DataType, Reader, Xlsx};
 use chrono::{Datelike, NaiveDate};
 use csv::ReaderBuilder;
 use regex::Regex;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -51,17 +53,175 @@ pub(crate) async fn download_from_s3(
 
 // ── Parse helpers ──
 
-pub fn parse_amount(s: &str) -> Option<i64> {
-    // Strip commas and currency symbols, keep digits . - +
-    let cleaned: String = s
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
-        .collect();
-    if cleaned.is_empty() || cleaned == "-" || cleaned == "+" || cleaned == "." {
+// ── Money parsing ──
+//
+// This is the ONLY place a source document's amount string becomes the integer
+// cents written to extracted_entities.amount_cents, which services/verification
+// then reconciles and reports on. The previous implementation was three lines and
+// had three silent defects:
+//
+//  1. `let v: f64 = cleaned.parse().ok()?; Some((v * 100.0).round() as i64)` put
+//     money through binary floating point — in a service whose sibling
+//     services/verification/src/decimal_math/mod.rs:3 states "NEVER use f32/f64
+//     for money. ONLY rust_decimal::Decimal." rust_decimal was already a declared
+//     dependency of THIS crate (Cargo.toml:20) and went entirely unused.
+//  2. The character filter kept only digits and `.`/`-`/`+` and discarded every
+//     other byte, so "(45.00)" — the accounting negative that QuickBooks, Xero and
+//     most GL exports emit for credits — parsed as +4500. A credit became a debit
+//     with no error. "1.500,00" (European) lost its comma and parsed as 150 cents
+//     instead of 150000, understating by 1000x. "45.00-" (trailing sign, common in
+//     SAP/mainframe exports) failed to parse entirely.
+//  3. All three call sites used `.unwrap_or(0)`, so anything unparseable became
+//     $0.00 and reconciled as a real number.
+//
+// Ambiguity is now REJECTED, never guessed: "1.500" is $1.50 under one convention
+// and $1,500 under another, and a single field carries no evidence for either, so
+// it returns None and the caller fails the document with the row number. A loud
+// failure an operator can fix beats a silent 1000x error in an audit report.
+const CURRENCY_SYMBOLS: &[char] = &[
+    '$', '€', '£', '¥', '₹', '¢', '₩', '₽', '₺', '₴', '₦', '₱', '₡', '₪', '¤', '﷼',
+];
+
+/// Detach the sign, returning (is_negative, unsigned_body).
+/// Handles accounting parentheses and both leading and trailing minus.
+fn split_sign(s: &str) -> (bool, String) {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        return (true, inner.trim().to_string());
+    }
+    if let Some(rest) = t.strip_prefix('-') {
+        return (true, rest.trim().to_string());
+    }
+    if let Some(rest) = t.strip_suffix('-') {
+        return (true, rest.trim().to_string());
+    }
+    (false, t.strip_prefix('+').unwrap_or(t).trim().to_string())
+}
+
+/// Keep digits and the two separator characters; silently drop currency symbols,
+/// whitespace (including the NBSP and the Swiss apostrophe used as thousands
+/// separators); reject anything else.
+///
+/// Letters are rejected on purpose. "45.00 CR" and "45.00 DR" carry the sign in a
+/// suffix, and quietly ignoring it would reintroduce exactly the credit-becomes-
+/// debit inversion this function exists to prevent.
+fn keep_numeric(body: &str) -> Option<String> {
+    let mut kept = String::with_capacity(body.len());
+    for c in body.chars() {
+        if c.is_ascii_digit() || c == '.' || c == ',' {
+            kept.push(c);
+        } else if c.is_whitespace() || c == '\u{00a0}' || c == '\'' || CURRENCY_SYMBOLS.contains(&c) {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    if kept.is_empty() { None } else { Some(kept) }
+}
+
+/// Every thousands group must be exactly 3 digits, and the leading group 1-3.
+fn valid_grouping(int_part: &str, sep: char) -> bool {
+    let groups: Vec<&str> = int_part.split(sep).collect();
+    if groups.len() < 2 {
+        return !int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit());
+    }
+    if groups[0].is_empty() || groups[0].len() > 3 {
+        return false;
+    }
+    groups.iter().enumerate().all(|(i, g)| {
+        g.chars().all(|c| c.is_ascii_digit()) && (i == 0 || g.len() == 3)
+    })
+}
+
+/// Normalize an unsigned amount to canonical `digits[.digits]`, or None when the
+/// separator convention cannot be determined. Pure string work — no arithmetic.
+fn normalize_decimal(body: &str) -> Option<String> {
+    let kept = keep_numeric(body)?;
+    let dots = kept.matches('.').count();
+    let commas = kept.matches(',').count();
+
+    // Which character is the decimal point, if any?
+    let dec: Option<char> = if dots > 0 && commas > 0 {
+        // Both present: the rightmost is the decimal point ("1.234,56" / "1,234.56").
+        if kept.rfind('.') > kept.rfind(',') { Some('.') } else { Some(',') }
+    } else if dots + commas == 0 {
+        None // bare integer dollars
+    } else {
+        let (sep, n) = if dots > 0 { ('.', dots) } else { (',', commas) };
+        if n > 1 {
+            None // repeated single separator can only be thousands grouping
+        } else {
+            let tail = kept.rsplit(sep).next().unwrap_or("");
+            match tail.len() {
+                // 1 or 2 trailing digits: a decimal point. Nobody groups thousands
+                // into 1 or 2 digits.
+                1 | 2 => Some(sep),
+                // Exactly 3: indistinguishable from a thousands separator.
+                // Treated as grouping ONLY for the separator that cannot be a
+                // decimal mark in the same string — which, with one separator and
+                // no other evidence, is neither. Reject.
+                3 => return None,
+                _ => return None,
+            }
+        }
+    };
+
+    let (int_raw, frac) = match dec {
+        Some(d) => {
+            let idx = kept.rfind(d)?;
+            (&kept[..idx], &kept[idx + 1..])
+        }
+        None => (kept.as_str(), ""),
+    };
+
+    // Whatever is not the decimal separator must be valid thousands grouping.
+    // An EMPTY integer part is legitimate when a decimal separator is present
+    // (".99" = 99 cents, a form some exports do emit), so grouping is only checked
+    // when there are integer digits to check — validating "" as a group rejected
+    // ".99" outright until a test caught it.
+    let thou = match dec {
+        Some('.') => ',',
+        Some(',') => '.',
+        _ => if dots > 0 { '.' } else { ',' },
+    };
+    if !int_raw.is_empty() && !valid_grouping(int_raw, thou) {
         return None;
     }
-    let v: f64 = cleaned.parse().ok()?;
-    Some((v * 100.0).round() as i64)
+    let int_part: String = int_raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if int_part.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // More than 2 decimal places cannot be represented in cents, and choosing a
+    // rounding for the operator is a financial calculation this service must not make.
+    if frac.len() > 2 {
+        return None;
+    }
+    let int_part = if int_part.is_empty() { "0".to_string() } else { int_part };
+    Some(if frac.is_empty() {
+        int_part
+    } else {
+        format!("{int_part}.{:0<2}", frac) // pad "5" -> "50"
+    })
+}
+
+/// Parse a source-document amount string to exact integer cents.
+/// Returns None for anything unparseable or ambiguous — callers must NOT default
+/// it to zero.
+pub fn parse_amount(s: &str) -> Option<i64> {
+    let (neg, body) = split_sign(s);
+    let canonical = normalize_decimal(&body)?;
+    // rust_decimal, not f64: exact base-10, so scale-2 values survive the x100.
+    let d = Decimal::from_str_exact(&canonical).ok()?;
+    if d.scale() > 2 {
+        return None;
+    }
+    // Exact: d has at most 2 decimal places, so d*100 has a zero fractional part
+    // and trunc() discards nothing.
+    let cents = (d * Decimal::from(100)).trunc().to_i64()?;
+    Some(if neg { -cents } else { cents })
 }
 
 // Strip commas from numeric strings before parsing amounts
@@ -176,7 +336,7 @@ impl OcrBackend for CsvParser {
         let entity_type = classify_entity_type(&request.doc_type);
         let mut entities = Vec::new();
 
-        for result in reader.records() {
+        for (row_idx, result) in reader.records().enumerate() {
             let record = result.map_err(|e| OcrError::ParsingError(format!("csv row: {e}")))?;
             let mut row_data = HashMap::new();
             for (i, h) in headers.iter().enumerate() {
@@ -191,7 +351,18 @@ impl OcrBackend for CsvParser {
             // points amount at one of them. If the mapped amount is empty but the
             // OTHER side exists in the raw row, fall back to it (doc 08 §1).
             let raw_amount = resolve_amount(&mapped, &row_data);
-            let amount_cents = parse_amount(&raw_amount).unwrap_or(0);
+            // Fail the document, do NOT default to 0. This loop already aborts on a
+            // malformed row, so an amount the parser cannot read unambiguously is
+            // reported the same way — with the row number, so the operator can see
+            // which cell to fix. `unwrap_or(0)` silently reconciled the book against
+            // an amount that was never in it.
+            let amount_cents = parse_amount(&raw_amount).ok_or_else(|| {
+                OcrError::ParsingError(format!(
+                    "row {}: cannot parse amount {raw_amount:?} unambiguously; \
+                     expected forms like 1234.56, 1,234.56, (45.00) or -45.00",
+                    row_idx + 2 // +1 for 0-index, +1 for the header row
+                ))
+            })?;
             let tx_date = mapped.get("date").and_then(|d| parse_date(d));
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
@@ -313,7 +484,9 @@ impl OcrBackend for XlsxParser {
         let entity_type = classify_entity_type(&request.doc_type);
         let mut entities = Vec::new();
 
-        for row in rows {
+        // enumerate() after rows.next() consumed the header, so row_idx 0 is the
+        // second spreadsheet row — the same offset the CSV path uses.
+        for (row_idx, row) in rows.enumerate() {
             let mut row_data = HashMap::new();
             for (i, cell) in row.iter().enumerate() {
                 if i < headers.len() {
@@ -327,7 +500,18 @@ impl OcrBackend for XlsxParser {
             // points amount at one of them. If the mapped amount is empty but the
             // OTHER side exists in the raw row, fall back to it (doc 08 §1).
             let raw_amount = resolve_amount(&mapped, &row_data);
-            let amount_cents = parse_amount(&raw_amount).unwrap_or(0);
+            // Fail the document, do NOT default to 0. This loop already aborts on a
+            // malformed row, so an amount the parser cannot read unambiguously is
+            // reported the same way — with the row number, so the operator can see
+            // which cell to fix. `unwrap_or(0)` silently reconciled the book against
+            // an amount that was never in it.
+            let amount_cents = parse_amount(&raw_amount).ok_or_else(|| {
+                OcrError::ParsingError(format!(
+                    "row {}: cannot parse amount {raw_amount:?} unambiguously; \
+                     expected forms like 1234.56, 1,234.56, (45.00) or -45.00",
+                    row_idx + 2 // +1 for 0-index, +1 for the header row
+                ))
+            })?;
             let tx_date = mapped.get("date").and_then(|d| parse_date(d));
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
@@ -437,8 +621,22 @@ impl OcrBackend for OfxParser {
                 }
             }
 
-            let raw_amount = fields.get("TRNAMT").map(|s| s.as_str()).unwrap_or("0");
-            let amount_cents = parse_amount(raw_amount).unwrap_or(0);
+            // TRNAMT is mandatory in OFX 1.x/2.x <STMTTRN>. Defaulting a missing or
+            // unreadable amount to "0" produced a $0.00 bank transaction that
+            // reconciliation then treated as real; the FITID identifies the offending
+            // transaction to the operator.
+            let raw_amount = fields.get("TRNAMT").map(|s| s.as_str()).ok_or_else(|| {
+                OcrError::ParsingError(format!(
+                    "STMTTRN {}: missing <TRNAMT>",
+                    fields.get("FITID").map(|s| s.as_str()).unwrap_or("<no FITID>")
+                ))
+            })?;
+            let amount_cents = parse_amount(raw_amount).ok_or_else(|| {
+                OcrError::ParsingError(format!(
+                    "STMTTRN {}: cannot parse <TRNAMT> {raw_amount:?} unambiguously",
+                    fields.get("FITID").map(|s| s.as_str()).unwrap_or("<no FITID>")
+                ))
+            })?;
             let raw_date = fields.get("DTPOSTED").or(fields.get("DTUSER"));
             let tx_date = raw_date.and_then(|d| parse_date(d));
 
@@ -508,26 +706,102 @@ pub fn create_structured_entity(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_amount_usd() {
-        assert_eq!(parse_amount("150.00"), Some(15000));
-        assert_eq!(parse_amount("2500.00"), Some(250000));
-    }
+    // The four original tests covered "150.00", "-150.00", "100", "$1,500.00" and
+    // "€89.99" — all happy path, all single-convention. Every defect fixed in
+    // parse_amount survived precisely because nothing here exercised an accounting
+    // negative, a European separator or a trailing sign. Their assertions are kept
+    // verbatim below, in the same table as the regressions.
+    const AMOUNT_CASES: &[(&str, Option<i64>, &str)] = &[
+        // original assertions, unchanged
+        ("150.00", Some(15000), "usd"),
+        ("2500.00", Some(250000), "usd"),
+        ("-150.00", Some(-15000), "leading minus"),
+        ("100", Some(10000), "bare integer is whole dollars"),
+        ("$1,500.00", Some(150000), "symbol + thousands"),
+        ("€89.99", Some(8999), "non-ascii symbol"),
+        ("471.25", Some(47125), "map_columns fixture below depends on this"),
+        // regressions: each of these was silently WRONG before
+        ("(45.00)", Some(-4500), "was +4500 — accounting credit read as a debit"),
+        ("(1,234.56)", Some(-123456), "parens with thousands"),
+        ("1.500,00", Some(150000), "was 150 — European, understated 1000x"),
+        ("45.00-", Some(-4500), "was None then 0 — trailing sign, SAP/mainframe"),
+        ("1 234,56", Some(123456), "space thousands, comma decimal"),
+        ("1'234.56", Some(123456), "Swiss apostrophe thousands"),
+        ("1.234.567,89", Some(123456789), "European multi-group"),
+        ("1,234,567.89", Some(123456789), "US multi-group"),
+        (".99", Some(99), "no integer part"),
+        ("45.5", Some(4550), "one decimal digit pads to 50"),
+        ("0.01", Some(1), "one cent"),
+        ("0.00", Some(0), "explicit zero is legitimate"),
+        ("8.65", Some(865), "typical two-dp value, exact here by construction"),
+        // f64 evidence, measured not assumed: 1.15_f64 * 100.0 is
+        // 114.99999999999999, and 1.005_f64 * 100.0 is 100.49999999999999.
+        // The old code's .round() hid the first (114.99… -> 115) and silently
+        // decided the second (100.49… -> 100, when the written value is nearer
+        // 101). Rounding money is itself a calculation, so the exact path takes
+        // 1.15 and REJECTS 1.005 rather than choosing for the firm.
+        ("1.15", Some(115), "1.15_f64 * 100.0 = 114.99999999999999"),
+        ("999999999999.99", Some(99999999999999), "large, still in i64"),
+        // The four pilot invoice totals (services/ingestion/test_fixtures, used
+        // by the agent-runtime eval). They are pinned HERE because this is where
+        // the conversion happens: deleting agent-runtime's
+        // graph/extract.py::_parse_amount_cents removed the only test that had
+        // ever asserted them, and a value nothing asserts is a value that drifts.
+        ("$342.50", Some(34250), "pilot INV-1001 total"),
+        ("$128.75", Some(12875), "pilot INV-1002 total"),
+        ("$899.00", Some(89900), "pilot BCH-2291 total"),
+        ("$215.00", Some(21500), "pilot MP-5502 total"),
+        ("97401", Some(9740100), "bare integer in a CSV amount column is dollars"),
+        // ambiguity and garbage: None, so the caller fails the document
+        ("1.500", None, "$1.50 or EUR 1,500 — unknowable from one field"),
+        ("1,500", None, "$1,500 or EUR 1,50 — unknowable from one field"),
+        ("1234.567", None, "3dp is not cents; picking a rounding is calculation"),
+        ("1.005", None, "the classic f64 rounding trap, rejected outright"),
+        ("45.00 CR", None, "letters may carry the sign; never ignore them"),
+        ("45.00%", None, "a percentage is not an amount — reject, don't strip"),
+        ("4/5", None, "a fraction or a date fragment, not an amount"),
+        ("12,34,567.89", None, "Indian lakh grouping unsupported — reject"),
+        ("", None, "empty"),
+        ("-", None, "sign only"),
+        (".", None, "separator only"),
+        ("$", None, "symbol only"),
+        ("abc", None, "not a number"),
+        ("1-2", None, "not a number"),
+    ];
 
     #[test]
-    fn test_parse_amount_negative() {
-        assert_eq!(parse_amount("-150.00"), Some(-15000));
+    fn test_parse_amount_table() {
+        for (input, expect, why) in AMOUNT_CASES {
+            assert_eq!(
+                parse_amount(input), *expect,
+                "parse_amount({input:?}) — {why}"
+            );
+        }
     }
 
+    /// Pins exactness across every cent in 0.00–9.99 so a future edit cannot
+    /// reintroduce a float hop unnoticed.
+    ///
+    /// Scope, stated honestly: this is a GUARD, not a reproduction of the old
+    /// bug. The previous implementation ended in `(v * 100.0).round()`, and
+    /// `.round()` absorbs the f64 epsilon, so the old code also returned all
+    /// 1000 of these correctly (measured, not assumed). What the old code got
+    /// wrong were the separator, sign and fail-open cases in AMOUNT_CASES
+    /// above — those are the regressions. The float itself was a latent
+    /// hazard rather than an active miscalculation in this range: it becomes
+    /// active the moment anyone truncates instead of rounds, widens the range,
+    /// or accepts a third decimal place.
     #[test]
-    fn test_parse_amount_no_decimal() {
-        assert_eq!(parse_amount("100"), Some(10000));
-    }
-
-    #[test]
-    fn test_parse_amount_with_currency() {
-        assert_eq!(parse_amount("$1,500.00"), Some(150000));
-        assert_eq!(parse_amount("€89.99"), Some(8999));
+    fn test_parse_amount_is_exact_across_all_cents() {
+        for dollars in 0..10i64 {
+            for cents in 0..100i64 {
+                let s = format!("{dollars}.{cents:02}");
+                assert_eq!(
+                    parse_amount(&s), Some(dollars * 100 + cents),
+                    "inexact conversion for {s}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,59 @@
+# golangci-lint configuration for services/api.
+#
+# WHY THIS FILE EXISTS (added 2026-09-04)
+#
+# There was no golangci-lint config anywhere in the repo, and .github/workflows/ci.yml
+# runs the Lint step with `working-directory: services/api`. With no config,
+# golangci-lint uses its defaults — and under v2 the default exclusion presets are
+# NOT applied unless you opt in (v1 applied them automatically). errcheck is a
+# default linter in both majors.
+#
+# This tree has 24 unchecked `json.NewEncoder(w).Encode(...)` calls across 14 files
+# (the writeJSON/writeProblem helper that each package defines for itself). Under v1
+# defaults those were excluded only by accident of the old EXC0001 pattern list; under
+# v2 defaults they are reported, and the Lint step fails before any of the real
+# findings in this service are reachable.
+#
+# This is the same shape of bug as services/{verification,ingestion}/clippy.toml,
+# found in the same session: the code obeys the intended rule, and the lint
+# invocation was configured so that it could never say so.
+#
+# NOT VERIFIED IN THIS ENVIRONMENT. golangci-lint is not installed on the VM this was
+# written in and the module proxy is unreachable, so this config has not been run.
+# The claim it rests on — errcheck is on by default and reports (*json.Encoder).Encode
+# — is read off the tree and the v2 migration guide, not observed. Treat the first CI
+# run as the test.
+version: "2"
+
+run:
+  # Test files are linted. Left explicit because it is load-bearing: internal/billing
+  # and internal/middleware carry tests that construct handlers directly, and a lint
+  # pass that skipped them would not see the code paths those tests exercise.
+  tests: true
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused. Deliberately not `all`:
+  # turning on every linter at once on an existing tree produces a wall of style
+  # findings that buries the correctness ones, which is how a lint job gets muted.
+  default: standard
+
+  exclusions:
+    presets:
+      # Restores the v1 default error-handling exclusions (deferred Close, Flush,
+      # print family, os.Setenv). Without this, `defer r.Body.Close()` and friends
+      # are reported throughout.
+      - std-error-handling
+
+  settings:
+    errcheck:
+      exclude-functions:
+        # Writing the response body is the last thing every handler does. If the
+        # client has already gone away, the status line and headers are on the wire
+        # and there is no second response to send — the only honest options are
+        # "ignore" or "log at debug", and 24 call sites of the latter would not
+        # change any outcome.
+        #
+        # This exclusion is narrow on purpose: it covers ONLY the response encoder.
+        # json.Unmarshal / json.Decoder.Decode errors stay checked, because those
+        # decide whether the request is valid.
+        - (*encoding/json.Encoder).Encode

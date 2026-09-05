@@ -79,7 +79,9 @@ export default function LoginPage() {
                 </MotionDiv>
                 <MotionDiv variant="slideUp">
                   <div className="space-y-1">
-                    <label className="text-sm font-medium text-foreground">2FA code (optional)</label>
+                    <label className="text-sm font-medium text-foreground">
+                      2FA code <span className="text-muted-foreground">(required if enabled)</span>
+                    </label>
                     <div className="relative">
                       <User className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" aria-hidden="true" />
                       <Input

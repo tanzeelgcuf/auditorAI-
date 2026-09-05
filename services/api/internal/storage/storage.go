@@ -8,6 +8,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,6 +18,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type Client struct {
@@ -69,15 +71,31 @@ func (c *Client) PresignUpload(ctx context.Context, key string, ttl time.Duratio
 }
 
 // ObjectExists HEADs an object to confirm bytes actually landed.
+//
+// A GENUINE absence returns (false, nil). Anything else — connection refused,
+// DNS failure, expired or wrong credentials, missing bucket — returns an error,
+// because the two cases need different answers to the client and the previous
+// version could not tell them apart: it returned `false, nil` for every error,
+// so HandleConfirmUpload told a user whose upload had succeeded that their
+// "upload did not complete" (400) whenever MinIO was unreachable. That sends the
+// firm to debug their own network while the actual fault is server-side.
 func (c *Client) ObjectExists(ctx context.Context, key string) (bool, error) {
 	_, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
-	if err != nil {
-		return false, nil // treat as absent; S3 errors here are 404/403
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	// HeadObject reports absence as types.NotFound; GetObject-style callers see
+	// NoSuchKey. Both are matched so the semantics do not depend on which the
+	// S3-compatible implementation chooses to send (MinIO and AWS differ).
+	var notFound *s3types.NotFound
+	var noSuchKey *s3types.NoSuchKey
+	if errors.As(err, &notFound) || errors.As(err, &noSuchKey) {
+		return false, nil
+	}
+	return false, fmt.Errorf("head %s: %w", key, err)
 }
 
 // StreamObject downloads an object's bytes (used by ingestion).
@@ -97,7 +115,11 @@ func (c *Client) StreamObject(ctx context.Context, key string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// PutObject writes bytes (used by tests / seed-demo).
+// PutObject writes bytes. This is the production path for the direct multipart
+// upload handler (internal/documents.HandleUpload), not just tests/seed-demo:
+// the presigned flow has the client PUT straight to storage, but the multipart
+// flow reads the bytes into the API process and they must be written here or the
+// source_documents row points at an object that does not exist.
 func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
 	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),

@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -11,23 +12,48 @@ import (
 // clientBookID may be empty for actions that are not book-scoped.
 // resourceID may be empty when the action is not about a single resource.
 //
-// The write goes through the RLS-wired request connection when available so
-// the tenant GUCs (app.current_firm / app.assigned_books) are set; access_log
-// RLS allows inserting when client_book_id is NULL or in assigned_books.
+// The write goes through the RLS-wired request connection when available so the
+// tenant GUCs (app.current_firm / app.assigned_books) are set; access_log RLS
+// allows inserting when client_book_id is NULL or in assigned_books.
+//
+// CANCELLATION IS STRIPPED FIRST. Every one of the 12 call sites passes
+// `r.Context()`, which is cancelled the moment the client's socket closes — so
+// before 2026-09-04 a caller could drop their own audit row by hanging up
+// immediately after the request, and the action itself would still stand because
+// it had already committed. For a product whose value proposition is traceability
+// that is the wrong way round. context.WithoutCancel keeps the ctx VALUES, which
+// is what DB(ctx, db) needs to find the RLS-wired request connection, and drops
+// only the cancellation; the bounded deadline replaces the one it dropped. The
+// call is still synchronous, so the request connection is alive throughout. Same
+// bug class as auth.persistLoginFailure — a write whose loss is fail-open must
+// not be cancellable by the party it is recording.
+//
+// KNOWN GAP, deliberately left as-is for now: when there is no request
+// connection the fallback pool has no GUC, so the INSERT raises and this
+// function degrades to a slog.Warn — an audit row is dropped without failing the
+// request. For a product whose value proposition is traceability that is the
+// wrong trade, but changing it means deciding what a request should do when its
+// audit write fails, which is a product decision, not a wiring fix. Tracked
+// rather than silently "fixed" here.
+//
+// source_ip is read from the context, not from an added parameter. All 12 call
+// sites already pass r.Context() so this costs them nothing, but the real reason
+// is that a parameter would have meant 12 independent resolutions of "which IP is
+// this?" — the exact shape of the X-Forwarded-For bypass fixed in clientip.go the
+// same week. One resolution (middleware.SourceIP), one reader, so the audit trail
+// cannot disagree with the rate limiter about who called.
 func RecordAccess(ctx context.Context, db *pgxpool.Pool, userID, clientBookID, action, resourceID string) {
-	conn := GetConn(ctx)
-	var err error
-	if conn != nil {
-		_, err = conn.Exec(ctx,
-			`INSERT INTO access_log (user_id, client_book_id, action, resource_id)
-			 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid)`,
-			userID, clientBookID, action, resourceID)
-	} else {
-		_, err = db.Exec(ctx,
-			`INSERT INTO access_log (user_id, client_book_id, action, resource_id)
-			 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid)`,
-			userID, clientBookID, action, resourceID)
-	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	// "" when the request never passed through middleware.SourceIP; NULLIF turns
+	// that into SQL NULL rather than a row asserting the call came from nowhere.
+	sourceIP := GetSourceIP(ctx)
+
+	_, err := DB(ctx, db).Exec(ctx,
+		`INSERT INTO access_log (user_id, client_book_id, action, resource_id, source_ip)
+		 VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::inet)`,
+		userID, clientBookID, action, resourceID, sourceIP)
 	if err != nil {
 		// Audit logging must never break the request path — degrade to a log line.
 		slog.Warn("failed to record access log", "action", action, "resource_id", resourceID, "error", err)

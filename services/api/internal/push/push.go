@@ -88,6 +88,13 @@ func (s *Service) HandleRegisterDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // SendFindingAlert pages high-severity findings to the firm's registered devices.
+//
+// DEAD CODE as of this commit — grep finds no caller. When it is wired up (the
+// natural producer is pipeline/verify_worker after it writes audit_findings) it
+// must be given the BYPASSRLS sys pool, not s.db: the caller is a background
+// goroutine with no app.current_firm set, so device_tokens' policy predicate
+// would raise. Do not "fix" that by falling back to the request connection —
+// there isn't one.
 func (s *Service) SendFindingAlert(ctx context.Context, firmID, findingID, severity, bookID, summary string) error {
 	if !severityShouldNotify(severity) {
 		return nil // only high severity pages a human

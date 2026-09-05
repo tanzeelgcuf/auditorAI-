@@ -25,7 +25,14 @@ import (
 // resolves the client_book_id -> firm from the JSON body and sets the firm_admin
 // context needed by RLSInjector. On mismatch it 401s (does not fall through to
 // the user Authenticator).
-func InternalAuth(db *pgxpool.Pool) func(http.Handler) http.Handler {
+//
+// TWO pools, for the same reason main.go has two. The book->firm and
+// entity->book lookups are what DETERMINE the tenant scope, so they cannot run
+// scoped: on the RLS-enforced pool with no app.current_firm set, the policy
+// predicate current_setting('app.current_firm') raises and every MCP call 500s.
+// They run on sysDB (auditor_sys, BYPASSRLS). Everything the handler then does
+// runs on a db (auditor_app) connection primed with the resolved scope.
+func InternalAuth(db, sysDB *pgxpool.Pool) func(http.Handler) http.Handler {
 	expected := os.Getenv("API_INTERNAL_KEY")
 	if expected == "" {
 		slog.Warn("API_INTERNAL_KEY not set — internal MCP auth disabled")
@@ -68,7 +75,7 @@ func InternalAuth(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				for _, id := range append(append(body.InvoiceIDs, body.BankIDs...), body.GLIDs...) {
 					if id != "" {
 						var derived string
-						err := db.QueryRow(r.Context(),
+						err := sysDB.QueryRow(r.Context(),
 							`SELECT client_book_id::text FROM extracted_entities WHERE id = $1`, id).Scan(&derived)
 						if err == nil {
 							bookID = derived
@@ -83,7 +90,7 @@ func InternalAuth(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			}
 
 			var firmID string
-			err := db.QueryRow(r.Context(),
+			err := sysDB.QueryRow(r.Context(),
 				`SELECT b.id::text, b.firm_id::text FROM client_books b WHERE b.id = $1`,
 				bookID).Scan(&bookID, &firmID)
 			if err != nil {
@@ -96,31 +103,25 @@ func InternalAuth(db *pgxpool.Pool) func(http.Handler) http.Handler {
 			// the RLS GUCs on a dedicated conn, the book-isolation policy blocks
 			// everything (Prompt A: get_pending_entities returned empty despite
 			// rows in the DB).
-			conn, err := db.Acquire(r.Context())
+			conn, ctx, err := AcquireScoped(r.Context(), db, firmID, []string{bookID})
 			if err != nil {
+				slog.Error("internal auth scoped conn failed", "error", err)
 				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "failed to acquire db conn")
 				return
 			}
-			if _, err = conn.Exec(r.Context(), "SELECT set_config('app.current_firm', $1, false)", firmID); err != nil {
-				conn.Release()
-				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "failed to set firm context")
-				return
-			}
-			if _, err = conn.Exec(r.Context(), "SELECT set_config('app.assigned_books', $1, false)", bookID); err != nil {
-				conn.Release()
-				writeProblem(w, r, "https://ai-auditor.dev/errors/internal", "Internal Error", http.StatusInternalServerError, "failed to set book context")
-				return
-			}
+			// Deferred, and via ReleaseRLSConn. The previous inline
+			// `conn.Exec(r.Context(), "RESET ...")` + `conn.Release()` AFTER
+			// next.ServeHTTP had both failure modes RLSInjector had: a panicking
+			// handler leaked the connection for the process lifetime, and the RESET
+			// was a silent no-op whenever r.Context() was already cancelled, which
+			// left app.current_firm set on a connection returned to the pool.
+			defer ReleaseRLSConn(r.Context(), conn)
 
-			ctx := context.WithValue(r.Context(), FirmIDKey, firmID)
+			ctx = context.WithValue(ctx, FirmIDKey, firmID)
 			ctx = context.WithValue(ctx, UserIDKey, "internal:"+firmID)
 			ctx = context.WithValue(ctx, RoleKey, "firm_admin")
-			ctx = context.WithValue(ctx, AssignedBooksKey, []string{bookID})
-			ctx = context.WithValue(ctx, connKey, conn)
 			slog.Info("internal auth ok", "book", bookID, "firm", firmID)
 			next.ServeHTTP(w, r.WithContext(ctx))
-			_, _ = conn.Exec(r.Context(), "RESET app.current_firm, app.assigned_books")
-			conn.Release()
 		})
 	}
 }

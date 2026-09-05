@@ -33,12 +33,14 @@ async def process_batch(client, graph, mcp, batch_event: dict):
     # Fetch pending entities + book config via MCP. Scope to the batch's source
     # document — extraction is per-document, not per-book (a book may hold
     # hundreds of entities; a single LLM prompt must not span them all).
-    try:
-        pending = await mcp.get_pending_entities(client_book_id, batch_id=batch_id)
-        tolerance = await mcp.get_book_tolerance(client_book_id)
-    except Exception as e:
-        logger.error("mcp fetch failed", error=str(e))
-        return
+    #
+    # No try/except here on purpose. This used to catch, log "mcp fetch failed"
+    # and return — and because the caller acked unconditionally, an API restart or
+    # a transient MCP error meant the batch was never extracted and nothing said
+    # so. Letting it raise hands the decision to the consumer loop, which retries
+    # a bounded number of times before giving up loudly.
+    pending = await mcp.get_pending_entities(client_book_id, batch_id=batch_id)
+    tolerance = await mcp.get_book_tolerance(client_book_id)
 
     config = BookConfig(
         id=client_book_id,
@@ -71,12 +73,14 @@ async def process_batch(client, graph, mcp, batch_event: dict):
 
     # Persist cross-linked groups back to the API (Prompt 3: the pipeline
     # dead-ended after extraction — groups were produced but never written).
+    #
+    # Allowed to raise. Swallowing this was the worst of the three swallows in
+    # this file: the whole graph had already run, so the expensive work was done
+    # and its ONLY output was this write. Catching the failure meant paying for
+    # the extraction and discarding the result.
     if groups:
-        try:
-            written = await mcp.persist_groups(groups, client_book_id)
-            logger.info("groups persisted", client_book_id=client_book_id, written=written)
-        except Exception as e:
-            logger.error("group persistence failed", error=str(e))
+        written = await mcp.persist_groups(groups, client_book_id)
+        logger.info("groups persisted", client_book_id=client_book_id, written=written)
 
 
 async def process_link(client, graph, mcp, link_event: dict):
@@ -92,12 +96,13 @@ async def process_link(client, graph, mcp, link_event: dict):
         return
 
     logger.info("linking book", client_book_id=client_book_id)
-    try:
-        pending = await mcp.get_pending_entities(client_book_id)  # no batch — all unlinked
-        tolerance = await mcp.get_book_tolerance(client_book_id)
-    except Exception as e:
-        logger.error("link mcp fetch failed", error=str(e))
-        return
+    # Allowed to raise — see process_batch. This swallow was the worst of the
+    # three in this file for a different reason than the persistence one: the
+    # link pass is BOOK-WIDE, so one dropped link.requested does not leave a
+    # single document unlinked, it leaves the entire book's three-way
+    # reconciliation unrun with 'pending' entities and no finding anywhere.
+    pending = await mcp.get_pending_entities(client_book_id)  # no batch — all unlinked
+    tolerance = await mcp.get_book_tolerance(client_book_id)
 
     config = BookConfig(
         id=client_book_id,
@@ -116,11 +121,14 @@ async def process_link(client, graph, mcp, link_event: dict):
     # Convert to ExtractedEntity and run ONLY the deterministic link node.
     from graph.schema import ExtractedEntity
     from graph.link import cross_link
-    try:
-        entities = [ExtractedEntity(**e) for e in pending]
-    except Exception as ex:
-        logger.error("link: entity parse failed", error=str(ex))
-        return
+    # Also allowed to raise. A shape mismatch between extracted_entities and
+    # ExtractedEntity is deterministic — it will fail identically on every
+    # redelivery — so this burns the retry budget and then terms. That is still
+    # the right trade against the previous behaviour: a silent return acked the
+    # event, so a schema drift between the API's MCP payload and this model
+    # would have stopped every book from linking with one ERROR line per book
+    # and no other signal. Failing loudly after five attempts is louder.
+    entities = [ExtractedEntity(**e) for e in pending]
     state["entities"] = entities
     state["classified_entities"] = entities  # cross_link reads this key
     linked = cross_link(state, config)
@@ -133,11 +141,50 @@ async def process_link(client, graph, mcp, link_event: dict):
         errors=linked.get("errors", []),
     )
     if groups:
-        try:
-            written = await mcp.persist_groups(groups, client_book_id)
-            logger.info("link groups persisted", client_book_id=client_book_id, written=written)
-        except Exception as e:
-            logger.error("link persistence failed", error=str(e))
+        # Allowed to raise — see process_batch.
+        written = await mcp.persist_groups(groups, client_book_id)
+        logger.info("link groups persisted", client_book_id=client_book_id, written=written)
+
+
+# Bounds redelivery for both consumers below. Matches maxDeliveryAttempts in
+# services/api/internal/pipeline/coordinator.go so the two halves of the pipeline
+# give up after the same number of tries.
+MAX_DELIVERY_ATTEMPTS = 5
+
+
+def _delivery_count(msg) -> int:
+    """How many times JetStream has delivered this message (1 on first delivery).
+
+    Defensive on purpose. nats-py exposes this as msg.metadata.num_delivered, but
+    that attribute path could NOT be verified in the environment this was written
+    in — nats-py is not installed there and PyPI was unreachable — so a mismatch
+    must not take the consumer down. Falling back to 1 means a failing message is
+    naked rather than dropped, which is the safe direction: at worst it retries
+    more than intended, instead of losing the event the way the previous code did.
+    """
+    try:
+        return int(msg.metadata.num_delivered)
+    except Exception:  # noqa: BLE001 - any shape mismatch degrades, never raises
+        logger.warning("could not read delivery count; retry bound not enforced")
+        return 1
+
+
+async def _retry_or_drop(msg, attempt: int) -> None:
+    """Nak while attempts remain, otherwise stop redelivery.
+
+    term() tells the server never to redeliver, which is what "give up" means
+    here; ack() is the fallback if this nats-py build predates it, since both
+    remove the message and only the bookkeeping differs.
+    """
+    if attempt < MAX_DELIVERY_ATTEMPTS:
+        await msg.nak()
+        return
+    logger.error("event failed permanently, no further retries", attempt=attempt)
+    term = getattr(msg, "term", None)
+    if term is not None:
+        await term()
+    else:
+        await msg.ack()
 
 
 async def run_consumer():
@@ -172,11 +219,34 @@ async def run_consumer():
             async for msg in sub.messages:
                 try:
                     event = json.loads(msg.data.decode())
+                except Exception as e:
+                    # A malformed payload will never parse. Ack it — retrying is
+                    # pointless and a nak would loop forever.
+                    logger.error("undecodable event, dropping", error=str(e))
+                    sentry_sdk.capture_exception(e)
+                    await msg.ack()
+                    continue
+
+                try:
                     await handler(client, graph, mcp, event)
                 except Exception as e:
-                    logger.error("batch processing failed", error=str(e))
+                    # THIS USED TO BE `finally: await msg.ack()`, which acked on
+                    # every path including this one. The LLM ran, the graph
+                    # produced groups, the MCP write failed — and the event was
+                    # acknowledged, so the work was lost permanently with nothing
+                    # to retry it. The document's entities simply never got linked
+                    # and no reconciliation ever referenced them. Same bug class as
+                    # the two Go consumers in services/api/internal/pipeline.
+                    attempt = _delivery_count(msg)
+                    logger.error(
+                        "batch processing failed",
+                        error=str(e),
+                        attempt=attempt,
+                        max_attempts=MAX_DELIVERY_ATTEMPTS,
+                    )
                     sentry_sdk.capture_exception(e)  # GlitchTip (no-op when DSN unset)
-                finally:
+                    await _retry_or_drop(msg, attempt)
+                else:
                     await msg.ack()
         finally:
             await nc.drain()

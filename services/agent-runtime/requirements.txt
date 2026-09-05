@@ -1,6 +1,15 @@
 # services/agent-runtime/requirements.txt
 langgraph==0.1.0
 anthropic>=0.30.0
+# REQUIRED AT STARTUP, and it was missing. main.py:163 imports ollama_adapter,
+# whose line 15 is `from openai import OpenAI` — the container connected to NATS
+# and then died with ModuleNotFoundError. The tests never caught it because none
+# of them import ollama_adapter.
+openai>=1.30.0
+# run_extraction.py:95 and run_3leg.py:49 `import psycopg2`. The -binary wheel is
+# used deliberately: plain psycopg2 compiles against libpq and would need
+# libpq-dev + a C toolchain in the python:3.11-slim image.
+psycopg2-binary>=2.9.9
 sentry-sdk>=2.0.0
 structlog>=24.1.0
 langfuse>=2.30.0

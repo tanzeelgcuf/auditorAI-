@@ -18,10 +18,17 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
 )
 
 type Service struct {
 	db *pgxpool.Pool
+	// storage verifies that an attachment's storage_key points at an object that
+	// actually exists. Attachment bytes are PUT directly to storage by the client
+	// via the presigned flow, so the API never holds them — existence
+	// verification, not writing, is what this service needs it for. May be nil
+	// when storage.New() failed at startup; HandleAddAttachment answers 503.
+	storage *storage.Client
 	// Notifier delivers report.generated webhook events (doc 07 §7). Injected by
 	// main.go to avoid an import cycle (webhooks imports nothing from findings).
 	Notifier ReportNotifier
@@ -35,6 +42,8 @@ type ReportNotifier interface {
 func NewService() *Service { return &Service{} }
 
 func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
+
+func (s *Service) SetStorage(st *storage.Client) { s.storage = st }
 
 // ---- helpers ----
 
@@ -242,11 +251,80 @@ func (s *Service) HandleAddAttachment(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
 		return
 	}
-	_, err := c.Exec(r.Context(),
+
+	// storage_key ARRIVES FROM THE CLIENT AND MUST NOT BE TRUSTED VERBATIM.
+	//
+	// RLS on finding_attachments constrains audit_finding_id (the policy is
+	// FOR ALL with only a USING clause, and Postgres reuses USING as WITH CHECK
+	// when the latter is omitted, so the INSERT is checked — a caller cannot
+	// attach to another firm's finding). It says NOTHING about storage_key: that
+	// column is a free TEXT field pointing into a shared bucket.
+	//
+	// Without this check, a caller legitimately assigned to book A could post
+	// storage_key "documents/<book-B-uuid>/<uuid>-payroll.pdf" and record another
+	// firm's document as evidence on their own finding — RLS-legal, and invisible
+	// to every row-level test. Object keys are namespaced by book
+	// (documents/<bookId>/... — see documents.go storageKey), so the server can
+	// and must verify the namespace itself rather than accepting the client's.
+	//
+	// The finding's book is read through the RLS-scoped connection, so a finding
+	// outside the caller's assignment returns no rows -> 404, with no existence
+	// leak.
+	var bookID string
+	if err := c.QueryRow(r.Context(),
+		`SELECT client_book_id::text FROM audit_findings WHERE id = $1`,
+		findingID).Scan(&bookID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeProblem(w, http.StatusNotFound, "https://ai-auditor.dev/errors/not-found", "finding not found")
+			return
+		}
+		slog.Error("failed to resolve finding book", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "query failed")
+		return
+	}
+
+	// Exact-prefix match, plus an explicit traversal reject: the prefix alone
+	// would still admit "documents/<book>/../<other-book>/x.pdf", which resolves
+	// outside the namespace in any client that normalises the path.
+	wantPrefix := "documents/" + bookID + "/"
+	if !strings.HasPrefix(req.StorageKey, wantPrefix) ||
+		strings.Contains(req.StorageKey, "..") ||
+		strings.Contains(req.StorageKey, "\\") {
+		slog.Warn("rejected attachment with out-of-namespace storage key",
+			"finding_id", findingID, "book_id", bookID, "user_id", userID)
+		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/invalid-storage-key",
+			"storage_key must reference an object uploaded to this finding's client book")
+		return
+	}
+
+	// The key must also point at an object that EXISTS. Namespace validation
+	// above stops a caller naming another firm's object; this stops an attachment
+	// row that references nothing at all — the same orphan-key defect that
+	// documents.HandleUpload shipped, arriving by a different route. The API never
+	// holds these bytes (the client PUTs them directly via the presigned flow), so
+	// existence is verified rather than written.
+	if s.storage == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/not-configured",
+			"storage not configured")
+		return
+	}
+	exists, err := s.storage.ObjectExists(r.Context(), req.StorageKey)
+	if err != nil {
+		slog.Error("storage unreachable during attachment add", "error", err, "finding_id", findingID)
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/storage-unavailable",
+			"could not verify the attachment because storage is unreachable — retry shortly")
+		return
+	}
+	if !exists {
+		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/upload-incomplete",
+			"no object exists at that storage_key — upload the file before attaching it")
+		return
+	}
+
+	if _, err := c.Exec(r.Context(),
 		`INSERT INTO finding_attachments (audit_finding_id, uploaded_by, storage_key, filename)
 		 VALUES ($1, $2, $3, $4)`,
-		findingID, userID, req.StorageKey, req.Filename)
-	if err != nil {
+		findingID, userID, req.StorageKey, req.Filename); err != nil {
 		slog.Error("failed to add attachment", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "insert failed")
 		return

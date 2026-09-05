@@ -66,7 +66,10 @@ func main() {
 
 	if *dbURL == "" {
 		fmt.Fprintln(os.Stderr, "seed-demo: -db-url is required")
-		fmt.Fprintln(os.Stderr, "  example: go run ./cmd/seed-demo -db-url 'postgres://auditor:auditor@localhost:5432/ai_auditor?sslmode=disable'")
+		fmt.Fprintln(os.Stderr, "  Use the BYPASSRLS role (SYS_DATABASE_URL), not DATABASE_URL: this")
+		fmt.Fprintln(os.Stderr, "  tool creates the firm and books it then writes into, so there is no")
+		fmt.Fprintln(os.Stderr, "  app.current_firm it could set that would satisfy the policies.")
+		fmt.Fprintln(os.Stderr, "  example: go run ./cmd/seed-demo -db-url 'postgres://auditor_sys:$SYS_DB_PASSWORD@localhost:5432/ai_auditor?sslmode=disable'")
 		os.Exit(2)
 	}
 	if *books < 2 || *books > 3 {
@@ -88,6 +91,23 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "seed-demo: ping: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Fail fast on the wrong role. Without this the seeder connects happily and
+	// then every INSERT either violates a policy or, worse, succeeds while the
+	// SELECTs that verify it return nothing — a confusing half-seeded database.
+	var rlsActive bool
+	if err := pool.QueryRow(ctx,
+		`SELECT row_security_active('client_books'::regclass)`).Scan(&rlsActive); err != nil {
+		fmt.Fprintf(os.Stderr, "seed-demo: role check: %v\n", err)
+		fmt.Fprintln(os.Stderr, "  (is the schema loaded? client_books must exist)")
+		os.Exit(1)
+	}
+	if rlsActive {
+		fmt.Fprintln(os.Stderr, "seed-demo: refusing to run — row security is ACTIVE for this role.")
+		fmt.Fprintln(os.Stderr, "  You passed the RLS-enforced DSN (auditor_app / DATABASE_URL).")
+		fmt.Fprintln(os.Stderr, "  Pass SYS_DATABASE_URL (auditor_sys, BYPASSRLS) instead.")
+		os.Exit(2)
 	}
 
 	firmName := gofakeit.Company()
@@ -223,6 +243,29 @@ func seedBook(
 	})
 
 	// three documents (one per type) covering all planted rows
+	//
+	// NO BYTES ARE WRITTEN TO OBJECT STORAGE FOR THESE, DELIBERATELY, and the
+	// consequence is documented rather than papered over: opening a demo
+	// finding's source document in the UI will fail to resolve, because
+	// GET /v1/documents/{id}/view returns a storage_key for an object that does
+	// not exist.
+	//
+	// The alternative — writing small stub CSV/OFX files — was rejected as worse.
+	// These rows are the provenance target for thousands of procedurally planted
+	// entities, and a stub whose contents disagree with the amounts in the
+	// findings would make the product's central claim (every reported number
+	// traces back to its exact source document) demonstrably false during a
+	// demo. A clean "object not found" is an honest gap; a document showing
+	// different numbers than the finding it supports is a traceability lie.
+	//
+	// The keys use a "demo/" prefix, NOT the "documents/" prefix that
+	// documents.go mints for real uploads, so seeded rows are distinguishable
+	// from genuine ones by key alone, and content_hash carries a "sha256:demo:"
+	// sentinel rather than a real digest for the same reason.
+	//
+	// ocr_status is 'done' so these never enter the ingestion pipeline: seeding
+	// publishes no document.uploaded event, and a 'pending' row would make
+	// services/ingestion StreamObject a key that was never written.
 	docs := []struct {
 		docType string
 		storage string

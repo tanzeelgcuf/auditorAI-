@@ -300,14 +300,43 @@ func (s *Service) HandleMergeGroups(w http.ResponseWriter, r *http.Request) {
 // ---- §3 Config change audit ----
 
 // LogConfigChange records a settings mutation. Called by settings/tenant handlers.
+//
+// Cancellation is stripped for the same reason as middleware.RecordAccess and
+// auth.persistLoginFailure: the only call site passes `r.Context()`
+// (tenant.go:318), the error degrades to a slog.Warn, and `config_change_log` is
+// an audit table — so before 2026-09-04 the person changing a book's settings
+// could suppress the record of that change by closing the connection, and the
+// change itself would still stand. Whoever is being recorded must not hold the
+// cancel button. The bounded deadline replaces the one WithoutCancel drops.
+//
+// THE SECOND BUG, found 2026-09-05 while adding source_ip: this used `db.Exec`
+// on the raw application pool, NOT middleware.DB(ctx, db). `config_change_log`
+// has RLS ENABLE + FORCE RLS and its policy calls
+// current_setting('app.assigned_books') with no missing_ok, and this codebase
+// sets no database-level or role-level default for that GUC — so on an unprimed
+// pool connection the predicate raises on the unset parameter, and on a recycled
+// one that has been RESET it evaluates against '' and the INSERT violates the
+// policy. Either way the statement errors, the error degrades to slog.Warn, and
+// GET /v1/books/{bookId}/config-history returns an empty list forever. The only
+// call site (tenant.go:318, inside HandleUpdateBookSettings) runs under
+// RLSInjector(pool), so a primed connection was sitting in the context unused.
+// Reasoned from source plus Postgres GUC semantics, NOT runtime-verified — there
+// is no Postgres in the environment this was written in.
 func LogConfigChange(ctx context.Context, db *pgxpool.Pool, bookID, userID, field string, oldV, newV interface{}) {
 	if db == nil || bookID == "" {
 		return
 	}
-	_, err := db.Exec(ctx,
-		`INSERT INTO config_change_log (client_book_id, changed_by, field_name, old_value, new_value)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		bookID, userID, field, strVal(oldV), strVal(newV))
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	// "" when the caller never passed through middleware.SourceIP; NULLIF makes
+	// that SQL NULL rather than a row asserting the change came from nowhere.
+	sourceIP := middleware.GetSourceIP(ctx)
+
+	_, err := middleware.DB(ctx, db).Exec(ctx,
+		`INSERT INTO config_change_log (client_book_id, changed_by, field_name, old_value, new_value, source_ip)
+		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet)`,
+		bookID, userID, field, strVal(oldV), strVal(newV), sourceIP)
 	if err != nil {
 		slog.Warn("failed to log config change", "error", err)
 	}
@@ -368,8 +397,19 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// source_ip is cast to text in SQL, matching the changed_by::text idiom on the
+	// line below rather than introducing a pgx inet codec question, and COALESCEd
+	// so the Scan target stays a plain string: rows written before 2026-09-05, and
+	// any row whose request never passed middleware.SourceIP, hold NULL.
+	//
+	// Column order here is load-bearing. rows.Scan binds BY POSITION and the loop
+	// below `continue`s on a Scan error, so appending a column to the SELECT
+	// without appending its target to the Scan does not fail loudly — it returns
+	// {"items": []} for every book, forever. check_audit_ip_arity.py pins the two
+	// lists against each other.
 	rows, err := c.Query(r.Context(),
-		`SELECT field_name, COALESCE(old_value,''), COALESCE(new_value,''), changed_by::text, changed_at
+		`SELECT field_name, COALESCE(old_value,''), COALESCE(new_value,''), changed_by::text, changed_at,
+		        COALESCE(source_ip::text,'')
 		 FROM config_change_log WHERE client_book_id = $1 ORDER BY changed_at DESC LIMIT 100`, bookID)
 	if err != nil {
 		slog.Error("config history query failed", "error", err)
@@ -384,11 +424,12 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 		NewValue  string    `json:"new_value"`
 		ChangedBy string    `json:"changed_by"`
 		ChangedAt time.Time `json:"changed_at"`
+		SourceIP  string    `json:"source_ip"`
 	}
 	var out []entry
 	for rows.Next() {
 		var e entry
-		if err := rows.Scan(&e.Field, &e.OldValue, &e.NewValue, &e.ChangedBy, &e.ChangedAt); err != nil {
+		if err := rows.Scan(&e.Field, &e.OldValue, &e.NewValue, &e.ChangedBy, &e.ChangedAt, &e.SourceIP); err != nil {
 			continue
 		}
 		out = append(out, e)

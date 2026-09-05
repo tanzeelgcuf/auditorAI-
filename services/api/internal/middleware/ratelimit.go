@@ -5,12 +5,21 @@ package middleware
 // Replaces the no-op RateLimiter placeholder (doc 00 §3.10). Real, in-process
 // limiter keyed by client IP; a gateway (Traefik/Kong) can do this more
 // robustly in prod, but the API must not ship with NO limiting on auth/upload/
-// admin endpoints. Per-IP buckets live in a map with periodic sweep so an
-// attacker can't exhaust memory by rotating IPs.
+// admin endpoints.
+//
+// On the bucket map and memory: this comment used to claim the periodic sweep
+// meant "an attacker can't exhaust memory by rotating IPs". That was false while
+// clientIP trusted X-Forwarded-For — the key was an arbitrary caller-supplied
+// string, so no IPs needed rotating at all, and entries are only evicted after
+// ttl of IDLE time. The key is now the connection peer (see clientip.go), which
+// costs an attacker a real address per bucket, and unparseable peers collapse to
+// one shared key. Stated honestly: the map is bounded by the number of distinct
+// source addresses seen in a 10-minute window, which a botnet or a routed IPv6
+// /64 can still make large. A gateway limiter in front is the real answer; this
+// one is the floor, not the ceiling.
 
 import (
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -74,20 +83,23 @@ func (rl *IPRateLimiter) sweep() {
 	}
 }
 
-// clientIP extracts the caller IP, honoring X-Forwarded-For (set by a gateway)
-// but falling back to RemoteAddr.
+// clientIP is the rate-limit bucket key: the resolved client address, taken
+// from r.RemoteAddr ONLY.
+//
+// It used to read X-Forwarded-For and prefer it over RemoteAddr, which made
+// every limit in this service bypassable by sending a different value of a
+// client-controlled header on each request. Header handling now lives in
+// clientip.go behind a trusted-proxy check, and RealIP(tp) has already written
+// the resolved address into RemoteAddr by the time this runs. Reading only
+// RemoteAddr here is what keeps that a single decision point: if RealIP is ever
+// dropped from the chain, this degrades to the true peer — safe — instead of
+// silently re-trusting the caller.
+//
+// Returns "" only for input that is not an IP at all; RateLimit turns that into
+// one shared bucket rather than a per-string bucket, so a malformed peer address
+// cannot be used to allocate map entries.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := indexByte(xff, ','); i >= 0 {
-			return trimSpace(xff[:i])
-		}
-		return trimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return peerIP(r)
 }
 
 // RateLimit returns middleware enforcing `limiter` per client IP. On exceeding
@@ -96,6 +108,12 @@ func RateLimit(limiter *IPRateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := clientIP(r)
+			if ip == "" {
+				// Not a parseable address. Share one bucket rather than keying on
+				// the raw string: an unbounded set of distinct keys is how the
+				// bucket map becomes a memory-growth surface.
+				ip = "unresolved"
+			}
 			if !limiter.get(ip).Allow() {
 				w.Header().Set("Retry-After", "1")
 				logRateLimited(w, r, ip)
@@ -119,24 +137,4 @@ func RateLimiter(next http.Handler) http.Handler {
 // Log a clear line when the limiter trips (ops visibility, doc 12 §3).
 func logRateLimited(w http.ResponseWriter, r *http.Request, ip string) {
 	slog.Warn("rate limited", "ip", ip, "path", r.URL.Path)
-}
-
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
-}
-
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
 }

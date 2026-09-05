@@ -338,7 +338,7 @@ func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.db.Exec(r.Context(),
+	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(),
 		`INSERT INTO user_book_assignments (user_id, client_book_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 		req.UserID, bookID)
 	if err != nil {
@@ -358,7 +358,7 @@ func (s *Service) HandleRemoveStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.db.Exec(r.Context(),
+	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(),
 		`DELETE FROM user_book_assignments WHERE user_id = $1 AND client_book_id = $2`,
 		userID, bookID)
 	if err != nil {
@@ -378,7 +378,7 @@ func (s *Service) HandleListStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query(r.Context(),
+	rows, err := middleware.DB(r.Context(), s.db).Query(r.Context(),
 		"SELECT id::text, email, role FROM users WHERE firm_id = $1 ORDER BY created_at DESC", firmID)
 	if err != nil {
 		slog.Error("failed to list staff", "error", err)
@@ -409,7 +409,7 @@ func (s *Service) HandleGetFirmSettings(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var name, brandColor, reportFooter string
-	err := s.db.QueryRow(r.Context(),
+	err := middleware.DB(r.Context(), s.db).QueryRow(r.Context(),
 		"SELECT name, brand_primary_color, COALESCE(report_footer_text, '') FROM firms WHERE id = $1",
 		firmID).Scan(&name, &brandColor, &reportFooter)
 	if err != nil {
@@ -468,7 +468,7 @@ func (s *Service) HandleUpdateFirmSettings(w http.ResponseWriter, r *http.Reques
 
 	args = append(args, firmID)
 	query := "UPDATE firms SET " + join(setClauses, ", ") + " WHERE id = $" + itoa(argIdx)
-	_, err := s.db.Exec(r.Context(), query, args...)
+	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(), query, args...)
 	if err != nil {
 		slog.Error("failed to update firm settings", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update settings"})

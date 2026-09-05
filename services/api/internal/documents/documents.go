@@ -80,6 +80,20 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := middleware.GetUserID(r.Context())
 
+	// Storage is optional at wiring time: cmd/server/main.go:165 only calls
+	// SetStorage when storage.New() returns no error, so s.storage can be nil in
+	// a running server. It is checked HERE, before the body is consumed, for two
+	// reasons: (1) PutObject dereferences c.s3, so a nil *Client panics rather
+	// than returning an error — the caller would see a 500 from the recover
+	// middleware instead of a diagnosable status; (2) failing before reading up
+	// to 25MB avoids doing all that work only to refuse. The presign and confirm
+	// handlers already answer 503 for this case; this matches them.
+	if s.storage == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/not-configured",
+			"storage not configured")
+		return
+	}
+
 	// Enforce upload size before parsing multipart
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
@@ -148,7 +162,27 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	storageKey := fmt.Sprintf("documents/%s/%s-%s", bookID, uuid.NewString(), header.Filename)
-	// In production: upload data to S3/MinIO here (aws-sdk-go). For now, persist metadata.
+
+	// Write the BYTES before the row. This ordering is the whole fix: the
+	// previous version generated a storage_key, wrote the metadata row with a
+	// TODO comment where the upload belonged, and published document.uploaded —
+	// so services/ingestion called StreamObject on a key that had never been
+	// written (pipeline/coordinator.go, GetObject -> NoSuchKey), the document sat
+	// at ocr_status='pending' forever, and the API had already answered 201.
+	//
+	// Failure modes of the two possible orders are not symmetric:
+	//   bytes then row  -> a failed insert leaves an ORPHAN OBJECT: invisible to
+	//                      users, costs storage, safe to sweep.
+	//   row then bytes  -> a failed put leaves an ORPHAN ROW: a document that
+	//                      appears in the UI, can never be processed, and blocks
+	//                      re-upload of the same file via the duplicate check.
+	// The orphan object is the cheaper failure, so bytes go first.
+	if err := s.storage.PutObject(r.Context(), storageKey, data); err != nil {
+		slog.Error("failed to store document bytes", "error", err, "book_id", bookID)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal",
+			"failed to store file")
+		return
+	}
 
 	var docID string
 	err = c.QueryRow(r.Context(),
@@ -293,8 +327,20 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the object actually landed (don't trust the client).
+	//
+	// The two failure cases get different answers: a genuine absence is the
+	// client's problem (400 — the PUT never completed), while an error reaching
+	// storage is ours (503 — retryable, and not something the firm can fix). The
+	// previous version collapsed both into 400 "upload did not complete", which
+	// is an actively misleading diagnosis during a storage outage.
 	exists, err := s.storage.ObjectExists(r.Context(), storageKey)
-	if err != nil || !exists {
+	if err != nil {
+		slog.Error("storage unreachable during confirm", "error", err, "doc_id", docID)
+		writeProblem(w, http.StatusServiceUnavailable, "https://ai-auditor.dev/errors/storage-unavailable",
+			"could not verify the upload because storage is unreachable — retry shortly")
+		return
+	}
+	if !exists {
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/upload-incomplete",
 			"object not found in storage — upload did not complete")
 		return

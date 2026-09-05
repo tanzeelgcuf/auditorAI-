@@ -1,9 +1,29 @@
 // Package middleware_test — Phase 5 multi-tenancy security hardening tests.
 //
 // These tests run against a REAL Postgres with the infra/init.sql schema and
-// RLS policies applied. They skip cleanly when no test database is available:
-// set DATABASE_URL_TEST (e.g. postgres://postgres@localhost:5432/ai_auditor_test)
-// to run them locally. The CI workflow provisions a postgres service container.
+// RLS policies applied. They skip cleanly when no test database is available.
+//
+// TWO DSNs, and the split is the whole point of this file:
+//
+//	DATABASE_URL_TEST        the RLS-ENFORCED role (auditor_app). This is the pool
+//	                         handed to RLSInjector and to the services under test,
+//	                         so every assertion below exercises the same
+//	                         enforcement path production uses.
+//	DATABASE_URL_TEST_OWNER  the TABLE OWNER (in CI: the `auditor` bootstrap
+//	                         superuser). Used ONLY for fixture setup and for
+//	                         cross-tenant verification reads.
+//
+// DATABASE_URL_TEST_OWNER must be the owner, not auditor_sys: init.sql:766 grants
+// both roles SELECT/INSERT/UPDATE/DELETE and nothing more, so auditor_sys — which
+// does have BYPASSRLS — would still fail setupEnv's TRUNCATE with "permission
+// denied". BYPASSRLS alone is not sufficient here; ownership is.
+//
+// Setup cannot run on the app role, and that is not a workaround — it is the
+// evidence that RLS is real. auditor_app is granted SELECT/INSERT/UPDATE/DELETE
+// and deliberately NOT TRUNCATE, and `INSERT INTO firms` cannot satisfy a policy
+// predicate that references the firm row being created. If this file ever passes
+// with both variables pointing at the same role, the suite is not testing
+// isolation.
 package middleware_test
 
 import (
@@ -27,9 +47,13 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/tenant"
 )
 
-// securityEnv holds the shared DB pool and the ids of all seeded entities.
+// securityEnv holds the two DB pools and the ids of all seeded entities.
 type securityEnv struct {
+	// pool is the RLS-ENFORCED pool. Everything under test runs on it.
 	pool *pgxpool.Pool
+	// setupPool bypasses RLS. Fixtures and cross-tenant verification reads only —
+	// never wire it into a handler or a middleware, or the test proves nothing.
+	setupPool *pgxpool.Pool
 
 	firmA, firmB         string
 	adminA, adminB       string
@@ -43,6 +67,13 @@ type securityEnv struct {
 
 func testDSN() string {
 	return os.Getenv("DATABASE_URL_TEST")
+}
+
+// setupDSN returns the BYPASSRLS DSN used for fixtures. It does NOT fall back to
+// testDSN(): a silent fallback would let the suite go green against a single
+// over-privileged role, which is the exact failure this file exists to detect.
+func setupDSN() string {
+	return os.Getenv("DATABASE_URL_TEST_OWNER")
 }
 
 // requireDB returns a pool to the test DB or skips the test.
@@ -64,6 +95,60 @@ func requireDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// requireSetupDB returns the BYPASSRLS pool used for fixtures, and FAILS rather
+// than skips when it is misconfigured — a skipped security suite reads as green.
+func requireSetupDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := setupDSN()
+	if dsn == "" {
+		t.Skip("DATABASE_URL_TEST_OWNER not set; skipping multi-tenancy security test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Skipf("no setup database available: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("setup database not reachable: %v", err)
+	}
+	return pool
+}
+
+// assertPoolsDiffer proves the two DSNs resolve to different enforcement
+// postures before any assertion is made. Without this, pointing both variables at
+// the same superuser turns every test below into a tautology — which is precisely
+// how this suite passed for as long as it did.
+func assertPoolsDiffer(t *testing.T, app, setup *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	var appRLS, setupRLS bool
+	var appRole, setupRole string
+	if err := app.QueryRow(ctx,
+		`SELECT current_user, row_security_active('client_books'::regclass)`).
+		Scan(&appRole, &appRLS); err != nil {
+		t.Fatalf("app pool posture query failed: %v", err)
+	}
+	if err := setup.QueryRow(ctx,
+		`SELECT current_user, row_security_active('client_books'::regclass)`).
+		Scan(&setupRole, &setupRLS); err != nil {
+		t.Fatalf("setup pool posture query failed: %v", err)
+	}
+	if !appRLS {
+		t.Fatalf("DATABASE_URL_TEST role %q is NOT subject to row security — "+
+			"every isolation assertion in this file would pass vacuously. "+
+			"Point it at auditor_app", appRole)
+	}
+	if setupRLS {
+		t.Fatalf("DATABASE_URL_TEST_OWNER role %q IS subject to row security, so "+
+			"it cannot seed fixtures. Point it at the table owner (the `auditor` "+
+			"bootstrap role) — not auditor_sys, which bypasses RLS but was never "+
+			"granted TRUNCATE", setupRole)
+	}
+	t.Logf("posture ok: app=%s row_security_active=true, setup=%s row_security_active=false",
+		appRole, setupRole)
+}
+
 func mustQueryRow(t *testing.T, pool *pgxpool.Pool, query string, args ...interface{}) string {
 	t.Helper()
 	var id string
@@ -75,13 +160,21 @@ func mustQueryRow(t *testing.T, pool *pgxpool.Pool, query string, args ...interf
 
 // setupEnv seeds two firms with books, users, assignments and cross-tenant
 // sample data, then truncates the tenant tables so tests are hermetic.
+//
+// All seeding runs on setupPool (BYPASSRLS). The returned env.pool is the
+// RLS-enforced pool that the middleware and services under test are wired to.
 func setupEnv(t *testing.T) *securityEnv {
 	t.Helper()
-	pool := requireDB(t)
+	appPool := requireDB(t)
+	t.Cleanup(appPool.Close)
+	pool := requireSetupDB(t)
 	t.Cleanup(pool.Close)
+	assertPoolsDiffer(t, appPool, pool)
 	ctx := context.Background()
 
 	// Truncate everything with tenant scope (CASCADE reaches the rest).
+	// TRUNCATE is deliberately NOT granted to auditor_app, so this only works on
+	// setupPool — see the package comment.
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE firms, users, client_books, user_book_assignments, source_documents,
 			extracted_entities, reconciliation_groups, audit_findings, audit_reports,
@@ -89,7 +182,7 @@ func setupEnv(t *testing.T) *securityEnv {
 		t.Fatalf("failed to truncate test tables: %v", err)
 	}
 
-	env := &securityEnv{pool: pool}
+	env := &securityEnv{pool: appPool, setupPool: pool}
 
 	env.firmA = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm A') RETURNING id::text`)
 	env.firmB = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm B') RETURNING id::text`)
@@ -247,7 +340,7 @@ func decodeList(t *testing.T, rec *httptest.ResponseRecorder) []map[string]inter
 func (e *securityEnv) countAccessLog(t *testing.T, userID, action string) int {
 	t.Helper()
 	var n int
-	if err := e.pool.QueryRow(context.Background(),
+	if err := e.setupPool.QueryRow(context.Background(),
 		`SELECT count(*) FROM access_log WHERE user_id = $1 AND action = $2`,
 		userID, action).Scan(&n); err != nil {
 		t.Fatalf("failed to count access_log: %v", err)
@@ -381,7 +474,7 @@ func TestSecurity_SessionVarInjectionRejected(t *testing.T) {
 
 	// The drop target must still exist (injection did not run).
 	var exists bool
-	if err := env.pool.QueryRow(context.Background(),
+	if err := env.setupPool.QueryRow(context.Background(),
 		"SELECT to_regclass('public.access_log') IS NOT NULL").Scan(&exists); err != nil {
 		t.Fatalf("verification query failed: %v", err)
 	}
@@ -413,7 +506,7 @@ func TestSecurity_NoAssignmentsSeesEmptyList(t *testing.T) {
 	router := env.newRouter(t)
 
 	// Create a staff user in firm A with no book assignments.
-	noBooks := mustQueryRow(t, env.pool,
+	noBooks := mustQueryRow(t, env.setupPool,
 		`INSERT INTO users (firm_id, email, password_hash, role, email_verified)
 		 VALUES ($1, 'no-books@test.local', 'unused', 'staff', true) RETURNING id::text`, env.firmA)
 
@@ -440,15 +533,15 @@ func TestSecurity_CrossBookResourceByIDReturns404(t *testing.T) {
 
 	// Seed a finding, group and report inside firm B's book so there is
 	// real cross-tenant data to try to reach.
-	groupB := mustQueryRow(t, env.pool,
+	groupB := mustQueryRow(t, env.setupPool,
 		`INSERT INTO reconciliation_groups (client_book_id, link_confidence, status)
 		 VALUES ($1, 0.9, 'needs_review') RETURNING id::text`, env.bookB)
-	findingB := mustQueryRow(t, env.pool,
+	findingB := mustQueryRow(t, env.setupPool,
 		`INSERT INTO audit_findings (client_book_id, reconciliation_group_id, rule_id, rule_version,
 			calculated_variance_cents, tolerance_cents, exceeds_tolerance, calculation_formula, severity, status)
 		 VALUES ($1, $2, 'gl_reconciliation', 'abc123', 500, 1, true, 'v = a - b', 'medium', 'open')
 		 RETURNING id::text`, env.bookB, groupB)
-	reportB := mustQueryRow(t, env.pool,
+	reportB := mustQueryRow(t, env.setupPool,
 		`INSERT INTO audit_reports (client_book_id, period_start, period_end, generated_by, finding_ids)
 		 VALUES ($1, '2026-01-01', '2026-01-31', $2, ARRAY[$3::uuid])
 		 RETURNING id::text`, env.bookB, env.adminB, findingB)
@@ -545,7 +638,7 @@ func TestSecurity_AccessLogWrittenOnSensitiveActions(t *testing.T) {
 
 func TestSecurity_AdminRotateKeys(t *testing.T) {
 	env := setupEnv(t)
-	seedRotateKeys(t, env.pool, env.firmA)
+	seedRotateKeys(t, env.setupPool, env.firmA)
 
 	adminToken := env.token(t, env.adminA, env.firmA, "firm_admin")
 	staffToken := env.token(t, env.staffA, env.firmA, "staff")
@@ -583,7 +676,7 @@ func TestSecurity_AdminRotateKeys(t *testing.T) {
 
 	// Exactly one active key for firm A; the seed key moved to rotating.
 	var active int
-	if err := env.pool.QueryRow(context.Background(),
+	if err := env.setupPool.QueryRow(context.Background(),
 		`SELECT count(*) FROM data_encryption_keys WHERE firm_id = $1 AND status = 'active'`,
 		env.firmA).Scan(&active); err != nil {
 		t.Fatalf("failed to count active keys: %v", err)

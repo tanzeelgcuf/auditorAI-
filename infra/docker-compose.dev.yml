@@ -1,4 +1,13 @@
 # AI Auditor v1 — docker-compose.dev.yml (local development)
+#
+#   docker compose -f infra/docker-compose.dev.yml up -d
+#
+# BACKING SERVICES ONLY. api / ingestion / verification / agent-runtime / web are
+# meant to run on the host against these, which is why every port is published
+# and the credentials are hardcoded dev values rather than ${VAR} lookups.
+#
+# Relative paths resolve against infra/ (the directory of the -f file), not the
+# repo root — `./infra/init.sql` and `./services/...` were both wrong here.
 
 services:
   postgres:
@@ -7,9 +16,24 @@ services:
       POSTGRES_DB: ai_auditor
       POSTGRES_USER: auditor
       POSTGRES_PASSWORD: devpassword
+      # init.sql reads these with \getenv to CREATE ROLE auditor_app/auditor_sys
+      # and aborts if either is absent, under 16 chars, or equal to the other.
+      # Hardcoded here because this file is local-dev-only; production values live
+      # in .env (see .env.example).
+      #
+      # A HOST-RUN api must use them too, or RLS is inert exactly as before:
+      #   DATABASE_URL=postgres://auditor_app:dev_app_password_1@localhost:5432/ai_auditor
+      #   SYS_DATABASE_URL=postgres://auditor_sys:dev_sys_password_1@localhost:5432/ai_auditor
+      # Connecting as `auditor` still works and still bypasses every policy — it
+      # is the bootstrap superuser. main.go's boot check refuses to start on it.
+      APP_DB_PASSWORD: dev_app_password_1
+      SYS_DB_PASSWORD: dev_sys_password_1
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # was ./infra/init.sql -> infra/infra/init.sql, which does not exist.
+      # Compose would have created a DIRECTORY at that path and mounted it,
+      # so postgres started with no schema at all.
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -18,22 +42,17 @@ services:
       timeout: 3s
       retries: 10
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    environment:
-      DATABASE_URL: postgres://auditor:devpassword@postgres:5432/ai_auditor
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 100
-      DEFAULT_POOL_SIZE: 20
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "6432:6432"
+  # pgbouncer removed — see the long note in docker-compose.yml. Short version:
+  # transaction pooling silently breaks the session-scoped app.current_firm the
+  # RLS middleware sets, and the pooler's own DSN would have laundered every
+  # connection into the `auditor` superuser, which is exempt from RLS. Connect to
+  # postgres:5432 / localhost:5432 directly.
 
   nats:
     image: nats:2.10-alpine
-    command: ["-js"]
+    # -m 8222 starts the monitoring server. Port 8222 was already published but
+    # nothing listened on it without this flag.
+    command: ["-js", "-m", "8222"]
     ports:
       - "4222:4222"
       - "8222:8222"
@@ -55,17 +74,36 @@ services:
 
   ocr-sidecar:
     build:
-      context: ./services/ingestion/ocr-sidecar
-      dockerfile: Dockerfile.dev
+      # was `context: ./services/ingestion/ocr-sidecar` (-> infra/services/...)
+      # with `dockerfile: Dockerfile.dev`, A FILE THAT DOES NOT EXIST in this
+      # repo. Both errors meant this file could never build either.
+      context: ../services/ingestion/ocr-sidecar
+      dockerfile: Dockerfile
     environment:
       DOCTR_DEVICE: cpu
     ports:
       - "8000:8000"
 
+  # Needed even for host-run development: internal/documents/clamav.go fails
+  # CLOSED, so with no reachable clamd every upload is rejected.
+  #
+  # A host-run api does NOT get the container entrypoint that renders
+  # clamd.conf, so point the host's /etc/clamav/clamd.conf at this daemon:
+  #     TCPSocket 3310
+  #     TCPAddr 127.0.0.1
+  clamav:
+    image: clamav/clamav:1.4
+    volumes:
+      - clamav_data:/var/lib/clamav
+    ports:
+      - "3310:3310"
+
   langfuse:
     image: langfuse/langfuse:2
     environment:
-      DATABASE_URL: postgres://auditor:devpassword@postgres:5432/ai_auditor
+      # Own database (init.sql creates it). Was ai_auditor, which meant langfuse's
+      # Prisma migrations landed in the application schema.
+      DATABASE_URL: postgres://auditor:devpassword@postgres:5432/langfuse
       NEXTAUTH_SECRET: devsecret
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: langfuse
@@ -92,7 +130,8 @@ services:
   glitchtip:
     image: glitchtip/glitchtip:latest
     environment:
-      DATABASE_URL: postgres://auditor:devpassword@postgres:5432/ai_auditor
+      # Own database (init.sql creates it); Django `migrate` runs on every start.
+      DATABASE_URL: postgres://auditor:devpassword@postgres:5432/glitchtip
       SECRET_KEY: devsecret
       ALLOWED_HOSTS: "*"
     depends_on:
@@ -105,3 +144,4 @@ volumes:
   postgres_data:
   qdrant_data:
   minio_data:
+  clamav_data:

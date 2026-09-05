@@ -1,4 +1,30 @@
 # AI Auditor v1 — docker-compose.yml (v1 production deploy target)
+#
+# RUN IT FROM THE REPOSITORY ROOT:
+#   docker compose -f infra/docker-compose.yml --env-file .env up -d --build
+#
+# Both flags matter.
+#
+# 1. Compose resolves every relative path in this file against the PROJECT
+#    DIRECTORY, which defaults to the directory holding the first -f file — so
+#    `infra/`, not the repo root. Before this commit the paths read
+#    `./services/api` and `./infra/init.sql`, which resolve to
+#    infra/services/api and infra/infra/init.sql. Neither exists. Every build
+#    and the postgres init mount were broken by construction.
+#
+# 2. --env-file is resolved against your CWD, not the project directory. Since
+#    .env.example lives at the repo root, `.env` does too, and compose would
+#    otherwise look for infra/.env and silently substitute empty strings for
+#    every ${VAR} — including POSTGRES_PASSWORD.
+#
+# BUILD CONTEXTS ARE DELIBERATELY MIXED:
+#   api / ingestion / verification / web  ->  context: ..  (repository root)
+#       The two Rust build.rs files call compile_protos("../../proto/<svc>.proto"),
+#       so proto/ must be inside the context. api and web follow for consistency
+#       and are written against a root context.
+#   agent-runtime / ocr-sidecar          ->  their own directory
+#       Their Dockerfiles predate this commit and use context-relative COPY
+#       (`COPY requirements.txt .`). A root context would break them.
 
 services:
   postgres:
@@ -7,9 +33,19 @@ services:
       POSTGRES_DB: ai_auditor
       POSTGRES_USER: auditor
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Read by init.sql via `\getenv` to CREATE ROLE auditor_app / auditor_sys.
+      # They must be here, on the POSTGRES service, not on api: psql runs inside
+      # this container during initdb, so this is the only process whose
+      # environment init.sql can see. Absent or shorter than 16 chars, or equal
+      # to each other, and init.sql raises and aborts — deliberately, because a
+      # missing auditor_app is indistinguishable at runtime from RLS being off.
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      SYS_DB_PASSWORD: ${SYS_DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # ./init.sql == infra/init.sql. Runs ONLY on an empty data volume; after
+      # the first `up`, schema changes need a migration or a volume reset.
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U auditor -d ai_auditor"]
       interval: 5s
@@ -18,50 +54,173 @@ services:
     networks:
       - auditor
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
+  # PGBOUNCER WAS REMOVED FROM THIS FILE. It is a deliberate departure from the
+  # documented deploy, so here is the reasoning rather than a silent deletion.
+  #
+  # As configured (edoburu/pgbouncer, DATABASE_URL=...auditor..., POOL_MODE:
+  # transaction) it broke the RLS design in two independent ways:
+  #
+  #  1. TENANT LEAK UNDER TRANSACTION POOLING. middleware.RLSInjector sets
+  #     app.current_firm with set_config(..., false) — SESSION scope — outside any
+  #     explicit transaction (middleware.go:125,143). In transaction pooling every
+  #     statement is its own transaction, so the server connection returns to
+  #     pgbouncer's pool immediately after set_config. The following statement can
+  #     land on a different server connection: either one with no GUC (policies
+  #     call current_setting without missing_ok, so it RAISES -> 500) or one still
+  #     carrying ANOTHER FIRM'S value -> cross-tenant read. The comment that used
+  #     to sit here claimed the API used SET LOCAL. It does not.
+  #  2. IDENTITY LAUNDERING. The server-side role is fixed by pgbouncer's own
+  #     DSN, so every request would reach Postgres as `auditor` — the bootstrap
+  #     SUPERUSER — no matter which role the api authenticated as. Superusers are
+  #     exempt from RLS unconditionally, which is the original inert-RLS bug.
+  #
+  # Reintroduce it only when ALL THREE hold, in this order:
+  #   (a) the api wraps each request in an explicit transaction and switches to
+  #       `SET LOCAL` / set_config(..., true), making transaction pooling sound;
+  #   (b) pgbouncer forwards the CLIENT's role to Postgres (verified by querying
+  #       `SELECT current_user` THROUGH the pooler, not by reading its docs);
+  #   (c) a load test shows pgx's own pool is actually the bottleneck. One pilot
+  #       firm on one book does not need a second pooler in front of pgx.
+  #
+  # Consequence today: postgres:16's default max_connections=100 is the cap.
+  # api opens two pgx pools (auditor_app + auditor_sys), langfuse and glitchtip
+  # one each.
+
+  # MinIO — the S3 implementation every S3_ENDPOINT in .env.example already
+  # points at (http://minio:9000), but which was absent from this file, so
+  # storage.New() failed and main.go:114 downgraded to "uploads limited".
+  #
+  # No bucket-creation sidecar is needed: cmd/server/main.go:110 calls
+  # storage.EnsureBucketExists(ctx) at startup.
+  minio:
+    image: minio/minio:latest # pin to a RELEASE.* tag before production
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@postgres:5432/ai_auditor
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 100
-      DEFAULT_POOL_SIZE: 20
-    depends_on:
-      postgres:
-        condition: service_healthy
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     ports:
-      - "6432:6432"
+      - "9000:9000"
+      - "9001:9001" # console
+    networks:
+      - auditor
+
+  # ClamAV daemon. internal/documents/clamav.go:46 runs `clamdscan --stream`
+  # with NO --config-file, so the client half (in the api image) reads only
+  # /etc/clamav/clamd.conf; services/api/docker-entrypoint.sh renders that file
+  # to point here. Exit 2/126/127 is treated as "scan unavailable" and
+  # documents.go:112 REJECTS the upload — fail-closed. Without this service,
+  # every upload 500s.
+  #
+  # Needs ~2GB RAM (the signature database is loaded into memory) and the first
+  # start downloads that database via freshclam, which is why start_period is
+  # minutes, not seconds.
+  clamav:
+    image: clamav/clamav:1.4
+    volumes:
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      # clamdcheck.sh ships in the official image and pings clamd over its
+      # configured socket. NOT VERIFIED HERE (no docker in this sandbox): if
+      # `up` hangs on "waiting for clamav to be healthy", check this path first.
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
     networks:
       - auditor
 
   api:
     build:
-      context: ./services/api
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: services/api/Dockerfile
     environment:
-      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@pgbouncer:6432/ai_auditor
+      # TWO DSNs, TWO ROLES. This is the whole RLS fix at the wiring level.
+      #
+      # DATABASE_URL -> auditor_app: NOSUPERUSER, NOBYPASSRLS, not the table
+      # owner. Every one of the 30 policies in init.sql is live on this role and
+      # inert on `auditor`. main.go asserts this at boot (assertRolePosture) and
+      # refuses to start if the connected role can bypass RLS, because "RLS is
+      # on" and "RLS applies to us" are different claims and only the second one
+      # matters.
+      #
+      # SYS_DATABASE_URL -> auditor_sys: NOSUPERUSER but BYPASSRLS, for the paths
+      # that are structurally cross-tenant — pre-auth identity lookups (signup
+      # creates the firm row a policy would need to already exist; login resolves
+      # firm_id FROM the email) and the background sweepers (notify, pipeline
+      # coordinator, verify_worker). These cannot set app.current_firm because
+      # they are what determines it.
+      DATABASE_URL: postgres://auditor_app:${APP_DB_PASSWORD}@postgres:5432/ai_auditor
+      SYS_DATABASE_URL: postgres://auditor_sys:${SYS_DB_PASSWORD}@postgres:5432/ai_auditor
       JWT_SECRET: ${JWT_SECRET}
+      APP_ENV: ${APP_ENV}
+      # Trusted reverse proxies for client-IP resolution. EMPTY = trust nothing,
+      # which is correct for this file as it stands: `ports: 8080:8080` below
+      # publishes the api directly and no service carries traefik labels, so
+      # nothing sanitises X-Forwarded-For before it reaches the process. If you
+      # put a proxy in front, set this to ITS address range — otherwise every
+      # client shares one rate-limit bucket. See clientip.go for why the empty
+      # default is the safe one.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       S3_ENDPOINT: ${S3_ENDPOINT}
       S3_BUCKET: ${S3_BUCKET}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY}
       S3_SECRET_KEY: ${S3_SECRET_KEY}
+      # storage.go:34 reads AWS_REGION (default us-east-1). MinIO ignores the
+      # value but the AWS SDK requires one to sign requests.
+      AWS_REGION: ${AWS_REGION}
       NATS_URL: nats://nats:4222
+      # Consumed by docker-entrypoint.sh to render clamd.conf.
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      # findings.go:568 writes PDFs to the LOCAL filesystem, not S3. Without the
+      # api_reports volume mounted at this path, every report is lost on restart.
+      REPORTS_DIR: /var/lib/ai-auditor/reports
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      BILLING_SUCCESS_URL: ${BILLING_SUCCESS_URL}
+      BILLING_CANCEL_URL: ${BILLING_CANCEL_URL}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: ${EMAIL_FROM}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME}
+      APP_BASE_URL: ${APP_BASE_URL}
+      EXPONENT_ACCESS_TOKEN: ${EXPONENT_ACCESS_TOKEN}
+      # The shared secret agent-runtime sends as X-Internal-Key. It was missing
+      # from BOTH services, so middleware/internal_auth.go rejected every MCP
+      # call the agent made.
+      API_INTERNAL_KEY: ${API_INTERNAL_KEY}
       INGESTION_GRPC_ADDR: ingestion:50051
       VERIFICATION_GRPC_ADDR: verification:50052
-      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
-      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
       GLITCHTIP_DSN: ${GLITCHTIP_DSN}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - api_reports:/var/lib/ai-auditor/reports
     depends_on:
-      pgbouncer:
-        condition: service_started
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
       nats:
         condition: service_healthy
       ingestion:
         condition: service_started
       verification:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     ports:
       - "8080:8080"
     networks:
@@ -69,27 +228,49 @@ services:
 
   ingestion:
     build:
-      context: ./services/ingestion
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: services/ingestion/Dockerfile
     environment:
       OCR_SIDECAR_URL: http://ocr-sidecar:8000
-      S3_ENDPOINT: ${S3_ENDPOINT}
+      # S3 NAMING: this service does NOT use the same env names as the Go api.
+      # storage.go:30-34 reads S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY and hands
+      # them to the SDK explicitly. The Rust side does not: structured.rs:18 calls
+      # aws_config::load_from_env() and :22 reads AWS_ENDPOINT_URL. `grep -rn` over
+      # services/ingestion/src finds ZERO reads of S3_ENDPOINT, S3_ACCESS_KEY or
+      # S3_SECRET_KEY — only S3_BUCKET (grpc/mod.rs:56, ocr/doctr.rs:60).
+      #
+      # So the three S3_* vars that used to be here were inert: the endpoint
+      # override never fired (client aimed at real AWS, not minio) and the SDK's
+      # env credential provider had nothing to read. Both S3 read paths in this
+      # service go through build_s3_client (grpc/mod.rs:55, ocr/doctr.rs:59), so
+      # every document fetch was affected, not one code path.
+      #
+      # Mapped from the same .env values so there is still one source of truth.
       S3_BUCKET: ${S3_BUCKET}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      AWS_ENDPOINT_URL: ${S3_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      # NOT passing AWS_REGION here on purpose: structured.rs:21 does
+      # set_region(Some(Region::new("us-east-1"))) unconditionally, after
+      # load_from_env(), so an AWS_REGION value cannot take effect. The doc
+      # comment at structured.rs:16 claims the region is read from env; it isn't.
       NATS_URL: nats://nats:4222
       GLITCHTIP_DSN: ${GLITCHTIP_DSN}
     depends_on:
       ocr-sidecar:
         condition: service_started
+      minio:
+        condition: service_healthy
       nats:
         condition: service_healthy
     networks:
       - auditor
 
+  # Own context: its Dockerfile does `COPY requirements.txt .` / `COPY main.py .`
+  # relative to this directory, so it cannot take the repo-root context.
   ocr-sidecar:
     build:
-      context: ./services/ingestion/ocr-sidecar
+      context: ../services/ingestion/ocr-sidecar
       dockerfile: Dockerfile
     environment:
       DOCTR_DEVICE: cpu
@@ -98,26 +279,84 @@ services:
 
   verification:
     build:
-      context: ./services/verification
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: services/verification/Dockerfile
     environment:
-      ZEN_DECISION_GRAPH_PATH: /app/services/verification/decision-graphs/gl_reconciliation.json
+      # Was /app/services/verification/decision-graphs/... — a path that exists
+      # in the repo but not in any image. The graphs are COPYed to
+      # /app/decision-graphs/ so that rule_version (a SHA-256 of the file's
+      # bytes, zen/mod.rs:93) is reproducible from the image digest.
+      #
+      # Caveat worth knowing: zen/mod.rs:92 sets rule_id = this path string, so
+      # changing it changes the rule_id recorded in every future finding.
+      ZEN_DECISION_GRAPH_PATH: /app/decision-graphs/gl_reconciliation.json
       GLITCHTIP_DSN: ${GLITCHTIP_DSN}
     networks:
       - auditor
 
   agent-runtime:
     build:
-      context: ./services/agent-runtime
+      context: ../services/agent-runtime
       dockerfile: Dockerfile
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      API_MCP_URL: http://api:8080/mcp
+      # Was http://api:8080/mcp. mcp_client/__init__.py:24 rstrips the URL and
+      # :36 POSTs to "{base}/mcp/tools/{tool}", so the old value produced
+      # /mcp/mcp/tools/... and every tool call 404'd.
+      API_MCP_URL: http://api:8080
+      # Without this the client sends an empty X-Internal-Key (mcp_client:25
+      # defaults to "") and middleware/internal_auth.go rejects the request.
+      API_INTERNAL_KEY: ${API_INTERNAL_KEY}
+      APP_ENV: ${APP_ENV}
+      NATS_URL: nats://nats:4222
+      # main.py:163 unconditionally builds an Ollama client. The default
+      # OLLAMA_URL is http://localhost:11434/v1, which inside this container is
+      # the container itself — so extraction fails 100% of the time unless this
+      # points at a reachable Ollama. ANTHROPIC_API_KEY is read at main.py:19
+      # but never used to construct a client; see the note on the ollama service.
+      OLLAMA_URL: http://ollama:11434/v1
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      # langfuse_trace.py:13 enables tracing only when BOTH are set. These were
+      # previously passed to the api service, whose Go code never reads them.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      # main.py does not use DATABASE_URL; the standalone harnesses
+      # (run_extraction.py:95, run_3leg.py:49) do, and their hardcoded fallback
+      # DSN only works on one developer's laptop. Passed so that
+      # `docker compose exec agent-runtime python run_extraction.py` works.
+      #
+      # auditor_sys, not auditor_app: those harnesses sweep documents across
+      # books with no HTTP request behind them, so nothing sets app.current_firm
+      # and every policy predicate would raise on the unset GUC. They are also
+      # the reason auditor_sys exists at all rather than just handing the api a
+      # superuser.
+      DATABASE_URL: postgres://auditor_sys:${SYS_DB_PASSWORD}@postgres:5432/ai_auditor
       QDRANT_URL: http://qdrant:6333
       GLITCHTIP_DSN: ${GLITCHTIP_DSN}
     depends_on:
-      - api
-      - qdrant
+      api:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_started
+    networks:
+      - auditor
+
+  # Local LLM host for agent-runtime's extraction/classification nodes. Present
+  # because the code's only client factory targets Ollama (ollama_adapter.py:52
+  # make_llm_client -> OllamaMessagesAdapter), consistent with this project's
+  # open-source-stack preference.
+  #
+  # ONE MANUAL STEP: the model is not baked into the image. After first `up`:
+  #   docker compose -f infra/docker-compose.yml exec ollama ollama pull llama3.2
+  # Until then every extraction batch fails with a model-not-found error.
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
     networks:
       - auditor
 
@@ -130,9 +369,16 @@ services:
 
   nats:
     image: nats:2.10-alpine
-    command: ["-js"]
+    # -m 8222 enables the monitoring HTTP server. Without it there is no health
+    # endpoint at all — the previous healthcheck ran `nats server check
+    # jetstream`, and the `nats` CLI is NOT in this image (only nats-server), so
+    # it could never pass. api and ingestion both gate on
+    # `nats: condition: service_healthy`, meaning neither would ever start.
+    command: ["-js", "-m", "8222"]
     healthcheck:
-      test: ["CMD", "nats", "server", "check", "jetstream"]
+      # busybox wget, from the alpine base. NOT VERIFIED HERE (no docker in this
+      # sandbox); /healthz is nats-server's documented monitoring endpoint.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -141,13 +387,20 @@ services:
 
   web:
     build:
-      context: ./apps/web
-      dockerfile: Dockerfile
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8080
-      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY}
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      # BUILD ARG, NOT `environment`. NEXT_PUBLIC_* is inlined into the client
+      # bundle by `next build`; passing it at runtime changes nothing. It was
+      # previously under `environment:`, so the shipped bundle always used the
+      # http://localhost:8080 fallback baked in at the five call sites.
+      #
+      # This is the URL the USER'S BROWSER hits, so it must be host-reachable —
+      # http://api:8080 would only resolve inside the compose network.
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     ports:
       - "3000:3000"
     networks:
@@ -156,15 +409,25 @@ services:
   langfuse:
     image: langfuse/langfuse:2
     environment:
-      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@pgbouncer:6432/ai_auditor
+      # OWN DATABASE. This used to point at ai_auditor, so langfuse ran its own
+      # Prisma migrations into the SAME `public` schema as the application —
+      # dozens of foreign tables sharing the namespace the RLS policies and the
+      # schema-drift guard both reason over. init.sql now does
+      # `CREATE DATABASE langfuse OWNER auditor`, so this is a clean split.
+      #
+      # Connects as `auditor` (the owner) and DIRECTLY to postgres:5432: it needs
+      # DDL to migrate, which auditor_app is deliberately denied
+      # (REVOKE CREATE ON SCHEMA public), and its schema is managed by langfuse,
+      # not by us.
+      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@postgres:5432/langfuse
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
       S3_ENDPOINT: ${S3_ENDPOINT}
       S3_BUCKET: ${S3_BUCKET}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY}
       S3_SECRET_KEY: ${S3_SECRET_KEY}
     depends_on:
-      pgbouncer:
-        condition: service_started
+      postgres:
+        condition: service_healthy
     ports:
       - "3001:3000"
     networks:
@@ -173,12 +436,15 @@ services:
   glitchtip:
     image: glitchtip/glitchtip:latest
     environment:
-      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@pgbouncer:6432/ai_auditor
+      # Own database, same reasoning as langfuse above: glitchtip is a Django app
+      # that runs `migrate` on start and would otherwise create its tables inside
+      # the application schema.
+      DATABASE_URL: postgres://auditor:${POSTGRES_PASSWORD}@postgres:5432/glitchtip
       SECRET_KEY: ${GLITCHTIP_SECRET_KEY}
       ALLOWED_HOSTS: "*"
     depends_on:
-      pgbouncer:
-        condition: service_started
+      postgres:
+        condition: service_healthy
     ports:
       - "8001:8000"
     networks:
@@ -194,11 +460,27 @@ services:
     networks:
       - auditor
 
+  # TWO SECURITY NOTES, both pre-existing and both left visible rather than
+  # quietly patched around:
+  #
+  # 1. `--api.insecure=true` published on host :8081 is an UNAUTHENTICATED
+  #    Traefik dashboard. It is commented out below. Re-enable it only bound to
+  #    localhost (`127.0.0.1:8081:8080`) or behind auth middleware.
+  # 2. Mounting /var/run/docker.sock — even :ro — gives this container effective
+  #    root on the host: the Docker API can start a privileged container. That
+  #    is how the docker provider works, so the mitigation is not removing it but
+  #    keeping Traefik's own surface closed (see 1).
+  #
+  # Also worth knowing: NO service in this file carries traefik labels, so
+  # Traefik currently routes nothing. Ports 80/443 are published but idle, and
+  # the letsencrypt resolver never issues a certificate. Wiring routers/labels
+  # for api and web is deliberately out of scope for this pass.
   traefik:
     image: traefik:v3.0
     command:
-      - "--api.insecure=true"
+      # - "--api.insecure=true"
       - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}"
@@ -207,7 +489,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8081:8080"
+      # - "127.0.0.1:8081:8080"  # dashboard; see note 1 above
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "letsencrypt:/letsencrypt"
@@ -218,6 +500,10 @@ volumes:
   postgres_data:
   qdrant_data:
   letsencrypt:
+  minio_data:
+  clamav_data: # signature database; avoids a full freshclam download per restart
+  ollama_data: # pulled models; without it `ollama pull` is undone by `down`
+  api_reports: # findings.go writes report PDFs to disk, not S3
 
 networks:
   auditor:
