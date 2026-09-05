@@ -48,18 +48,28 @@ jobs:
       # requires "a REAL Postgres with the infra/init.sql schema and RLS policies
       # applied" — without this step the suite has no tables to query.
       #
-      # APP_DB_PASSWORD / SYS_DB_PASSWORD are NOT optional. init.sql:721-722 reads
-      # them with \getenv and its bootstrap DO block RAISEs when either is unset,
-      # shorter than 16 chars, or equal to the other — so with only PGPASSWORD set
-      # this step aborted before creating a single table. These are throwaway CI
-      # credentials for an ephemeral container; they are deliberately literal here
-      # so the job does not depend on repository secrets being configured.
+      # TWO files, in this order. infra/00-bootstrap-roles.sql CREATEs auditor_app
+      # and auditor_sys; infra/init.sql GRANTs to them and RAISEs at the end if
+      # either is missing, so reversing the order fails the load. They were one
+      # file until 2026-09-06, when the psql \getenv meta-commands in the bootstrap
+      # turned out to be what broke `sqlc compile` below — see that file's header.
+      #
+      # APP_DB_PASSWORD / SYS_DB_PASSWORD are NOT optional. The bootstrap reads
+      # them with \getenv and RAISEs when either is unset, shorter than 16 chars,
+      # or equal to the other — so with only PGPASSWORD set this step aborts before
+      # creating a single table. These are throwaway CI credentials for an ephemeral
+      # container; they are deliberately literal here so the job does not depend on
+      # repository secrets being configured.
       - name: Load schema
         env:
           PGPASSWORD: testpass
           APP_DB_PASSWORD: ci_app_password_not_secret
           SYS_DB_PASSWORD: ci_sys_password_not_secret
-        run: psql -h localhost -U auditor -d ai_auditor_test -v ON_ERROR_STOP=1 -f infra/init.sql
+        run: |
+          psql -h localhost -U auditor -d ai_auditor_test -v ON_ERROR_STOP=1 \
+            -f infra/00-bootstrap-roles.sql
+          psql -h localhost -U auditor -d ai_auditor_test -v ON_ERROR_STOP=1 \
+            -f infra/init.sql
 
       - name: Install sqlc
         run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
@@ -340,6 +350,39 @@ jobs:
       #     python3 scripts/mutate_rls_guard.py
       - name: Check RLS write priming
         run: python3 scripts/check_rls_write_priming.py --verbose
+
+      # psql/SQL split between infra/init.sql and infra/00-bootstrap-roles.sql.
+      # services/api/sqlc.yaml sets `schema: "../../infra/init.sql"`, so sqlc
+      # parses that file with the real PostgreSQL parser. init.sql contained four
+      # psql CLIENT meta-commands (\set x2, \getenv x2) and a psql variable
+      # interpolation (:'app_pw'), none of which is SQL. `sqlc compile` failed,
+      # and because that step precedes `go test` in the Go job, EVERY Go test —
+      # the entire DATABASE_URL_TEST integration suite included — never ran. That
+      # is why Phase 3's DB-backed cases had never had a first run.
+      #
+      # The reported position, 859:48, reads like a stray colon and is not one:
+      # 859 was the first `\set` (14 chars, so it has no column 48) and 48 is the
+      # column of :'app_pw' on line 863, the first statement-terminating `;`
+      # after it. "Fixing the colon" would have broken database init and left
+      # sqlc just as broken.
+      #
+      # The guard checks BOTH directions, because \getenv is a security control
+      # rather than a style choice: the alternative form
+      # `\set app_pw `printf '%s' "$APP_DB_PASSWORD"`` makes psql run a SHELL,
+      # and inside double quotes a shell still expands $(...) and backticks, so a
+      # password containing either would be EXECUTED during database init. A
+      # guard that only rejected meta-commands in init.sql would be perfectly
+      # happy if someone "simplified" the bootstrap back to the shell form.
+      #
+      # 9 mutants were run from pristine copies. Two findings worth keeping:
+      # M1 was NOT caught at first — init.sql did not end in a newline, so an
+      # appended `\set x 1` landed as `$selfcheck$;\set x 1`, which does not
+      # START with a backslash. That was a bad mutant AND a real hole (psql
+      # accepts a meta-command after a `;` on the same line); both are fixed, and
+      # `E'\\d+'` is still correctly not flagged. M8, removing the `schema:` key
+      # from sqlc.yaml, exits 2 INERT rather than printing OK.
+      - name: Check bootstrap/schema split (sqlc-parseable init.sql)
+        run: python3 scripts/check_bootstrap_split.py
 
   # services/agent-runtime has eight test modules under tests/ (88 tests as of
   # 2026-09-06) and requirements.txt already pins pytest and pytest-asyncio —

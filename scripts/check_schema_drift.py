@@ -3,8 +3,9 @@
 
 Why this exists
 ---------------
-infra/init.sql is the ONLY DDL any environment applies. There is no migration
-runner. Before this guard, services/api/db/migrations/ held 8 .up.sql files that
+infra/init.sql is the only file that defines a RELATION — every table, view,
+index and policy — in every environment. There is no migration runner. Before
+this guard, services/api/db/migrations/ held 8 .up.sql files that
 nothing ever executed, so 6 tables, 1 view and 10 columns were referenced by
 live handlers but absent from the applied schema. Nothing in CI could see it:
 
@@ -13,6 +14,16 @@ live handlers but absent from the applied schema. Nothing in CI could see it:
   * `go build` / `go vet` / lint never parse SQL string literals.
   * the one real-database test suite died in setup on a missing table, so the
     schema failure masked the RLS failure behind it.
+
+Amended 2026-09-06: init.sql is no longer the only .sql file applied.
+infra/00-bootstrap-roles.sql runs first and holds the two CREATE ROLE
+statements, because reading a password safely needs psql's `\getenv` and psql
+meta-commands are not SQL — sqlc parses init.sql as its schema and could not
+read them, which failed `sqlc compile` and, since that step precedes `go test`,
+took every Go test with it. That file defines no relation and this parser does
+not read it; `scripts/check_bootstrap_split.py` fails if a CREATE TABLE / VIEW /
+INDEX / POLICY ever appears there, which is what keeps this parser's single-file
+assumption true rather than merely stated.
 
 So: parse init.sql, extract every table/view/column reference out of the Go and
 Python sources, and diff. Deliberately conservative — it only reports a column

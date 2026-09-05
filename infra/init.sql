@@ -1,9 +1,18 @@
 -- AI Auditor v1 — Database Initialization (DDL from docs 05-10)
 --
--- THIS FILE IS THE ENTIRE APPLIED SCHEMA. It is the only DDL that any
--- environment runs: infra/docker-compose*.yml mount it into
--- /docker-entrypoint-initdb.d/, and .github/workflows/ci.yml loads it with
--- `psql -v ON_ERROR_STOP=1 -f infra/init.sql`. There is no migration runner.
+-- THIS FILE IS THE ENTIRE APPLIED SCHEMA — every table, view, index, policy and
+-- grant. It is the only DDL that any environment runs: infra/docker-compose*.yml
+-- mount it into /docker-entrypoint-initdb.d/, and .github/workflows/ci.yml loads
+-- it with `psql -v ON_ERROR_STOP=1 -f infra/init.sql`. There is no migration
+-- runner.
+--
+-- ONE thing is not here: the two `CREATE ROLE` statements, which moved to
+-- `infra/00-bootstrap-roles.sql` on 2026-09-06 because they need psql's `\getenv`
+-- to read a password without going through a shell, and psql meta-commands are
+-- not SQL — sqlc parses THIS file as its schema and could not read them. That
+-- file runs first everywhere this one runs. Nothing else moved: no relation and no
+-- policy lives outside this file, and `scripts/check_bootstrap_split.py` fails if
+-- one appears there.
 -- services/api/db/migrations/ used to hold 8 .up.sql files that NOTHING ever
 -- applied — the only reference to that directory in the whole repo was a line
 -- of prose in .claude/agents/backend-agent.md. Everything they created is
@@ -842,60 +851,26 @@ CREATE INDEX idx_access_log_source_ip ON access_log(source_ip, occurred_at DESC)
 -- BYPASSRLS rather than superuser is the point: auditor_sys can read across
 -- tenants but cannot create objects, cannot read other databases, and holds only
 -- the DML grants issued below.
--- Passwords come from the environment, never from this file. Both compose (via
--- the postgres service env) and CI must export APP_DB_PASSWORD and
--- SYS_DB_PASSWORD or this script stops here on purpose.
+-- THE TWO `CREATE ROLE` STATEMENTS ARE NOT IN THIS FILE. They live in
+-- `infra/00-bootstrap-roles.sql`, which runs FIRST — read that file's header
+-- before changing either one.
 --
--- \getenv, not `printf '%s' "$APP_DB_PASSWORD"`. The backquote form makes psql
--- run a SHELL, and inside double quotes the shell still expands $(...) and
--- backticks — so a password containing either would have been executed as a
--- command during database init. \getenv (psql 14+, and the postgres:16 image
--- ships psql 16) reads the variable directly with no shell involved.
+-- Moved out 2026-09-06 because they could not be expressed in SQL. Passwords come
+-- from the environment, never from a file, and psql's `\getenv` is the only way to
+-- read one without handing it to a shell. `\set`, `\getenv` and `:'app_pw'` are
+-- psql CLIENT constructs; `services/api/sqlc.yaml` points `schema:` at THIS file,
+-- so sqlc parsed them with the PostgreSQL parser and failed — and `sqlc compile`
+-- runs before `go test` in the Go job, so nothing downstream of it ever ran,
+-- including the whole DATABASE_URL_TEST suite. Keeping the credential bootstrap
+-- in a psql-only file and this file pure SQL fixes that without weakening the
+-- injection control. `scripts/check_bootstrap_split.py` fails if a psql
+-- meta-command or a `:'var'` interpolation reappears here, and also if the
+-- bootstrap file stops using `\getenv`.
 --
--- The two \set lines are not redundant: \getenv leaves the psql variable
--- UNCHANGED when the environment variable is absent, so without a defined
--- default, :'app_pw' would be emitted literally and fail with a syntax error
--- instead of the actionable message the DO block below raises.
-\set app_pw ''
-\set sys_pw ''
-\getenv app_pw APP_DB_PASSWORD
-\getenv sys_pw SYS_DB_PASSWORD
-SELECT set_config('auditor.bootstrap_app_pw', :'app_pw', false);
-SELECT set_config('auditor.bootstrap_sys_pw', :'sys_pw', false);
+-- What still lives here, and depends on those roles already existing: the GRANT
+-- block immediately below, and the final self-check that RAISEs if auditor_app is
+-- missing or is superuser/BYPASSRLS.
 
-DO $bootstrap$
-DECLARE
-    app_pw text := current_setting('auditor.bootstrap_app_pw', true);
-    sys_pw text := current_setting('auditor.bootstrap_sys_pw', true);
-BEGIN
-    IF app_pw IS NULL OR length(app_pw) < 16 THEN
-        RAISE EXCEPTION 'APP_DB_PASSWORD is unset or shorter than 16 chars. '
-            'Set it in .env (see .env.example) and re-create the postgres volume; '
-            'the api connects as auditor_app and RLS depends on it.';
-    END IF;
-    IF sys_pw IS NULL OR length(sys_pw) < 16 THEN
-        RAISE EXCEPTION 'SYS_DB_PASSWORD is unset or shorter than 16 chars. '
-            'Set it in .env (see .env.example); auth and the background workers '
-            'connect as auditor_sys.';
-    END IF;
-    IF app_pw = sys_pw THEN
-        RAISE EXCEPTION 'APP_DB_PASSWORD and SYS_DB_PASSWORD must differ; they '
-            'are the RLS-enforced and RLS-bypassing credentials respectively.';
-    END IF;
-
-    -- format(%L) quotes and escapes; the literal never appears in this file.
-    EXECUTE format(
-        'CREATE ROLE auditor_app LOGIN PASSWORD %L '
-        'NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT', app_pw);
-    EXECUTE format(
-        'CREATE ROLE auditor_sys LOGIN PASSWORD %L '
-        'NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS NOINHERIT', sys_pw);
-END
-$bootstrap$;
-
--- Scrub the passwords out of the session before anything else runs.
-SELECT set_config('auditor.bootstrap_app_pw', '', false);
-SELECT set_config('auditor.bootstrap_sys_pw', '', false);
 -- ----- PRIVILEGES -----
 -- Least privilege: DML only. No CREATE, no TRUNCATE, no ownership. Test suites
 -- that need TRUNCATE (middleware/security_test.go:86) must connect as the owner
