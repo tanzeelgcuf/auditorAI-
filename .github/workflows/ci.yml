@@ -288,6 +288,59 @@ jobs:
       - name: Check audit source-IP wiring
         run: python3 scripts/check_audit_ip_arity.py --verbose
 
+      # RLS write priming. Every statement against an RLS table must run on a
+      # connection RLSInjector or AcquireScoped primed with app.current_firm and
+      # app.assigned_books. The failure mode is NOT the intuitive one: init.sql's
+      # policies call current_setting(...) with no missing_ok and cast the result
+      # straight to uuid / uuid[] (33 of the 35 calls in the schema; the only
+      # 2-argument ones are the bootstrap password lookups), so an unprimed
+      # statement RAISES — 42704 undefined_object when the GUC was never set on
+      # that physical connection, 22P02 invalid_text_representation on ''::uuid
+      # once ReleaseRLSConn has RESET it. It does not filter, and it does not
+      # return zero rows. Earlier comments in this repo claimed the zero-rows
+      # outcome; they were wrong and were corrected, not left standing.
+      #
+      # THE SHAPE THAT HID IT, in eleven places across seven files:
+      #
+      #     c := middleware.GetConn(ctx)
+      #     if c == nil { c, _ = s.db.Acquire(ctx) }   // looks handled
+      #
+      # Acquire() succeeds, so the branch reads as defensive while handing back
+      # the exact value the nil check existed to reject. Fabricating a substitute
+      # for a value you could not resolve is worse than failing, because the
+      # failure moves somewhere that cannot explain it.
+      #
+      # THREE HALVES, because each one has a blind spot the others cover:
+      #   * negative — resolves the receiver of every .Exec/.Query/.QueryRow/
+      #     .Begin whose SQL touches an RLS table, and fails on a bare pool not
+      #     in ALLOWLIST. Keyed per-RECEIVER, not per-file: billing.go holds both
+      #     s.sysDB (BYPASSRLS, correct) and s.db (app pool), so a file-level
+      #     excusal would hide exactly the writes this guard exists to catch.
+      #   * positive — pins all 8 fixed sites by name, so reverting one fails even
+      #     if the search patterns stop matching.
+      #   * fabrication — flags `<pool>.Acquire(` by shape. This half was added
+      #     after mutant M1 showed the negative half could not see a reverted
+      #     fix: the enclosing function still contains middleware.GetConn(, so
+      #     the receiver still classified as primed. Within minutes of being
+      #     added it found FIVE unflagged instances (mcp.go x4, review.go x1) on
+      #     the RLS-enforced app pool, in files three prior sweeps of this same
+      #     bug class had passed over. Its verdict on those files was identical
+      #     before and after the fix, which is the direct evidence that receiver
+      #     classification alone is not enough.
+      #
+      # Zero matches must FAIL, never quietly succeed: fewer than 20 RLS tables,
+      # fewer than 40 matched statements, no primed receiver at all, or zero
+      # .Acquire( calls all exit 2 rather than printing OK.
+      #
+      # 9 mutants + 2 inertness breakages were run before this was added here,
+      # each from a pristine copy so no result is contaminated by the previous
+      # mutation, and each required to name ITS OWN site and no other pinned file
+      # — including one brand-new fabrication planted in findings.go, a file with
+      # no pin, which the positive half cannot possibly catch. Reproduce with:
+      #     python3 scripts/mutate_rls_guard.py
+      - name: Check RLS write priming
+        run: python3 scripts/check_rls_write_priming.py --verbose
+
   # services/agent-runtime has four test modules (tests/test_extract.py,
   # test_link.py, test_mcp_client.py, test_pilot_fixtures.py) and
   # requirements.txt already pins pytest and pytest-asyncio — but nothing in CI
