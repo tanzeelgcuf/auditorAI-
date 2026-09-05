@@ -207,10 +207,54 @@ Session reports live at the workspace root next to the repo:
     `middleware.DB(ctx, db)` **by name**, because reverting that one-line fix
     was tested against every other guard in the repo and produced exit 0
     everywhere. `sysPool` callers (`auth.go` ×8, `webhooks.go` ×3) are correct
-    by design — they must see across firms — and the ~9 remaining suspect
-    app-pool handler sites are listed in `SOC2_READINESS.md` roadmap item 9.
+    by design — they must see across firms. The "~9 remaining suspect app-pool
+    sites" this paragraph used to point at are closed as of 2026-09-05: the
+    honest final count is **eleven sites across seven files**, and
+    `check_rls_write_priming.py` now covers the class in all three directions.
     Before adding any statement against an RLS table, answer two questions:
     which pool does it run on, and is its error returned?
+
+15. **Detect this class by SHAPE, not by receiver name — and never let a
+    fallback fabricate the value the nil check exists to reject.** The
+    anti-pattern is
+
+    ```go
+    c := middleware.GetConn(ctx)
+    if c == nil { c2, err := s.db.Acquire(ctx); ...; c = c2 }
+    ```
+
+    `Acquire()` succeeds, so the branch looks handled while returning an
+    **unprimed** connection — the one value the nil check was written to
+    reject — from the same RLS-enforced pool whose policies it then has to
+    satisfy. Fail closed instead: log, 500, return.
+
+    The load-bearing lesson is about the guard, not the code. A checker that
+    classifies a statement by walking outward to the enclosing function and
+    asking "is `middleware.GetConn(` in scope?" **cannot see this**, because the
+    defective code mentions `GetConn` too. Measured, not reasoned: run against a
+    scratch copy of the pre-fix tree the receiver half reported **108 primed
+    receivers**, and against the fixed tree it reports **108** — identical before
+    and after. It had no opinion at all about five real defects in `mcp.go` ×4
+    and `review.go` ×1, all five on the RLS-enforced pool
+    (`main.go:241`, `main.go:219`). Matching `<receiver>.Acquire(` by shape, with
+    a **per-receiver** allowlist, is strictly stronger: it is the only half that
+    catches a brand-new instance in a file no pin covers.
+
+    Corollary, now seen four times: **a pool field that existed only to feed a
+    fallback becomes write-only the moment the fallback fails closed.** Delete
+    the field and its `SetDB`, and if a pre-scope function genuinely needs
+    `sysPool`, make that an explicit parameter rather than a second field
+    (`settings.AuthAPIKey`, `push.SendFindingAlert`). Deleted from `settings`,
+    `push` and `mcp`; `tenant` and `review` keep theirs for other real uses.
+
+    Corollary, seen once and worth naming: **a test whose mechanism depends on
+    the code you are deleting can keep passing while its premise evaporates.**
+    `mcp_test.go`'s acceptance test used the nil-pool panic from `s.db.Acquire`
+    as its evidence, recovered it, and asserted only "not 400". Deleting `s.db`
+    deleted the panic; the test stayed green and its comment stayed false.
+    Assert the positive observation — the 500 and its `"no db conn"` detail — so
+    that "the request stopped at the resolution point" is checked rather than
+    inferred from the absence of a 400.
 
 ## Group disposition
 
@@ -569,7 +613,7 @@ Per-language gates, stated accurately:
 - **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists.
 - **Docker**: builds all 6 images with the same context/`-f` split as `infra/docker-compose.yml`, asserts binaries and the decision graph are actually inside the images, and `docker compose config -q` on both compose files.
 
-Five **static guards** — they exist because each proves something about code that
+Six **static guards** — they exist because each proves something about code that
 no test executes, and each was verified in both directions (clean on the current
 tree, red when the original bug is reintroduced) before being wired in:
 
@@ -580,6 +624,11 @@ tree, red when the original bug is reintroduced) before being wired in:
 | `scripts/check_cancellable_audit_writes.py` | Schema Drift Guard | rule 12 — an audit/security write on a request context whose error is only logged, plus a positive check that the four known fixes still carry `context.WithoutCancel` |
 | `scripts/check_audit_ip_arity.py` | Schema Drift Guard | rule 13 and rule 14 — `source_ip` dropped from an audit INSERT, a column/placeholder/argument arity mismatch, two same-type columns **transposed** (which raises nothing and writes a confidently wrong row), a select list longer than its Scan list, `SourceIP` mounted above `RealIP` or unmounted, and either audit writer reverted from `middleware.DB(ctx, db)` to the raw pool. 11 plausible mutants were run against it, 11 caught, each by its own invariant. |
 | `scripts/check_amount_parity.py` | python | the Rust money parser and its Python mirror disagreeing (they once read `"1250"` as $1,250.00 and $12.50) |
+| `scripts/check_rls_write_priming.py` | Schema Drift Guard | rule 14 and rule 15 — three halves. **Negative**: every `.Exec/.Query/.QueryRow/.Begin` whose SQL names one of the 31 RLS tables, classified by receiver, red on a bare pool. **Positive**: 8 files pinned by name, `must`/`must_not`, pin bodies comment-stripped first or a pin matches the prose describing the bug it forbids. **Fabrication**: `<receiver>.Acquire(` by shape with a per-receiver allowlist — 4 calls in the tree, 4 accounted for. Four **inertness gates** exit **2**, not 1: zero RLS tables parsed, zero statements matched, zero `Acquire` calls found, or a pinned file missing. 9 mutants + 2 inertness breakages run via `scripts/mutate_rls_guard.py`: **9/9 caught and correctly attributed**, both breakages REFUSED. |
+
+Current reading, REAL EXIT read directly (not through a pipe): `144 statements
+against 31 RLS tables, none on an unaccounted bare pool; 4 .Acquire( calls, all
+accounted for; all 8 pinned fixes in place.`
 
 Every one of these fails by **name** as well as by pattern — the positive half
 means silently reverting a fix goes red, which is not hypothetical: reverting
@@ -593,7 +642,7 @@ Lint rules that bite in non-obvious ways:
 - That deny reaches into `#[cfg(test)]` modules and CI passes `--all-targets`, so the 64 test-module unwraps were deny-level errors. Both crates now ship a `clippy.toml` with `allow-unwrap-in-tests` / `allow-expect-in-tests`. Do not "simplify" those files away.
 - `cargo fmt --check` rejects tabs, trailing whitespace, and over-width **code** lines (rustfmt leaves comments alone, and does not split string literals).
 - `clippy -D warnings` rejects `format!` with no arguments (`useless_format`).
-- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts three guards.
+- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts **five** guards (schema drift, storage-key orphans, cancellable audit writes, audit IP arity, RLS write priming).
 
 ## What is NOT true (read this before repeating a claim from this file)
 
@@ -605,6 +654,8 @@ false:
 - ~~"`pnpm test`"~~ — `grep -rn pnpm .github/workflows/ apps/web/package.json` returns nothing. The web job uses `npm ci`, and `apps/web/package.json` declares only `dev`, `build`, `start`, `lint` — **there is no web test script to run.** The web app has zero automated tests; lint + `tsc --noEmit` + a successful build is its entire gate.
 - ~~"100% branch coverage on verification"~~ — **no Rust coverage gate exists.** The only coverage step in the whole file is `codecov/codecov-action@v4` at line 100, inside the Go job, with no threshold set. `grep -rn 'tarpaulin\|llvm-cov\|grcov'` returns nothing. Treat this as an aspiration, not a gate.
 - ~~"there is no `DATABASE_URL_TEST` suite"~~ — withdrawn 2026-09-05. Repeated across several sessions and wrong. The harness exists: `internal/middleware/security_test.go`, `internal/pipeline/verify_worker_test.go`, `internal/auth/login_lockout_test.go` and `internal/billing/billing_test.go` all gate on `DATABASE_URL_TEST` and `t.Skip` when it is unset, and CI supplies a `postgres:16` service container with four DSNs at `ci.yml:104-107` (`DATABASE_URL` and `DATABASE_URL_TEST` as `auditor_app`, `SYS_DATABASE_URL` as `auditor_sys`, `DATABASE_URL_TEST_OWNER` as the owner). What is actually missing is the specific **cases** — lockout ordering, an `access_log` row landing with a non-NULL `source_ip`, a `config_change_log` row landing at all, `verify_worker`'s downgrade — and the fact that **no run has ever happened.** State the narrow gap, not the wide one.
+- ~~"an unprimed read against an RLS table returns **zero rows** with a 200"~~ — withdrawn 2026-09-05, and it mattered because the wrong version made the class look like a reporting nuisance. It **raises**. OBSERVED in `infra/init.sql`: 33 of the 35 `current_setting()` calls take no `missing_ok` and every one is cast to `uuid` or `uuid[]`; the only 2-argument calls are the bootstrap password lookups at `:868-869`. An unprimed statement therefore fails with **42704 undefined_object**, or **22P02 invalid_text_representation** on `''::uuid` for a connection recycled after `RESET`. Zero-rows-with-a-200 was also the reason an earlier note recorded the class as four instances in two files; the real count is eleven across seven files.
+- ~~"`check_rls_write_priming.py` covers rule 14"~~ — true only after 2026-09-05. Its receiver-classification half **passed all five defects in `mcp.go` and `review.go`** and would still pass a revert of any of them, because the defective shape mentions `middleware.GetConn(` and so classifies as primed. Evidence, not inference: the same half reported **108 primed receivers on the pre-fix scratch tree and 108 on the fixed tree.** Any claim that a guard "covers" a class should name which half of it does the covering, and what that half is blind to.
 - ~~"`FORCE ROW LEVEL SECURITY` is applied to none of the RLS tables"~~ — never committed to this file, but I derived it on 2026-09-05 and nearly reported it as a finding. `grep -nE 'ALTER TABLE \w+ FORCE ROW LEVEL SECURITY' infra/init.sql` returns **nothing**, which reads as absence and would resurrect audit finding #1 (owner bypasses RLS). FORCE *is* applied: `init.sql:880-905` is a `DO` block that selects every table where `relrowsecurity` is set and `relforcerowsecurity` is not, then `EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', t)`. Dynamic, so no static grep for the literal statement can find it, and it self-heals for future tables that get ENABLE without FORCE. **The general rule: a grep returning zero is not evidence of absence when the statement can be generated at runtime.** The only real check is `relforcerowsecurity` in a live catalogue query, which needs the database this environment does not have.
 
 **Nothing in this repo has been compiled or executed in the sessions that wrote
@@ -630,6 +681,16 @@ upgrades them by repetition:
   about the Go runtime. Precedent for why that distinction matters: the first
   draft of the lockout test asserted a 24-hour ceiling of "40–60 attempts" when
   the measured figure was 64.
+- **`/mcp/tools/*` is primed today, so the fallback removed in rule 15 was latent
+  rather than a live outage.** That group is mounted with no `RLSInjector`, which
+  is what first looked like a dead surface. The chain that primes it anyway:
+  routes at `main.go:519-522` sit under `InternalAuth(pool, sysPool)` at
+  `main.go:511`, which calls `AcquireScoped` at `internal_auth.go:110`, which
+  stores the primed connection under `connKey` at `middleware.go:200`, which is
+  what `GetConn` reads at `middleware.go:262`. REASONED from those five line
+  references; **not executed.** Had it been wrong in either direction the
+  conclusion flips — a live outage on all four MCP tools if `GetConn` is nil, or
+  a cross-firm read if `Acquire` had ever been reached.
 - **Every ✅ in `SOC2_READINESS.md`** rests on source reading, non-DB unit tests
   and the static guards above. That combination has caught real defects — the
   header bypass, the cancellable writes, the unprimed-pool INSERT — and is still
