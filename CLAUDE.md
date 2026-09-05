@@ -256,6 +256,56 @@ Session reports live at the workspace root next to the repo:
     that "the request stopped at the resolution point" is checked rather than
     inferred from the absence of a 400.
 
+16. **Magnitude is not side, and this repo cannot tell you which side is
+    which.** Both tiers compare money on `abs()` — `_amounts_match`
+    (`graph/link.py`) and all three pairs in `compute_three_way_variance`
+    (`decimal_math/mod.rs`). A leg of the right SIZE on the wrong SIDE is
+    therefore variance 0 → `is_exact` True → confidence 1.0 → auto-linked with
+    no human, and `exceeds_tolerance` false in Rust as well. A wrong-side
+    posting, and a refund matched to the charge it reverses, both arrive as
+    clean reconciliations.
+
+    Keep the `abs()`. It is right for a reason stronger than the convention
+    argument that used to justify it: **the sign is not decidable there.**
+    Measured 2026-09-06 — `services/ingestion/test_fixtures/*`, the only data
+    in this repo from real file formats, parse to legs that are sign-for-sign
+    IDENTICAL (invoice, bank and gl all `[150000, 25000, 8999, -50000, 320000,
+    120000, 47550, 199999, 64275, 87500]`), because the fixture builder aligns
+    them on purpose: OFX reports a refund as a positive CREDIT while the
+    invoice and GL report it as a negative. Sign encodes charge-vs-refund
+    there, not side. A gate enforcing the other convention **fails 10 of 77
+    tests, including the real-fixture one.** That is not a gate finding bugs,
+    it is a gate encoding a guess.
+
+    Enumerating three non-zero legs up to a global flip leaves exactly one
+    pattern no convention here permits — invoice and bank agreeing in sign
+    while **GL alone** sits on the other side. `(+,+,+)` is the fixtures'
+    convention, `(+,-,+)` the prose one, `(+,-,-)` a by-the-book bank rec
+    whose GL leg is the CASH line rather than the expense line; which one a
+    firm uses is a fact about its chart of accounts. So `_sign_pattern_ok`
+    asserts that single pattern and asserts **nothing** when invoice and bank
+    disagree, on 2-leg groups, or on a leg netting to zero (rule 10).
+    Downgrade-only per rule 9, and a FLAG read in the `elif` rather than an
+    `and sign_ok` conjunct — `is_exact` pins amount_score at 1.0, so a group
+    with no date or counterparty signal scores exactly `0.500` against a
+    `review_floor` of `0.500`; a bare conjunct drops the class out of BOTH
+    queues, which is worse than the bug, because an unmatched entity reads as
+    "nothing to reconcile here".
+
+    Do **not** make `_amounts_match` sign-aware to fix this. Python would then
+    withhold candidates Rust would reconcile — the 139/600 tier disagreement
+    inverted and invisible, since a suppressed candidate leaves no row
+    anywhere. Ask the sign question once, at routing.
+
+    The generalisation, which is the part worth carrying: **a comment
+    asserting a domain convention is a claim, and two of them here were
+    false.** `_score_group` comment #1 and `compute_three_way_variance`'s both
+    stated "a billed invoice +, its bank debit -, its GL credit +" as settled
+    fact, and both had been quoted as evidence. When a rule rests on one
+    measurement, guard the measurement too —
+    `test_fixtures_are_still_sign_aligned` goes red if the fixtures are
+    re-signed, instead of the comment quietly becoming wrong.
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
@@ -270,7 +320,7 @@ over tolerance by Rust's own arithmetic.**
 | `pipeline/verify_worker.go` | Success path wrote the finding and stopped; `review.go:71` selects the queue on `status`, so the group never appeared in it. |
 | `link.py is_exact` | Compared each leg against `present_totals[0]` only — a **star**. Two legs one tolerance off the invoice in opposite directions are 2× tolerance apart and passed. Rust takes the **max of all three pairwise** variances. |
 | `link.py` presence | `total != 0`, so a zero-net invoice leg was invisible and the group auto-linked on the other two. |
-| `link.py _score_group` | `abs(vi - vj)` on **signed** totals. 3-way groups carry opposite signs by convention, so `amount_score` clamped to 0.0, the path collapsed to `0.2·date + 0.3·cp`, and a near-miss landed exactly on `review_floor` — a fuzzy counterparty then routed a real discrepancy to **neither queue**. |
+| `link.py _score_group` | `abs(vi - vj)` on **signed** totals, so any group whose legs are recorded on opposite sides had `amount_score` clamped to 0.0, the path collapsed to `0.2·date + 0.3·cp`, and a near-miss landed exactly on `review_floor` — a fuzzy counterparty then routed a real discrepancy to **neither queue**. (The fix is right; the *reason* originally written here — "3-way groups carry opposite signs by convention" — was retired 2026-09-06. See rule 16: the sign is not decidable there, which is a stronger justification for the same `abs()`.) |
 | `mcp.go HandleCreateEntityLink` | Took `req.Status` from the caller. A group created `'confirmed'` is immune to the downgrade *because* that UPDATE is guarded on `auto_linked`. |
 | `graph_def.py _verify_node` | Never sent the presence flags (so every leg arrived absent and no group could be flagged), never applied the result, and left the group `auto_linked` on exception. **Unreachable in production** — `main.py:212` passes no `verification_client` — fixed and pinned anyway. |
 | `infra/init.sql` | `status DEFAULT 'auto_linked'`. A default disposition must mean "nobody decided". Now `'needs_review'`. |
@@ -281,11 +331,16 @@ gap at confidence 1.0. That is why this class is worse than a low-confidence
 mismatch — it is silent and it grows with a customer-configurable number.
 
 Tests: `services/agent-runtime/tests/test_link_tolerance.py` (8),
-`tests/test_verify_node.py` (10), `internal/mcp/mcp_test.go`,
+`tests/test_verify_node.py` (10), `tests/test_link_sign.py` (11, rule 16 — 3
+behavioural and 8 *declared* guards; read its header for the per-test
+non-vacuity attribution), `internal/mcp/mcp_test.go`,
 `internal/pipeline/verify_worker_test.go`. Read the last one's header before
 trusting it — it asserts on source **text**, because a `jetstream.Msg` cannot be
 built outside a live connection, and the behavioural equivalent belongs in the
-`DATABASE_URL_TEST` suite and does not exist yet.
+`DATABASE_URL_TEST` suite and does not exist yet. The whole Python suite is
+**88 passed, 0 failed, 0 skipped-unsupported** as of 2026-09-06 under the
+stdlib pyshim; `pytest tests -q` collects the directory, so a new
+`tests/test_*.py` needs no CI change.
 
 ## Client IP and rate limits
 
@@ -657,6 +712,8 @@ false:
 - ~~"an unprimed read against an RLS table returns **zero rows** with a 200"~~ — withdrawn 2026-09-05, and it mattered because the wrong version made the class look like a reporting nuisance. It **raises**. OBSERVED in `infra/init.sql`: 33 of the 35 `current_setting()` calls take no `missing_ok` and every one is cast to `uuid` or `uuid[]`; the only 2-argument calls are the bootstrap password lookups at `:868-869`. An unprimed statement therefore fails with **42704 undefined_object**, or **22P02 invalid_text_representation** on `''::uuid` for a connection recycled after `RESET`. Zero-rows-with-a-200 was also the reason an earlier note recorded the class as four instances in two files; the real count is eleven across seven files.
 - ~~"`check_rls_write_priming.py` covers rule 14"~~ — true only after 2026-09-05. Its receiver-classification half **passed all five defects in `mcp.go` and `review.go`** and would still pass a revert of any of them, because the defective shape mentions `middleware.GetConn(` and so classifies as primed. Evidence, not inference: the same half reported **108 primed receivers on the pre-fix scratch tree and 108 on the fixed tree.** Any claim that a guard "covers" a class should name which half of it does the covering, and what that half is blind to.
 - ~~"`FORCE ROW LEVEL SECURITY` is applied to none of the RLS tables"~~ — never committed to this file, but I derived it on 2026-09-05 and nearly reported it as a finding. `grep -nE 'ALTER TABLE \w+ FORCE ROW LEVEL SECURITY' infra/init.sql` returns **nothing**, which reads as absence and would resurrect audit finding #1 (owner bypasses RLS). FORCE *is* applied: `init.sql:880-905` is a `DO` block that selects every table where `relrowsecurity` is set and `relforcerowsecurity` is not, then `EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', t)`. Dynamic, so no static grep for the literal statement can find it, and it self-heals for future tables that get ENABLE without FORCE. **The general rule: a grep returning zero is not evidence of absence when the statement can be generated at runtime.** The only real check is `relforcerowsecurity` in a live catalogue query, which needs the database this environment does not have.
+- ~~"a legitimate 3-way group carries opposite signs by convention — a billed invoice +, its bank debit -, its GL credit +"~~ — retired 2026-09-06, and it had been sitting in **two** places as the stated justification for taking `abs()`: `_score_group` comment #1 in `graph/link.py` and the comment above the three comparisons in `compute_three_way_variance`. It is *one* of at least two conventions live in this product and **not** the one the repo's own fixtures use. OBSERVED: `services/ingestion/test_fixtures/*` parsed into legs give invoice, bank and gl sign-for-sign identical, and a gate enforcing the invoice↔bank-opposite rule **fails 10 of 77 tests including `test_sample_invoice_bank_ofx_produces_valid_reconciliation_group`**. Whether the `gl` leg is the expense/revenue line (same sign as the invoice) or the CASH line (same sign as the bank) is a fact about the customer's chart of accounts and is not knowable from this codebase. The `abs()` calls are correct, for the stronger reason in rule 16; the convention claim is not. **Nothing in this repo establishes a sign convention — if a session needs one, it has to come from the pilot firm's actual books.**
+- ~~"the 139/600 over-tolerance auto-links were a sign-handling bug"~~ — never in this file, but it is an easy inference from the two findings sitting next to each other, and it is wrong. 139/600 belongs to the **star-vs-all-pairs `is_exact`** defect (see Group disposition above), confirmed verbatim in `link.py`'s own comment; that measurement was taken before `_amounts_match` was ever examined for sign. The wrong-side class has **no** measured incidence figure — the fixtures cannot produce one, because they are sign-aligned by construction. Do not attach the 139 to it.
 
 **Nothing in this repo has been compiled or executed in the sessions that wrote
 most of it.** `cargo`, `rustc`, `go`, `gofmt`, `psql` and `docker` are all absent
@@ -702,6 +759,9 @@ upgrades them by repetition:
 - **A test that also passes against the pre-fix code proves nothing.** Method used on 2026-09-04: `git archive HEAD` into a scratch tree, copy the new tests in, re-run. 18 new tests → 12 fail there, and the 6 that pass on both sides are over-correction guards. One test was caught this way *after* it was written and looked green: `test_zero_net_invoice_leg_is_compared_not_ignored` passed on both trees, because `build_candidate_groups` never admits a `50000` invoice into a group whose bank leg is `-89900`, so the assertion loop never ran. Rewritten to call `score_and_route` directly.
 - Before calling something a model/tool limitation, run an isolation test that changes one variable and confirms the result changes. The regression test for the graph bug is exactly this shape: same input, two graphs differing only in thresholds, asserted to produce **different** severities.
 - When you fix one instance of a bug class, sweep for the others before closing it. Every guard in the table above found a second or third instance after the first.
+- **Read the pre-fix run by ATTRIBUTION, not by count, and declare which tests are guards before running it.** `3 passed / 8 failed` is not a result on its own: on `test_link_sign.py`'s pre-fix tree, 3 of the 8 failures were the bug reproducing with the right message, 4 died on `AttributeError: 'ReconciliationGroup' object has no attribute 'sign_conflict'` and 1 on `ImportError`, and all three *declared* guards passed on both trees — which is the intended result, since a guard failing pre-fix means it is testing the fix rather than guarding against over-correction. State the split per test. Two mechanical requirements fall out of this: **import a new symbol lazily**, inside the one test that needs it, or the pre-fix tree collapses all N results into a single IMPORT ERROR and destroys the reading; and **give every assertion a message**, or a pre-fix failure arrives as a bare `AssertionError` you cannot attribute.
+- **`main()` that returns a status is not `main()` that exits.** `python3 -c "rt.main([...])"` printed `TOTAL: 10 passed, 1 failed` and `REAL EXIT=0` in the same breath. Wrap it: `sys.exit(rt.main([...]))`. And read the exit code of the command you care about — `${PIPESTATUS[0]}`, not `$?` after a pipe into `tail`.
+- **When a rule rests on a single measurement, guard the measurement.** A comment recording one can rot while every test stays green; `test_fixtures_are_still_sign_aligned` exists for exactly that, and goes red if the fixtures are re-signed rather than letting rule 16's justification quietly evaporate.
 - Report the literal command output, not a summary of what you expect it to say.
 
 ## Subagents
