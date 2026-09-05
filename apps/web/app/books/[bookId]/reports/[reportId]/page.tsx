@@ -54,11 +54,11 @@ export default function ReportViewerPage() {
       {isLoading ? (
         <div className="grid gap-6 lg:grid-cols-2">
           <StaggerContainer staggerChildren={0.04} staggerDelay={0.1}>
-            <SkeletonCard title description contentLines={2} />
-            <SkeletonCard title description contentLines={2} />
-            <SkeletonCard title description contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
           </StaggerContainer>
-          <SkeletonCard title description contentLines={8} />
+          <SkeletonCard showTitle showDescription contentLines={8} />
         </div>
       ) : (
         <div className="grid gap-6 lg:grid-cols-2">
