@@ -413,6 +413,33 @@ jobs:
       - name: Import check (entrypoint chain)
         working-directory: services/agent-runtime
         run: python -c "import ollama_adapter, mcp_client, graph.graph_def; print('entrypoint imports OK')"
+      # The pinned langgraph must actually be USABLE, not merely installed.
+      # graph_def.build_graph() wraps `from langgraph.graph import StateGraph`
+      # in try/except ImportError and falls back to _SequentialPipeline, whose
+      # own docstring says "for tests/CI" — so an absent or incompatible
+      # langgraph does not raise anywhere the suite can see it. The step above
+      # cannot see it either: the import is inside the function, not at module
+      # scope. Result: the 88 tests pass on the fallback and the real graph is
+      # never exercised, which is the "green suite that never ran the real path"
+      # shape this repo has been bitten by before.
+      #
+      # This asserts the compiled object is NOT the fallback. It is why the
+      # unresolvable `langgraph==0.1.0` pin is worth a CI check and not just a
+      # corrected version: pip failing was loud, but pip succeeding on a version
+      # whose API moved would be silent.
+      - name: Assert the real LangGraph is in use (not the fallback)
+        working-directory: services/agent-runtime
+        run: |
+          python - <<'PY'
+          from langgraph.graph import StateGraph, END  # must import at all
+          import langgraph
+          from graph.graph_def import build_graph, _SequentialPipeline
+          g = build_graph(object())
+          assert not isinstance(g, _SequentialPipeline), (
+              "build_graph fell back to _SequentialPipeline with langgraph "
+              "installed — the pin resolves but the API does not match")
+          print("langgraph", getattr(langgraph, "__version__", "?"), "->", type(g).__name__)
+          PY
       # Cross-language money-parser parity. services/ingestion (Rust) owns
       # parse_amount; services/agent-runtime/harness_amount_mirror.py mirrors it
       # for the offline harnesses. When those two last disagreed, "1250" meant
@@ -461,6 +488,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # NOT PINNED, and deliberately left that way in this commit rather than
+      # swapped for a tag nobody here could resolve. `@master` means every run
+      # fetches whatever is on that branch and executes it with this workflow's
+      # token — the standard third-party-action supply-chain exposure. It is also
+      # the only floating ref left in this file (checked: every other `uses:` is
+      # @vN). Pin it to a released tag, or better a commit SHA, from a machine
+      # that can reach github.com; do not guess a tag from an environment with no
+      # network, which is exactly how the OSV reference below got into this file.
       - name: Run Trivy (filesystem)
         uses: aquasecurity/trivy-action@master
         with:
@@ -479,12 +514,43 @@ jobs:
           config: p/default
           audit_on: push
           publish_token: ${{ secrets.SEMGREP_APP_TOKEN }}
-      - name: Run OSV-Scanner
-        uses: google/osv-scanner-action@v1
-        with:
-          scan-args: |-
-            --recursive
-            ./
+
+  # OSV-Scanner is a SEPARATE JOB now, and that is the fix — not a cosmetic
+  # reorganisation.
+  #
+  # It used to be the last step of "Security & License Scan":
+  #     - name: Run OSV-Scanner
+  #       uses: google/osv-scanner-action@v1
+  # which is not a valid step reference. Google ships the GitHub integration as
+  # REUSABLE WORKFLOWS (.github/workflows/osv-scanner-reusable.yml and
+  # osv-scanner-reusable-pr.yml) in that repository; there is no action.yml at
+  # its root. A reusable workflow is called with `uses:` at JOB level, never
+  # from inside `steps:` — so this failed while the workflow was being parsed,
+  # before any step ran, which is why Trivy and Semgrep produced no output
+  # either. Moving it out means a bad reference here can no longer take the two
+  # scans that do work with it.
+  #
+  # UNVERIFIED FROM THE ENVIRONMENT THIS WAS FIXED IN: the `@v2` ref cannot be
+  # resolved here (no network to GitHub), so what is proven is the SHAPE, not the
+  # tag. If the next run reports "invalid value workflow reference", the ref is
+  # the only thing wrong — pin the exact tag from that repository's releases and
+  # change nothing else. Do not resolve it by deleting the scan: Trivy's fs scan
+  # overlaps but is not a substitute (OSV resolves lockfiles per-ecosystem, which
+  # is how a vulnerable transitive Go or npm dependency gets seen at all).
+  #
+  # `actions: read` is required in addition to the obvious two — see
+  # google/osv-scanner issue #1090, where its absence fails the SARIF upload.
+  osv:
+    name: OSV-Scanner
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2
+    with:
+      scan-args: |-
+        --recursive
+        ./
 
   docker:
     name: Docker Build

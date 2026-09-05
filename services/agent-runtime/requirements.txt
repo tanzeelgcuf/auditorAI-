@@ -1,5 +1,23 @@
 # services/agent-runtime/requirements.txt
-langgraph==0.1.0
+#
+# langgraph WAS `==0.1.0`, and pip could never resolve it: that version was never
+# published (PyPI's 0.0.x series ends at 0.0.69 and the next release is 0.1.1).
+# The Python CI job died in `pip install -r requirements.txt`, so every one of
+# the 88 tests was reported as a failure of this line. Pre-existing — not
+# introduced by the 2026-09 hardening commits.
+#
+# Now a bounded range rather than a new exact pin, deliberately: an exact `==`
+# is what created the unresolvable state, and PyPI is unreachable from the
+# environment this was fixed in, so any specific patch number here would be an
+# assertion nobody could check. The upper bound is not decoration — build_graph()
+# uses the 0.1/0.2-era core surface (StateGraph over a TypedDict,
+# add_node/add_edge/set_entry_point/add_conditional_edges/compile, END) and
+# `set_entry_point` is deprecated in later majors, so an open `>=` would
+# eventually pull a release this graph is not written against.
+#
+# UNVERIFIED HERE: no PyPI access, so it is not proven that this range resolves.
+# The next real CI run is the check.
+langgraph>=0.2.0,<0.3.0
 anthropic>=0.30.0
 # REQUIRED AT STARTUP, and it was missing. main.py:163 imports ollama_adapter,
 # whose line 15 is `from openai import OpenAI` — the container connected to NATS
