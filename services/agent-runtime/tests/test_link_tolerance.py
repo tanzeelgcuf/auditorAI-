@@ -18,12 +18,25 @@
 #      build_candidate_groups will not itself propose that membership, so this
 #      one is reachable through the other group producers (mcp.go
 #      HandleCreateEntityLink, humanoverride split/merge), not through matching.
-#   3. _score_group's amount term used SIGNED subtraction, abs(vi - vj). Every
-#      legitimate 3-way group carries opposite signs by convention, so a
-#      near-miss group scored avg_variance ~= 1.33x max_amt, amount_score clamped
-#      to 0.0, and the non-exact path collapsed to 0.2*date + 0.3*cp <= 0.5 —
-#      landing on review_floor, where a slightly fuzzy counterparty dropped it
-#      below and routed a real discrepancy to NEITHER queue.
+#   3. _score_group's amount term used SIGNED subtraction, abs(vi - vj). Any
+#      group whose legs are recorded on opposite sides therefore scored
+#      avg_variance ~= 1.33x max_amt, amount_score clamped to 0.0, and the
+#      non-exact path collapsed to 0.2*date + 0.3*cp <= 0.5 — landing on
+#      review_floor, where a slightly fuzzy counterparty dropped it below and
+#      routed a real discrepancy to NEITHER queue.
+#
+#      CORRECTED 2026-09-06: this used to read "every legitimate 3-way group
+#      carries opposite signs by convention". It does not. That is ONE of at
+#      least two conventions live in this product, and not the one the repo's
+#      own fixtures use — services/ingestion/test_fixtures/* parse to legs that
+#      are sign-for-sign IDENTICAL, and a gate enforcing invoice<->bank-opposite
+#      fails 10 of 77 tests including the real-fixture one. See the block above
+#      _sign_pattern_ok in graph/link.py for the measurement and CLAUDE.md rule
+#      16. The FIX below is untouched and still right: abs() is correct because
+#      the sign is not decidable here under ANY convention, which is a stronger
+#      reason than the convention claim it replaces. What changes is only that
+#      the tests in this file which hand-build invoice +, bank -, GL + are
+#      exercising one possible convention, not "the" convention.
 #
 # Per docs 06 §2 + 09 §1. No network, no API key needed.
 
@@ -181,7 +194,8 @@ def test_zero_net_invoice_leg_is_compared_not_ignored():
 # ---- 3. the amount term compares magnitudes, and stays inside the queues ----
 
 def test_score_group_amount_term_uses_magnitudes():
-    """A 2c gap on an $899 invoice with opposite signs by convention. Signed
+    """A 2c gap on an $899 invoice whose legs sit on opposite sides (convention
+    A — one of the two live here; see the header's item 3 correction). Signed
     subtraction gave abs(89900 - (-89899)) = 179799 and clamped amount_score to
     0.0; magnitudes give 1c/2c gaps and a score just under 1.0."""
     config = BookConfig(id=BOOK_ID, tolerance_cents=1)

@@ -403,9 +403,16 @@ mod tests {
         assert_eq!(v, vec![dec!(100.00)]);
     }
 
-    // Prompt B regression: a bank debit (-) and its GL credit (+) are the same
-    // payment (sign is a side convention, doc 09 §1). |bank-gl| must compare
-    // absolute values, or every legit payment flags as a full-amount variance.
+    // Prompt B regression: under the side-encoded convention a bank debit (-)
+    // and its GL credit (+) are the same payment, so |bank-gl| must compare
+    // absolute values or every payment recorded that way flags as a
+    // full-amount variance. CORRECTED 2026-09-06: this used to justify itself
+    // with "sign is a side convention, doc 09 §1" — there is no doc 09 in this
+    // repository, and side-encoding is one of at least two conventions live in
+    // the product rather than the rule. The test is right either way: abs() is
+    // required because the convention is NOT KNOWABLE here, so a 2-leg group
+    // must reconcile whichever way its book records sides. See the block above
+    // compute_three_way_variance and CLAUDE.md rule 16.
     #[test]
     fn test_two_leg_opposite_signs_is_a_match() {
         let bank = [dec!(-150.00)];
