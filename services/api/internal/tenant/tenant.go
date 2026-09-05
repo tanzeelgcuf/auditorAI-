@@ -25,10 +25,47 @@ func (s *Service) SetDB(db *pgxpool.Pool) {
 	s.db = db
 }
 
+// primed returns the RLS-primed request connection, or false after logging and
+// writing a 500. It is the ONE resolution point for this package (rule 13);
+// before 2026-09-05 four handlers each hand-rolled `GetConn() ... else
+// s.db.Acquire()`, which is four independent answers to one question.
+//
+// Why there is no Acquire() fallback. Every table these handlers touch —
+// client_books (init.sql:588), user_book_assignments (:596),
+// data_encryption_keys (:721) — has ENABLE ROW LEVEL SECURITY, and the DO block
+// at init.sql:920 adds FORCE to every ENABLEd table. OBSERVED in init.sql: 33 of
+// the 35 current_setting() calls in this schema take no missing_ok argument, and
+// every one of those 33 is cast straight to uuid or to uuid[] via
+// string_to_array(...)::uuid[]; the only 2-argument calls are the two bootstrap
+// password lookups at :868-869. So on a connection this middleware never primed,
+// a policy predicate cannot evaluate to false — it raises, either 42704 for a GUC
+// that was never set in that session or 22P02 on ''::uuid for one that was RESET
+// by ReleaseRLSConn (middleware.go:218).
+//
+// That is a narrower and less dramatic claim than "the read silently returns zero
+// rows", which is what an earlier version of this comment and its two siblings
+// said. Zero-rows-with-a-200 is the outcome for a schema that compares
+// current_setting() as text; it is not the outcome for this one, because of the
+// casts. Corrected rather than left standing.
+//
+// OBSERVED: unreachable today. All ten tenant routes are mounted at depth 5
+// inside the group that does r.Use(middleware.RLSInjector(pool)) at main.go:386
+// (main.go:390-395 and 482-485), and tenantSvc.SetDB(pool) at main.go:159 passes
+// the RLS-enforced pool. No live incident — the trap is removed before it fires.
+func (s *Service) primed(w http.ResponseWriter, r *http.Request) (middleware.Querier, bool) {
+	if c := middleware.GetConn(r.Context()); c != nil {
+		return c, true
+	}
+	slog.Error("tenant: no RLS-primed connection; route is mounted outside the "+
+		"RLSInjector group and every statement here would raise",
+		"path", r.URL.Path, "method", r.Method)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	return nil, false
+}
+
 func (s *Service) HandleCreateBook(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.GetUserID(r.Context())
 	firmID := middleware.GetFirmID(r.Context())
-	role := middleware.GetRole(r.Context())
 	if userID == "" || firmID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
@@ -46,19 +83,9 @@ func (s *Service) HandleCreateBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := middleware.GetConn(r.Context())
-	var driver *pgxpool.Conn
-	if conn != nil {
-		driver = conn
-	} else {
-		c, err := s.db.Acquire(r.Context())
-		if err != nil {
-			slog.Error("failed to acquire connection", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		defer c.Release()
-		driver = c
+	driver, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	tx, err := driver.Begin(r.Context())
@@ -99,15 +126,13 @@ func (s *Service) HandleCreateBook(w http.ResponseWriter, r *http.Request) {
 	// ponytail: only the creating admin is assigned now; add when multi-admin firm setup is built
 
 	slog.Info("book created", "book_id", bookID, "firm_id", firmID, "user_id", userID)
-	if role == "firm_admin" {
-		writeJSON(w, http.StatusCreated, map[string]string{
-			"id": bookID, "client_name": req.ClientName,
-		})
-	} else {
-		writeJSON(w, http.StatusCreated, map[string]string{
-			"id": bookID, "client_name": req.ClientName,
-		})
-	}
+	// Both arms of the previous `if role == "firm_admin"` returned byte-identical
+	// bodies, which read as a role-dependent response that does not exist. Collapsed;
+	// no behaviour change. Only firm_admin can reach this route anyway (RequireRole on
+	// the /v1/admin group), so the branch could not have differentiated anything.
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id": bookID, "client_name": req.ClientName,
+	})
 }
 
 func (s *Service) HandleListBooks(w http.ResponseWriter, r *http.Request) {
@@ -124,44 +149,27 @@ func (s *Service) HandleListBooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use the RLS connection if available so app.current_firm filters apply
-	conn := middleware.GetConn(r.Context())
-	if conn != nil {
-		rows, err := conn.Query(r.Context(),
-			"SELECT id::text, client_name FROM client_books WHERE id = ANY($1)", assignedBooks)
-		if err != nil {
-			slog.Error("failed to list books", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		defer rows.Close()
-		var books []map[string]string
-		for rows.Next() {
-			var id, name string
-			if err := rows.Scan(&id, &name); err != nil {
-				slog.Error("failed to scan book row", "error", err)
-				continue
-			}
-			books = append(books, map[string]string{"id": id, "client_name": name})
-		}
-		if books == nil {
-			books = []map[string]string{}
-		}
-		writeJSON(w, http.StatusOK, books)
+	conn, ok := s.primed(w, r)
+	if !ok {
 		return
 	}
 
-	// Fallback: direct pool query via firm_id
-	rows, err := s.db.Query(r.Context(),
-		"SELECT id::text, client_name FROM client_books WHERE firm_id = $1 AND id = ANY($2)",
-		firmID, assignedBooks)
+	// No `WHERE firm_id = $1` here: client_books_firm_isolation (init.sql:589)
+	// already restricts the visible rows to the primed firm, and `id = ANY($1)`
+	// restricts them to this user's assignments. The removed fallback branch did
+	// carry an explicit firm_id predicate, which is what made it look safe — but
+	// it could never have run it, because the same policy raises on an unprimed
+	// connection before any predicate of ours is reached.
+	rows, err := conn.Query(r.Context(),
+		"SELECT id::text, client_name FROM client_books WHERE id = ANY($1)", assignedBooks)
 	if err != nil {
 		slog.Error("failed to list books", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 	defer rows.Close()
-	var books []map[string]string
+
+	books := []map[string]string{}
 	for rows.Next() {
 		var id, name string
 		if err := rows.Scan(&id, &name); err != nil {
@@ -170,8 +178,14 @@ func (s *Service) HandleListBooks(w http.ResponseWriter, r *http.Request) {
 		}
 		books = append(books, map[string]string{"id": id, "client_name": name})
 	}
-	if books == nil {
-		books = []map[string]string{}
+	// rows.Err() distinguishes "the firm has no books" from "the result set was
+	// truncated by a connection or decode failure". Without it a mid-stream error
+	// answered 200 with a short list, which for a book list is indistinguishable
+	// from the client having lost access to a book.
+	if err := rows.Err(); err != nil {
+		slog.Error("book list iteration failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
 	}
 	writeJSON(w, http.StatusOK, books)
 }
@@ -189,18 +203,14 @@ func (s *Service) HandleGetBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := middleware.GetConn(r.Context())
-	var clientName string
-	var err error
-
-	if conn != nil {
-		err = conn.QueryRow(r.Context(),
-			"SELECT client_name FROM client_books WHERE id = $1", bookID).Scan(&clientName)
-	} else {
-		err = s.db.QueryRow(r.Context(),
-			"SELECT client_name FROM client_books WHERE id = $1", bookID).Scan(&clientName)
+	conn, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
+	var clientName string
+	err := conn.QueryRow(r.Context(),
+		"SELECT client_name FROM client_books WHERE id = $1", bookID).Scan(&clientName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
@@ -239,17 +249,9 @@ func (s *Service) HandleUpdateBookSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	conn := middleware.GetConn(r.Context())
-	db := conn
-	if db == nil {
-		c, err := s.db.Acquire(r.Context())
-		if err != nil {
-			slog.Error("failed to acquire connection", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		defer c.Release()
-		db = c
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	// Build dynamic update — for simplicity update all settable fields if provided

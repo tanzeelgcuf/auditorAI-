@@ -38,13 +38,15 @@ const (
 	apiKeyPrefix = "aiaud_"
 )
 
-type Service struct {
-	db *pgxpool.Pool
-}
+// Service holds no pool. Every statement in this file runs on the RLS-primed
+// connection resolved by conn(), and the one pre-scope function (AuthAPIKey) takes
+// the pool it requires as an explicit sysDB parameter. The removed
+// `db *pgxpool.Pool` field plus SetDB became write-only the moment conn() stopped
+// falling back to s.db.Acquire(); keeping them would have left a field whose only
+// purpose was to make the wrong pool reachable again.
+type Service struct{}
 
 func NewService() *Service { return &Service{} }
-
-func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
 
 // ---- helpers ----
 
@@ -71,17 +73,54 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// conn returns the RLS-wired request connection, falling back to a dedicated
-// pool connection when the middleware did not provide one.
+// ErrNoPrimedConn means RLSInjector did not put a connection in the request
+// context. Every relation this file touches — chart_of_accounts,
+// counterparty_aliases, csv_column_mappings, api_keys, webhook_subscriptions —
+// has FORCE RLS, and every policy calls current_setting('app.…') with no
+// missing_ok against no database or role default.
+var ErrNoPrimedConn = errors.New("settings: no RLS-primed connection in request context")
+
+// conn returns the RLS-wired request connection, or an error.
+//
+// It used to fall back to s.db.Acquire(...) when the middleware provided no
+// connection. That fallback was worse than the raw pool it was standing in for,
+// because it LOOKED careful: an acquired-but-unprimed connection is a connection
+// with no app.current_firm, so every policy predicate here fails to evaluate at
+// all rather than evaluating to false.
+//
+// Precisely what it does, corrected 2026-09-05 — an earlier version of this
+// comment said the read "returns ZERO ROWS … 'Your chart of accounts is empty',
+// HTTP 200, nothing logged." That is the outcome for a schema that compares
+// current_setting() as text. It is NOT the outcome for this one. OBSERVED in
+// init.sql: 33 of 35 current_setting() calls take no missing_ok argument, and
+// every one of the 33 is cast immediately to uuid or to uuid[] via
+// string_to_array(...)::uuid[] — the only 2-argument calls are the bootstrap
+// password lookups at :868-869. So an unprimed statement raises: 42704
+// undefined_object when the GUC was never set on that physical connection, or
+// 22P02 invalid_text_representation on ''::uuid when ReleaseRLSConn
+// (middleware.go:218) has RESET it. Both are errors, not empty result sets. The
+// fallback is still a bug — a 500 whose log line blames the query — but it is a
+// loud one, and overstating it as a silent wrong answer is the kind of rounding-up
+// this project has been bitten by.
+//
+// OBSERVED, so the change is scoped honestly: the fallback is UNREACHABLE today.
+// Every route that reaches this helper is mounted at depth >= 3 inside the group
+// that does r.Use(middleware.RLSInjector(pool)) at main.go:386, and
+// settingsSvc.SetDB(pool) at main.go:226 is the RLS-enforced pool, not sysPool.
+// So this fixes no live incident. It removes a trap that fires the day one of
+// these routes is mounted one group out — and returns an error at the one place
+// that can still tell the difference, instead of 10 call sites that cannot.
+//
+// The same shape existed inline in push.go and four times in the tenant package;
+// all were fixed together.
 func (s *Service) conn(r *http.Request) (pgxQuerier, func(), error) {
 	if c := middleware.GetConn(r.Context()); c != nil {
 		return c, func() {}, nil
 	}
-	c, err := s.db.Acquire(r.Context())
-	if err != nil {
-		return nil, nil, err
-	}
-	return c, c.Release, nil
+	slog.Error("settings: no RLS-primed connection; route is mounted outside the "+
+		"RLSInjector group and every statement here would raise on the unset GUC",
+		"path", r.URL.Path, "method", r.Method)
+	return nil, nil, ErrNoPrimedConn
 }
 
 // pgxQuerier abstracts the connection types used for single-statement queries.
@@ -828,21 +867,58 @@ func (s *Service) HandleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "key revoked"})
 }
 
-// AuthAPIKey hashes a presented key and looks up a non-revoked match,
-// returning the owning firm_id. Intended for future programmatic access
-// (not yet wired to a route).
-func AuthAPIKey(ctx context.Context, db *pgxpool.Pool, key string) (string, error) {
+// AuthAPIKey hashes a presented key and looks up a non-revoked match, returning
+// the owning firm_id. Not yet wired to a route.
+//
+// THE POOL IS PART OF THE CONTRACT, which is why the parameter is named sysDB and
+// not db. api_keys carries RLS (api_keys_firm_isolation, init.sql:707) keyed on
+// current_setting('app.current_firm'), and this function's whole job is to
+// discover which firm the caller belongs to — so there cannot be a primed
+// connection yet. It must run on sysPool (auditor_sys, BYPASSRLS), the same
+// pre-scope position as authSvc (main.go:155) and InternalAuth's sysDB
+// (main.go:511). Handed the app pool it does not "see fewer rows": the policy
+// predicate raises, and the caller reads that as "invalid api key" for every key.
+//
+// Corrected 2026-09-05, and scoped honestly: this function has ZERO callers, so
+// nothing is broken in production today. It was pre-broken before first use —
+// the previous signature took an unlabelled `db *pgxpool.Pool` and discarded the
+// UPDATE's error with `_, _ =`, so the first route to wire it up would have
+// authenticated nobody while logging nothing.
+func AuthAPIKey(ctx context.Context, sysDB *pgxpool.Pool, key string) (string, error) {
+	// One resolution point for the hash — it was computed twice, and two
+	// computations of one identity is the shape rule 13 exists to prevent.
+	hash := HashKey(key)
+
 	var firmID string
-	err := db.QueryRow(ctx,
+	err := sysDB.QueryRow(ctx,
 		`SELECT firm_id::text FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
-		HashKey(key)).Scan(&firmID)
+		hash).Scan(&firmID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", errors.New("invalid api key")
 		}
 		return "", err
 	}
-	_, _ = db.Exec(ctx, `UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1`, HashKey(key))
+
+	// last_used_at is a best-effort touch, not part of the auth decision, so a
+	// failure here must not reject a valid key — but it must not be invisible
+	// either. `_, _ =` meant a permanently failing UPDATE (a dropped column, an
+	// RLS denial) looked exactly like success.
+	//
+	// context.WithoutCancel, for the reason check_cancellable_audit_writes
+	// exists: ctx belongs to the request, the request belongs to the API-key
+	// holder, and an Exec on an already-cancelled context never reaches the
+	// server. Without the strip, a caller who aborts immediately after
+	// authenticating leaves no record of having used the key, and the swallowed
+	// error above means nothing is logged either — the party being recorded can
+	// cancel their own record. Flagged by that guard when this function was
+	// rewritten, not reasoned about in advance.
+	touchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := sysDB.Exec(touchCtx,
+		`UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1`, hash); err != nil {
+		slog.Warn("failed to touch api_key last_used_at", "error", err)
+	}
 	return firmID, nil
 }
 

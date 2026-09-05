@@ -20,17 +20,13 @@ func (s *Service) HandleRotateKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := middleware.GetConn(r.Context())
-	db := conn
-	if db == nil {
-		c, err := s.db.Acquire(r.Context())
-		if err != nil {
-			slog.Error("failed to acquire connection", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		defer c.Release()
-		db = c
+	// s.primed, not GetConn-or-Acquire: data_encryption_keys carries RLS
+	// (init.sql:721-723) and dek_firm_isolation casts current_setting to uuid, so a
+	// connection this process never primed raises rather than filtering. See the
+	// comment on Service.primed in tenant.go for the observed reachability.
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	keyID := uuid.NewString()

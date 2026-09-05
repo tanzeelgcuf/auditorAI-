@@ -222,8 +222,12 @@ func main() {
 	periodsSvc := periods.NewService()
 	periodsSvc.SetDB(pool)
 
+	// settings takes no pool: every statement in it runs on the RLS-primed request
+	// connection, and its one pre-scope function (settings.AuthAPIKey, currently
+	// unwired) takes sysPool as an explicit parameter. The SetDB(pool) that used to
+	// be here fed a field that became write-only when conn() stopped falling back
+	// to Acquire().
 	settingsSvc := settings.NewService()
-	settingsSvc.SetDB(pool)
 	billingSvc.SetDB(pool)
 	// The Stripe webhook is a cross-firm actor with no JWT, so it cannot satisfy the
 	// `firms` RLS policy (init.sql:466 -> id = current_setting('app.current_firm')).
@@ -234,7 +238,12 @@ func main() {
 	// HandleCheckout keeps using the RLS-bound pool; only the webhook uses this one.
 	billingSvc.SetSysDB(sysPool)
 	mcpSvc := mcp.NewService()
-	mcpSvc.SetDB(pool)
+	// No mcpSvc.SetDB: the service holds no pool. All four /mcp/tools/* handlers
+	// run on the connection InternalAuth primed via AcquireScoped; the field this
+	// call used to set existed only to feed an Acquire() fallback, which returned
+	// an UNPRIMED connection from this same RLS-enforced pool and so could not
+	// have served any of the queries it was reached for.
+
 	if pipelineClient != nil {
 		mcpSvc.SetVerificationPublisher(pipelineClient)
 	}
@@ -255,8 +264,11 @@ func main() {
 	portalSvc.SetSysDB(sysPool)
 	portalSvc.SetAuth(authSvc)
 
+	// push takes no pool either, for the same reason, and for a second one: its
+	// background fan-out (push.SendFindingAlert) needs sysPool while its handler
+	// needs the primed request connection. One field could only ever have been right
+	// for one of them, and SetDB(pool) made it the wrong one for the fan-out.
 	pushSvc := push.NewService()
-	pushSvc.SetDB(pool)
 
 	humanSvc := humanoverride.NewService()
 	humanSvc.SetDB(pool)
