@@ -443,8 +443,11 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		"generated_at": time.Now().Format(time.RFC3339),
 		"finding_ids": findingIDs, "pdf_storage_key": pdfKey,
 	})
-	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
-		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
+		// The response below is already decided; this only means a retry of this
+		// request will regenerate the report instead of replaying it.
+		slog.Error("idempotency store failed", "error", err, "report_id", reportID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)

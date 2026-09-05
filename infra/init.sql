@@ -392,14 +392,32 @@ CREATE TABLE api_keys (
     revoked_at TIMESTAMPTZ
 );
 
+-- Idempotency cache. firm_id and client_book_id were added 2026-09-05 together with
+-- RLS below and with firm+book entering the hash in middleware/idempotency.go. All
+-- three had to move at once: a tenancy column nobody writes is decorative, a policy
+-- on a column that is always NULL denies everything, and a hash that omits the book
+-- lets one user replay book A's response against a book B request.
+--
+-- client_book_id is NULLable because idempotency is offered on routes that have no
+-- {bookId} segment; today both mounts are book-scoped, but a firm-level POST is a
+-- normal thing to add and must not be forced to invent a book.
+--
+-- ON DELETE CASCADE is deliberate and is the only CASCADE in this file. Every other
+-- FK here is RESTRICT-by-default because the rows it protects are records a tenant
+-- must not lose. These rows are a 24h cache with no evidentiary value, and without
+-- CASCADE a firm or book delete would fail on a FK violation for up to a day
+-- (billing_test.go:277 already does DELETE FROM firms).
 CREATE TABLE idempotency_keys (
     key_hash TEXT PRIMARY KEY,
+    firm_id UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    client_book_id UUID REFERENCES client_books(id) ON DELETE CASCADE,
     user_id UUID NOT NULL,
     response_status INTEGER NOT NULL,
     response_body JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_idempotency_keys_created ON idempotency_keys (created_at);
+CREATE INDEX idx_idempotency_keys_firm ON idempotency_keys (firm_id);
 
 CREATE TABLE webhook_subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -736,14 +754,29 @@ CREATE POLICY entity_tags_book_isolation ON entity_tags
         WHERE client_book_id = ANY(string_to_array(current_setting('app.assigned_books'), ',')::uuid[])
     ));
 
+-- Idempotency cache. Firm-scoped with an additional book test, because the table has
+-- both columns and a row is only ever legitimately read by the same (firm, book) that
+-- wrote it. The book clause mirrors bank_holidays_book_or_global: NULL client_book_id
+-- means the row came from a route with no {bookId}, and is scoped by firm alone.
+--
+-- This table was on the "deliberately not RLS-protected" list until 2026-09-05. The
+-- reason given there was accurate at the time and worth preserving: idempotency.go
+-- queried the RAW pool, and adding RLS to a table whose statements run unprimed does
+-- not protect it — it breaks it, because every policy below calls current_setting()
+-- with no missing_ok and there is no GUC default, so the statement raises or tests
+-- against '' and is denied. The pool fix (middleware.DB) landed first for that reason.
+ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
+CREATE POLICY idempotency_keys_firm_book_isolation ON idempotency_keys
+    USING (firm_id = current_setting('app.current_firm')::uuid
+           AND (client_book_id IS NULL
+                OR client_book_id = ANY(string_to_array(current_setting('app.assigned_books'), ',')::uuid[])));
+
 -- ----- DELIBERATELY NOT RLS-PROTECTED (documented, not overlooked) -----
 -- coa_templates: global chart-of-accounts templates, no tenant column. Read by
 --   templates.go:16,28 and settings.go:351,407.
--- idempotency_keys: keyed by key_hash = sha256(user_id || ':' || client key)
---   (middleware/idempotency.go:35), so a key from firm A cannot collide with
---   firm B's. It is also queried on the RAW pool (idempotency.go:41,102), which
---   has no tenant GUC set, so adding RLS here would break every retry-safe
---   request instead of protecting anything.
+--
+-- idempotency_keys was removed from this list on 2026-09-05; it now has firm_id,
+-- client_book_id and idempotency_keys_firm_book_isolation above.
 
 -- ===== INDEXES =====
 CREATE INDEX idx_source_documents_book ON source_documents(client_book_id);
@@ -962,13 +995,15 @@ BEGIN
         RAISE EXCEPTION 'RLS-enabled but unforced or policy-less: %', missing;
     END IF;
 
-    -- 3. The two intentional exemptions are still the ONLY ones. Any new table
-    --    that forgets RLS trips this instead of silently shipping unprotected.
+    -- 3. The one intentional exemption is still the ONLY one. Any new table that
+    --    forgets RLS trips this instead of silently shipping unprotected.
+    --    idempotency_keys was removed from this list on 2026-09-05 when it gained
+    --    firm_id, client_book_id and a policy.
     SELECT string_agg(c.relname, ', ' ORDER BY c.relname) INTO missing
     FROM pg_class c
     JOIN pg_namespace ns ON ns.oid = c.relnamespace
     WHERE ns.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity
-      AND c.relname NOT IN ('coa_templates', 'idempotency_keys');
+      AND c.relname NOT IN ('coa_templates');
     IF missing IS NOT NULL THEN
         RAISE EXCEPTION 'table(s) without RLS and not on the documented exemption '
             'list: %. Add a policy, or add it to the list here and say why.', missing;

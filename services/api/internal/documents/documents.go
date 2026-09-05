@@ -216,9 +216,12 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		"id": docID, "client_book_id": bookID, "filename": header.Filename,
 		"doc_type": docType, "ocr_status": "pending",
 	})
-	// Store idempotent response (non-fatal on failure — retry would reprocess)
-	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
-		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	// Non-fatal for THIS request — the 201 below is already decided. But it is logged,
+	// not discarded: a persistently failing store means every retry re-ingests the
+	// same upload, which is the exact duplicate this header exists to prevent.
+	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
+		slog.Error("idempotency store failed", "error", err, "doc_id", docID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)
