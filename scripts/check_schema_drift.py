@@ -291,11 +291,15 @@ def referenced_columns(sql: str, known: dict[str, set[str]]) -> set[tuple[str, s
                 pairs.add((table, col))
 
     # UPDATE t SET a = ..., b = ...   (stop at WHERE/RETURNING/FROM)
+    # `=(?!>)` so that a named function argument — make_interval(secs => $1),
+    # jsonb_set(target => ...) — is not read as an assignment to a column `secs`.
+    # Same bug class as the `secs` false positive in single_table_columns below;
+    # found by sweeping for it after fixing that one.
     for m in re.finditer(
         r"\bUPDATE\s+([a-z_][a-z0-9_]*)\s+SET\s+(.*?)(?:\bWHERE\b|\bRETURNING\b|\bFROM\b|$)",
         sql, re.I | re.S):
         table = m.group(1).lower()
-        for assign in re.finditer(r"([a-z_][a-z0-9_]*)\s*=", m.group(2), re.I):
+        for assign in re.finditer(r"([a-z_][a-z0-9_]*)\s*=(?!>)", m.group(2), re.I):
             pairs.add((table, assign.group(1).lower()))
 
     # alias.column / table.column, where the alias resolves to one known table
@@ -338,6 +342,12 @@ def single_table_columns(sql: str, known: dict[str, set[str]]) -> set[tuple[str,
     body = re.sub(r"'(?:[^']|'')*'", " ", sql)
     body = re.sub(r"::\s*[a-z_][a-z0-9_]*(\s*\[\s*\])?", " ", body, flags=re.I)
     body = re.sub(r"\$\d+", " ", body)
+    # Named function arguments: make_interval(secs => $1). `secs` is an argument
+    # name, not a column, and no real column reference is ever followed by `=>`,
+    # so dropping these is a precision fix, not a loosening. It is here because
+    # the guard reported idempotency_keys.secs on 2026-09-05 against SQL that was
+    # correct.
+    body = re.sub(r"\b[a-z_][a-z0-9_]*\s*=>", " ", body, flags=re.I)
     body = re.sub(r"\b[a-z_][a-z0-9_]*\s*\(", " ( ", body, flags=re.I)
     body = re.sub(r"\b[a-z_][a-z0-9_]*\s*\.\s*[a-z_][a-z0-9_]*", " ", body, flags=re.I)
 
