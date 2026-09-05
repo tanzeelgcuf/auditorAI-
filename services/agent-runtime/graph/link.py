@@ -42,13 +42,123 @@ def _entity_key(e: ExtractedEntity) -> tuple:
 
 
 def _amounts_match(a: int, b: int, tolerance: int) -> bool:
-    """Check if two amounts match within tolerance (cents).
+    """Check if two amounts match within tolerance (cents), on MAGNITUDE ONLY.
 
     Compares absolute values: bank transactions are debits (negative) while GL
     entries are credits (positive) for the same underlying transaction — the
     sign is a side convention, not a different amount.
+
+    DO NOT make this sign-aware. The contract is shared with the deterministic
+    tier: `compute_three_way_variance`
+    (`services/verification/src/decimal_math/mod.rs`, comment at :81-88, the
+    three `.abs()` comparisons at :89-97) takes absolute values on all three
+    pairs, and its comment names this function as the reason. Rule 9 says that
+    tier disposes. If this predicate started rejecting a sign pattern the
+    verifier accepts, Python would silently withhold candidates Rust would have
+    reconciled — the same tier disagreement as the 139/600 bug, in the opposite
+    direction and harder to see, because a suppressed candidate leaves no row.
+
+    The sign question is real, and it is asked in `_sign_pattern_ok`, at
+    ROUTING time, where it can only downgrade.
     """
     return abs(abs(a) - abs(b)) <= tolerance
+
+
+# THE SIGN CONVENTION IN THIS REPO IS NOT ONE CONVENTION. IT IS TWO, AND BOTH
+# ARE EXERCISED BY PASSING TESTS. Established 2026-09-06 by measurement, after
+# first writing the gate the prose implies and watching it break the fixtures.
+#
+# What the PROSE said — two places, agreeing with each other, and both wrong to
+# state it as settled:
+#   _score_group, this file             "a billed invoice +, its bank debit −,
+#                                        its GL credit +"  (CORRECTED in place
+#                                        2026-09-06; see the note there)
+#   compute_three_way_variance,         "bank payment and GL entry carry the
+#   verification/decimal_math (:82-84)   opposite sign by convention
+#                                        (bank debit -, GL credit +)"
+#
+# What the REAL FIXTURES do — tests/fixtures/sample_invoice.csv +
+# sample_bank.ofx + sample_gl.csv, the only data here that comes from real file
+# formats rather than a hand-written literal. Parsed through
+# entities_from_fixtures, the three legs are sign-for-sign IDENTICAL:
+#   invoice [150000, 25000, 8999, -50000, 320000, 120000, 47550, 199999, 64275, 87500]
+#   bank    [150000, 25000, 8999, -50000, 320000, 120000, 47550, 199999, 64275, 87500]
+#   gl      [150000, 25000, 8999, -50000, 320000, 120000, 47550, 199999, 64275, 87500]
+# The fixture builder says why, and says it deliberately: "OFX expresses the
+# refund as a positive CREDIT while the invoice/GL express it as a negative
+# refund. Align to the invoice sign convention." So sign encodes DIRECTION
+# (charge vs refund), not SIDE. tests/test_link.py is all-positive throughout,
+# the same way; tests/test_link_tolerance.py hand-builds the prose convention.
+#
+# MEASURED CONSEQUENCE. A gate enforcing the prose convention (invoice↔bank
+# opposite) fails 10 of 77 tests, including
+# test_sample_invoice_bank_ofx_produces_valid_reconciliation_group — the real
+# one. That is not a gate finding bugs; that is a gate encoding a guess.
+#
+# So the three readings that are live, none of them excludable from here:
+#   A "side-encoded"  inv +, bank −, gl +   → inv↔bank OPP,  inv↔gl SAME, bank↔gl OPP
+#   B "direction-only" inv +, bank +, gl +  → inv↔bank SAME, inv↔gl SAME, bank↔gl SAME
+#   C "bank-rec"      inv +, bank −, gl −   → inv↔bank OPP,  inv↔gl OPP,  bank↔gl SAME
+# B is what the fixtures do. A is what the comments claim. C is what a
+# by-the-book bank reconciliation does when the `gl` leg is the CASH account
+# line rather than the expense/revenue line, which is a fact about the
+# customer's chart of accounts and is not knowable from this file.
+#
+# WHAT IS STILL DECIDABLE WITHOUT PICKING ONE. Enumerate all sign patterns for
+# three non-zero legs (up to a global flip, which preserves every pairwise
+# relation): (+,+,+) is B, (+,−,+) is A, (+,−,−) is C, and (+,+,−) is none of
+# them. Exactly one pattern is impossible under all three, and it states
+# compactly:
+#
+#     IF the invoice and bank legs AGREE in sign, the GL leg must agree too.
+#
+# When invoice and bank DISAGREE, A permits gl-with-invoice and C permits
+# gl-with-bank, so there is no constraint and this asserts none. Two-leg groups
+# (bank+GL, no invoice) get no constraint either — bank↔gl is OPP under A and
+# SAME under B and C. Narrow, and true regardless of which convention a book
+# uses, which is the trade being made deliberately.
+
+
+def _sign_pattern_ok(inv_total: int, bank_total: int, gl_total: int,
+                     has_inv: bool, has_bank: bool, has_gl: bool) -> Tuple[bool, str]:
+    """Is this group's sign pattern possible under ANY of conventions A/B/C above?
+
+    Returns (ok, reason). Enforces exactly one rule, the only one that survives
+    not knowing which convention the book uses: **if the invoice and bank legs
+    agree in sign, the GL leg must agree with them.**
+
+    THE DEFECT THIS CLOSES. `_amounts_match` compares magnitudes, so a leg of the
+    right SIZE on the wrong SIDE is variance 0 — and a 1:1:1 group of those
+    scores `is_exact` True, confidence 1.0, and auto-links with nobody looking.
+    Concretely, at the fixtures' own convention: invoice +150000, bank +150000,
+    GL -150000 reconciled clean. The likely readings are a double-entry posted to
+    the wrong side, or a refund recorded against the charge it reverses. Both are
+    findings; both were indistinguishable from a clean match.
+
+    WHAT IT DELIBERATELY DOES NOT ASSERT. Nothing when invoice and bank disagree
+    (A and C both live, pointing opposite ways). Nothing about 2-leg bank+GL
+    groups. Nothing when a leg totals ZERO — that leg has no sign to compare, and
+    it is rule 10's case: an invoice plus its full credit note nets to zero, is
+    PRESENT by membership, and must not be downgraded for lacking a sign.
+    Widening any of these needs the book's convention, which means a per-book
+    config field and a migration, not a guess in a predicate.
+    """
+    if not (has_inv and has_bank and has_gl):
+        return True, ""
+    if inv_total == 0 or bank_total == 0 or gl_total == 0:
+        return True, ""  # no sign to compare — rule 10, not a failure
+    inv_pos = inv_total > 0
+    bank_pos = bank_total > 0
+    gl_pos = gl_total > 0
+    if inv_pos != bank_pos:
+        return True, ""  # conventions A and C disagree here; assert nothing
+    if gl_pos != inv_pos:
+        side = "positive" if inv_pos else "negative"
+        return False, (
+            "invoice and bank are both %s but GL is %s; no sign convention in "
+            "this codebase permits the GL leg alone on the other side"
+            % (side, "negative" if inv_pos else "positive"))
+    return True, ""
 
 
 def _dates_match(a: Optional[date], b: Optional[date]) -> bool:
@@ -124,18 +234,28 @@ def _score_group(
     #
     # Two corrections here, the same pair found in score_and_route's is_exact:
     #
-    # 1. Variance is |‖a‖ − ‖b‖|, not |a − b|. This used signed subtraction, and
-    #    every legitimate 3-way group carries opposite signs by convention (a
-    #    billed invoice +, its bank debit −, its GL credit +). |89900 − (−89899)|
-    #    is 179799, so a group one cent out of tolerance scored avg_variance
-    #    ≈ 1.33 × max_amt, amount_score clamped to 0.0, and the whole non-exact
-    #    path collapsed to 0.2·date + 0.3·counterparty ≤ 0.5. At review_floor
-    #    0.50 that sits exactly on the boundary: a slightly fuzzy counterparty
-    #    (0.95 → 0.285) drops it to 0.485 and score_and_route then routes it to
-    #    NEITHER queue — a real over-tolerance discrepancy disappearing rather
-    #    than being reviewed. _amounts_match and services/verification's
-    #    compute_three_way_variance both compare absolute values; this now does
-    #    too, so the near-miss score degrades smoothly with the actual gap.
+    # 1. Variance is |‖a‖ − ‖b‖|, not |a − b|. This used signed subtraction.
+    #    |89900 − (−89899)| is 179799, so a group one cent out of tolerance
+    #    scored avg_variance ≈ 1.33 × max_amt, amount_score clamped to 0.0, and
+    #    the whole non-exact path collapsed to 0.2·date + 0.3·counterparty ≤ 0.5.
+    #    At review_floor 0.50 that sits exactly on the boundary: a slightly fuzzy
+    #    counterparty (0.95 → 0.285) drops it to 0.485 and score_and_route then
+    #    routes it to NEITHER queue — a real over-tolerance discrepancy
+    #    disappearing rather than being reviewed. _amounts_match and
+    #    services/verification's compute_three_way_variance both compare absolute
+    #    values; this now does too, so the near-miss score degrades smoothly with
+    #    the actual gap.
+    #
+    #    CORRECTED 2026-09-06. This comment used to justify the abs() by asserting
+    #    "every legitimate 3-way group carries opposite signs by convention (a
+    #    billed invoice +, its bank debit −, its GL credit +)". That is not
+    #    established: the repo's own fixtures (services/ingestion/test_fixtures,
+    #    parsed by tests/test_pilot_fixtures.entities_from_fixtures) produce
+    #    invoice, bank and GL legs that are sign-for-sign IDENTICAL, and their
+    #    builder aligns them deliberately. See the block above _sign_pattern_ok:
+    #    this codebase holds TWO sign conventions and both have passing tests.
+    #    The abs() is right either way — that is the actual argument for it, and
+    #    it is a stronger one than the convention claim it replaced.
     #
     # 2. Presence is membership, not a non-zero total. A leg whose amounts net to
     #    zero (an invoice and its full credit note) is present and must be
@@ -418,6 +538,58 @@ def score_and_route(
         score = _score_group(invs, banks, gls, config, is_exact)
         group.link_confidence = round(score, 4)
 
+        # SIGN GATE — downgrade-only, and the only place in this file that looks
+        # at sign at all. `is_exact` above is magnitude-only by contract (see
+        # _amounts_match), which means a leg of the right SIZE and the wrong SIDE
+        # is variance 0, is_exact True, confidence 1.0 — auto-linked, no human.
+        # At the fixtures' own convention: invoice +150000, bank +150000,
+        # GL -150000 reconciled clean. That is a wrong-side posting or a refund
+        # matched to the charge it reverses; both are findings, and both arrived
+        # as clean reconciliations.
+        #
+        # It downgrades and never suppresses, for two independent reasons: rule 9
+        # (the verification tier disposes; this tier may only lower a claim, never
+        # raise or hide one), and because the repo demonstrably holds TWO sign
+        # conventions — see the block above _sign_pattern_ok for the measurement.
+        # The predicate is therefore deliberately narrow, and even where it fires
+        # the cost of being wrong is review work, never a missed match.
+        sign_ok, sign_reason = _sign_pattern_ok(
+            inv_total, bank_total, gl_total, bool(invs), bool(banks), bool(gls))
+
+        # WHY THE FLAG AND NOT JUST `and sign_ok` ON THE FIRST BRANCH. Adding the
+        # conjunct alone would let a sign-contradicting group fall out of BOTH
+        # queues on a boundary score, which is strictly worse than auto-linking
+        # it: an unmatched entity is reported as "nothing to reconcile here",
+        # while an over-confident link at least appears in a queue. is_exact
+        # groups sit exactly on that boundary by construction — amount_score is
+        # 1.0, so a group with no date and no counterparty signal scores
+        # 0.5·1.0 = 0.500 against a review_floor of 0.500, decided by float
+        # comparison. The `or group.sign_conflict` in the elif makes review the
+        # floor for this class rather than something it can miss. Same shape as
+        # the group.mismatch early-return above, and the same reason.
+        #
+        # `sign_conflict` is set only when the group WOULD have auto-linked
+        # (is_exact), not on every sign oddity. A non-exact group already has a
+        # variance to explain and is already headed for review or below the floor
+        # on its own merits; flagging those too would widen a targeted downgrade
+        # into a reclassification of candidates this change has no evidence about.
+        group.sign_conflict = is_exact and not sign_ok
+        if group.sign_conflict:
+            # The reason reaches the LOG and nothing else. reconciliation_groups
+            # has no column for it (infra/init.sql:220-241 — confidence, status,
+            # group_scope, no downgrade reason) and the only INSERT path from this
+            # tier is mcp.go create_entity_link, which carries status and scope.
+            # So a reviewer sees a needs_review group with confidence 1.0 and no
+            # stated cause. That is a real gap; it is a schema change plus a
+            # writer change, not something to smuggle into this fix.
+            logger.warning(
+                "sign pattern contradicts convention — downgraded to needs_review",
+                group_id=str(group.id),
+                reason=sign_reason,
+                inv_cents=inv_total, bank_cents=bank_total, gl_cents=gl_total,
+                link_confidence=group.link_confidence,
+            )
+
         # Pass-5 discrepancy candidates are mismatch BY CONSTRUCTION — the bank
         # and GL legs are the same real transaction whose amounts disagree. Route
         # them straight to needs_review regardless of confidence: a hair-thin
@@ -448,12 +620,12 @@ def score_and_route(
         # requires a human to accept the variance. The alternative is a product
         # that reports a reconciliation as clean while its own verification tier
         # has an open over-tolerance finding against it.
-        if score >= config.auto_link_threshold and is_exact:
+        if score >= config.auto_link_threshold and is_exact and sign_ok:
             group.status = "auto_linked"
             auto_linked.append(group)
             for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:
                 matched_ids.add(str(eid))
-        elif score >= config.review_floor:
+        elif score >= config.review_floor or group.sign_conflict:
             group.status = "needs_review"
             needs_review.append(group)
             for eid in group.invoice_entity_ids + group.bank_entity_ids + group.gl_entity_ids:

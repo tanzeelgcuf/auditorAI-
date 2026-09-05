@@ -63,6 +63,13 @@ class ReconciliationGroup(BaseModel):
     link_confidence: float = 0.0
     status: str = "needs_review"  # auto_linked, needs_review, unmatched
     mismatch: bool = False  # pass-5 provenance: bank↔GL same-date/cp but amounts differ
+    # Set by score_and_route when magnitudes reconcile but the sign pattern
+    # contradicts SIGN_PAIRS (link.py). IN-PROCESS ONLY, same as `mismatch`:
+    # reconciliation_groups (infra/init.sql:220) has no column for either, so
+    # this decides routing and then exists only in the structlog line. Read in
+    # score_and_route's elif — it is what keeps a downgraded group from falling
+    # out of both queues on a boundary score.
+    sign_conflict: bool = False
 
 
 class BookConfig(BaseModel):

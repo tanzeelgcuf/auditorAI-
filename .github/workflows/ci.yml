@@ -341,11 +341,11 @@ jobs:
       - name: Check RLS write priming
         run: python3 scripts/check_rls_write_priming.py --verbose
 
-  # services/agent-runtime has four test modules (tests/test_extract.py,
-  # test_link.py, test_mcp_client.py, test_pilot_fixtures.py) and
-  # requirements.txt already pins pytest and pytest-asyncio — but nothing in CI
-  # ran them, so the Python service was the only one of the four with zero
-  # automated coverage on every push.
+  # services/agent-runtime has eight test modules under tests/ (88 tests as of
+  # 2026-09-06) and requirements.txt already pins pytest and pytest-asyncio —
+  # but nothing in CI ran them, so the Python service was the only one of the
+  # four with zero automated coverage on every push. `pytest tests -q` collects
+  # the directory, so a new tests/test_*.py needs no change here.
   python:
     name: Python (services/agent-runtime)
     runs-on: ubuntu-latest
