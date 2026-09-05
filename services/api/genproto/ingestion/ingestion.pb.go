@@ -29,7 +29,7 @@ type ProcessDocumentRequest struct {
 	ClientBookId  string                 `protobuf:"bytes,2,opt,name=client_book_id,json=clientBookId,proto3" json:"client_book_id,omitempty"`
 	StorageKey    string                 `protobuf:"bytes,3,opt,name=storage_key,json=storageKey,proto3" json:"storage_key,omitempty"`
 	DocType       string                 `protobuf:"bytes,4,opt,name=doc_type,json=docType,proto3" json:"doc_type,omitempty"`                                                                                 // invoice | bank_statement | gl_export
-	ColumnMap     map[string]string      `protobuf:"bytes,5,rep,name=column_map,json=columnMap,proto3" json:"column_map,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // per-book CSV column mapping (doc 08 §1)
+	ColumnMap     map[string]string      `protobuf:"bytes,5,rep,name=column_map,json=columnMap,proto3" json:"column_map,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // per-book CSV column mapping
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

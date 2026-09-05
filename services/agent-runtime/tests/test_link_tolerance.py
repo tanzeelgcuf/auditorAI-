@@ -38,7 +38,7 @@
 #      the tests in this file which hand-build invoice +, bank -, GL + are
 #      exercising one possible convention, not "the" convention.
 #
-# Per docs 06 §2 + 09 §1. No network, no API key needed.
+# No network, no API key needed.
 
 import sys
 import os

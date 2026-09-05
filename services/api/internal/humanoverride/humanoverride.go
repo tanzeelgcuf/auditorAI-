@@ -1,6 +1,6 @@
 package humanoverride
 
-// Doc 11 (Round 5) — human override capability. When the automation gets it
+// Human override capability. When the automation gets it
 // wrong, a reviewer can: create an entity manually, split/merge a group, and
 // tag entities. Config mutations get audited. All history preserved (no deletes).
 

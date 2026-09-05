@@ -1,11 +1,11 @@
-"""Run doc-12 §1 agent-runtime extraction on the real docTR entities.
+"""Run agent-runtime extraction on the real docTR entities.
 
 Loads the 65 raw OCR entities for invoices_batch_june2026.pdf, groups by page,
 calls Claude once per page asking for the invoice total (with source-entity-index
 citations), and prints the normalized invoice entities — the last non-deterministic
 leg of the reconciliation pipeline, now against real docTR output.
 
-Expected (per 04 README + doc 12 §1.3):
+Expected:
   INV-1001 $342.50 (page 1), INV-1002 $128.75 (page 2),
   BCH-2291 $899.00 (page 3), MP-5502 $215.00 (page 4)
 """
@@ -19,7 +19,7 @@ from openai import OpenAI
 
 logger = structlog.get_logger()
 
-# Open-source local LLM via Ollama (doc 00 §3.5 substitution map — keep Claude for
+# Open-source local LLM via Ollama (keep Claude for
 # production quality-critical paths, but local models are fine for this test).
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
@@ -120,7 +120,7 @@ def main():
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
             data = json.loads(raw)
             data["page"] = page
-            # Deterministic conversion of the verbatim raw string (doc 13) — the
+            # Deterministic conversion of the verbatim raw string — the
             # model must NOT do this arithmetic; mirror _parse_amount_cents.
             data["total_amount"] = _raw_to_cents(data.get("total_amount_raw", ""))
             # Citation grounding (Round 7): the model's source_indices are not
@@ -139,7 +139,7 @@ def main():
             print(f"PAGE {page}: parse error {e}")
             results.append({"page": page, "error": str(e)})
 
-    print("\n=== ASSERTIONS (doc 12 §1.3) ===")
+    print("\n=== ASSERTIONS ===")
     expected = {1: ("INV-1001", 34250), 2: ("INV-1002", 12875), 3: ("BCH-2291", 89900), 4: ("MP-5502", 21500)}
     passed = 0
     for page, (want_num, want_amt) in expected.items():

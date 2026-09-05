@@ -306,6 +306,52 @@ Session reports live at the workspace root next to the repo:
     `test_fixtures_are_still_sign_aligned` goes red if the fixtures are
     re-signed, instead of the comment quietly becoming wrong.
 
+17. **A type error names a line. It does not name the bug — and the fix that
+    silences it is usually not the fix.** Added 2026-09-06 after the first
+    `web` job. Five TypeScript failures were triaged as "type noise"; **two
+    were rendering bugs whose only visible symptom was the type error**, and
+    the widening fix proposed for one of them would have compiled while
+    leaving the bug in place.
+
+    - `MotionButton` took `variant?: VariantKey`, so `variant="secondary"`
+      and `size="icon"` were type errors. The proposed fix was to widen
+      `VariantKey` with `"secondary" | "outline" | "ghost"`. OBSERVED instead,
+      by reading **all 19 call sites**: the component rendered
+      `className={cn(className)}` and never composed `buttonVariants` at all,
+      and not one call site re-declares a background, height, padding, radius
+      or focus ring — they pass only layout (`w-full gap-2`, `h-8 w-8`). So
+      **every MotionButton in the app rendered as an unstyled `<button>`**,
+      including the submit CTAs on login, signup, dashboard, onboarding and
+      settings, and their `disabled={…isPending}` states got no
+      `disabled:opacity-50`. tsc could only see the 9 sites that passed
+      `variant`/`size`; the other 10 typechecked clean and were equally
+      unstyled. Widening would have made all 19 compile and none of them
+      styled. Fixed by exporting `buttonVariants` (it was module-private —
+      *that* was the root cause) and composing it; the animation preset moved
+      to `motionVariant`.
+    - `VariantKey` listed `"fade"`. `grep` found that literal in **exactly one
+      place in the app — the type declaration itself.** The exported object is
+      `fadeIn`, and `pdf-viewer.tsx:87` passes `variant="fadeIn"`. So
+      `presets["fadeIn"]` was `undefined`, and an `undefined` variants prop
+      beside `initial="hidden" animate="visible"` **does not throw** — the
+      animation had silently never run once. Renaming the key to match its
+      object fixes the call site and removes the trap; "fix the call site to
+      `fade`" would have left it.
+
+    Two mechanical tells, both cheap: a props type that a **majority of call
+    sites** violate is describing the wrong thing, not catching mistakes; and
+    a union member that greps to zero call sites has never worked. Neither
+    needs a compiler, which matters here.
+
+    The same pass found a third defect tsc cannot see at all: `skeleton.tsx`
+    carried `backgroundColor: "rgb(var(--color-muted) / <alpha-value>)"` in a
+    React inline `style`, copied out of `tailwind.config.ts:36`.
+    `<alpha-value>` is a Tailwind **config** placeholder substituted when a
+    utility class is emitted; nothing substitutes it in a style prop, so the
+    browser got invalid CSS and dropped the declaration — every skeleton in
+    the app rendered with no fill. Swept: the only `<alpha-value>` outside
+    `tailwind.config.ts`.
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
@@ -655,17 +701,26 @@ from Stripe with no error on our side. The handler authenticates its own caller
 (secret unset → 503; `webhook.ConstructEvent` verifies the HMAC over the raw body
 → 400) and is rate-limited. Do not "fix" it back into the auth group.
 
-## CI — `.github/workflows/ci.yml`, 8 jobs
+## CI — `.github/workflows/ci.yml`, 9 jobs
 
 `go` · `rust-ingestion` · `rust-verification` · `Schema Drift Guard` · `python` ·
-`web` · `security` · `docker`
+`web` · `security` · `osv` · `docker`
+
+`osv` (display name **OSV-Scanner**) was added 2026-09-06 and is a job-level
+`uses:` of a **reusable workflow**
+(`google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2`), not a
+step-level action. It was previously written as a step-level
+`uses: google/osv-scanner-action@v1`, which does not resolve; that repo publishes
+reusable workflows, and this one additionally needs `actions: read` alongside
+`security-events: write`.
 
 Per-language gates, stated accurately:
 
-- **Go**: real Postgres 16 service container with `infra/init.sql` loaded, `sqlc compile`, golangci-lint, `go test ./... -race` against four distinct DSNs, coverage uploaded to codecov (**no threshold configured**).
+- **Go**: real Postgres 16 service container with `infra/init.sql` loaded, `sqlc compile`, golangci-lint, `go test ./... -race` against four distinct DSNs, coverage uploaded to codecov (**no threshold configured**). **Step order is load-bearing and it is why the DB suite has zero runs**: `Load schema` → `Install sqlc` → `Run sqlc` → `Lint` → `Test`. `sqlc compile` failing at step 5 means step 7 never executes, so a `sqlc` syntax error reads in the log as "Go tests didn't run" rather than as a schema problem.
 - **Rust** (both crates): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, `cargo build --release --locked`. Ingestion is built WITHOUT `--all-features` on purpose — the `enhance` feature gates deliberately-inert stages the shipped image does not enable.
-- **Python**: entrypoint import check (`import ollama_adapter, mcp_client, graph.graph_def`) separately from `pytest tests -q`, because a missing runtime dep shows up in the import chain while every test still passes.
-- **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists.
+- **Python**: entrypoint import check (`import ollama_adapter, mcp_client, graph.graph_def`) separately from `pytest tests -q`, because a missing runtime dep shows up in the import chain while every test still passes. Since 2026-09-06 it also **asserts the real LangGraph is in use** — `graph.graph_def` must not have fallen back to the in-repo `_SequentialPipeline` shim — because an unresolvable pin degraded silently to that shim and every test stayed green.
+- **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists. `apps/web/package-lock.json` is lockfileVersion 3, 444 packages, **every one with an integrity hash** — which makes the lockfile admissible local evidence that a pin resolves on the registry, in an environment with no network. That is how the never-published-pin sweep was closed on the npm side without `npm view`.
+
 - **Docker**: builds all 6 images with the same context/`-f` split as `infra/docker-compose.yml`, asserts binaries and the decision graph are actually inside the images, and `docker compose config -q` on both compose files.
 
 Six **static guards** — they exist because each proves something about code that

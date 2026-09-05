@@ -2,7 +2,7 @@ package middleware
 
 // Per-IP token-bucket rate limiting (golang.org/x/time/rate).
 //
-// Replaces the no-op RateLimiter placeholder (doc 00 §3.10). Real, in-process
+// Replaces the no-op RateLimiter placeholder. Real, in-process
 // limiter keyed by client IP; a gateway (Traefik/Kong) can do this more
 // robustly in prod, but the API must not ship with NO limiting on auth/upload/
 // admin endpoints.
@@ -134,7 +134,7 @@ func RateLimiter(next http.Handler) http.Handler {
 	return RateLimit(NewIPRateLimiter(10, 20))(next)
 }
 
-// Log a clear line when the limiter trips (ops visibility, doc 12 §3).
+// Log a clear line when the limiter trips (ops visibility).
 func logRateLimited(w http.ResponseWriter, r *http.Request, ip string) {
 	slog.Warn("rate limited", "ip", ip, "path", r.URL.Path)
 }

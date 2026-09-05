@@ -1,4 +1,4 @@
-// InternalAuth tests — internal key auth for MCP tools (doc 05 §3).
+// InternalAuth tests — internal key auth for MCP tools.
 package middleware
 
 import (

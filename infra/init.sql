@@ -1,4 +1,4 @@
--- AI Auditor v1 — Database Initialization (DDL from docs 05-10)
+-- AI Auditor v1 — Database Initialization
 --
 -- THIS FILE IS THE ENTIRE APPLIED SCHEMA — every table, view, index, policy and
 -- grant. It is the only DDL that any environment runs: infra/docker-compose*.yml
@@ -213,7 +213,7 @@ CREATE TABLE extracted_entities (
     extraction_confidence NUMERIC(4,3) NOT NULL,
     source_format TEXT NOT NULL DEFAULT 'ocr' CHECK (source_format IN ('ocr', 'structured')),
     transaction_ref TEXT,
-    -- Folded from migration 000008 (doc 11 §1, human override / manual entry).
+    -- Folded from migration 000008.
     -- humanoverride.go:99-102 INSERTs created_by/manually_created_by/
     -- corrects_entity_id and :116 UPDATEs status, so POST
     -- /v1/books/{bookId}/entities/manual could not work without these four.
@@ -243,7 +243,7 @@ CREATE TABLE reconciliation_groups (
     -- :265 literal 'needs_review', seed-demo, security_test), so this changes no
     -- current behaviour — it changes what the NEXT writer gets for free.
     status TEXT NOT NULL DEFAULT 'needs_review' CHECK (status IN ('auto_linked','needs_review','confirmed','rejected','superseded')),
-    -- Folded from migration 000010 (doc 12 §2): AP vs AR reconciled separately.
+    -- Folded from migration 000010: AP vs AR reconciled separately.
     -- mcp.go:234 INSERTs this on the agent's create_entity_link write path.
     group_scope TEXT NOT NULL DEFAULT 'ap' CHECK (group_scope IN ('ap', 'ar', 'other')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -498,7 +498,7 @@ CREATE TABLE coa_templates (
 -- the HTTP route that reaches it, so a future reader can tell live schema from
 -- speculative schema.
 
--- From 000002. Per-tenant data encryption keys (doc 05 §5).
+-- From 000002. Per-tenant data encryption keys.
 -- rotate_keys.go:50 SELECTs and :60 INSERTs -> POST /v1/tenant/rotate-keys.
 -- ALSO: middleware/security_test.go:88 TRUNCATEs this table in test setup, so
 -- its absence made the entire security/RLS suite die before its first
@@ -512,7 +512,7 @@ CREATE TABLE data_encryption_keys (
 );
 CREATE INDEX idx_data_encryption_keys_firm ON data_encryption_keys(firm_id, status);
 
--- From 000005. Mobile push targets (doc 03 §3.10 / doc 07 §8).
+-- From 000005. Mobile push targets.
 -- push.go:78 INSERTs -> POST /v1/push/register, which apps/mobile/src/push.ts:15
 -- already calls; push.go:102 SELECTs for delivery.
 CREATE TABLE device_tokens (
@@ -542,7 +542,7 @@ CREATE TABLE config_change_log (
 -- From 000008 §4. Business-day-aware date matching.
 -- NOTE, and this is a real gap rather than an oversight in the fold: `grep -rn
 -- bank_holidays` finds NO reader anywhere in services/ or apps/. The table is
--- carried over so the schema is complete against doc 11, but the business-day
+-- carried over so the fold does not silently drop a table, but the business-day
 -- matching feature it exists for is not implemented. client_book_id is
 -- deliberately nullable = a global (all-books) holiday.
 CREATE TABLE bank_holidays (

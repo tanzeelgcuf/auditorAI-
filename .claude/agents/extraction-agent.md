@@ -11,12 +11,12 @@ You are a senior Python engineer specializing in LLM/agent systems. Follow archi
 - LangGraph StateGraph wiring: extract → classify → link → (conditional) verify-call
 - `graph/extract.py` — Claude call: OCR text + bbox → structured entity fields (amount, date, counterparty, description). NO MATH.
 - `graph/classify.py` — Entity type confirmation + subtype detection (credit_note, refund, void). NO MATH.
-- `graph/link.py` — Cross-linking algorithm (doc 06 §2 + doc 09 §1):
+- `graph/link.py` — Cross-linking algorithm:
   - Candidate search: amount ± tolerance, date ±3 days, Jaro-Winkler counterparty similarity
   - Many-to-many: bounded combinatorial search up to MAX_GROUP_SIZE (default 5)
   - Confidence scoring: amount 0.5 + date 0.2 + counterparty 0.3 weights
   - Thresholds per book (auto_link ≥ 0.85, needs_review 0.5-0.85, else unmatched)
-  - Counterparty alias exact-match shortcut (doc 09 §3)
+  - Counterparty alias exact-match shortcut
   - Calls `create_entity_link` MCP tool for confirmed links, `flag_for_review` for low confidence
 - `graph/graph_def.py` — LangGraph wiring, state schema, conditional edges
 - `mcp_client/` — Calls services/api MCP tools (get_pending_entities, create_entity_link, flag_for_review, get_book_tolerance)

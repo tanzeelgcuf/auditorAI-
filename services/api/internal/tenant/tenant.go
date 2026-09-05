@@ -300,7 +300,9 @@ func (s *Service) HandleUpdateBookSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Doc 11 §3 — audit every config mutation (part of the same logical change).
+	// Audit every config mutation into config_change_log (part of the same logical
+	// change). The write must run on the request's primed connection — CLAUDE.md
+	// rule 14; an unprimed write against an RLS table RAISES, it does not no-op.
 	s.auditConfigChange(r, bookID, settings.ClientName, "client_name")
 	s.auditConfigChange(r, bookID, settings.BaseCurrency, "base_currency")
 	s.auditConfigChange(r, bookID, settings.FiscalYearStartMonth, "fiscal_year_start_month")

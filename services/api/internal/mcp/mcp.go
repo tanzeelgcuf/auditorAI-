@@ -1,7 +1,7 @@
 package mcp
 
 // Internal MCP tool server — called by services/agent-runtime, not external clients.
-// Tools (docs 05 §3): get_pending_entities, create_entity_link, flag_for_review,
+// Tools: get_pending_entities, create_entity_link, flag_for_review,
 // get_book_tolerance.
 
 import (
@@ -190,7 +190,7 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request", "invalid body")
 		return
 	}
-	// Doc 09: groups need not have all three legs (bank+GL only is valid — deposits,
+	// Groups need not have all three legs (bank+GL only is valid — deposits,
 	// fees). At least bank+GL required; invoice may be empty.
 	if len(req.BankIDs) == 0 || len(req.GLIDs) == 0 {
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request",
@@ -260,7 +260,7 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Derive group scope from the GL legs' chart-of-accounts account type
-	// (doc 12 §2 / Round 7): AR-side activity is categorized, not excluded.
+	// AR-side activity is categorized, not excluded.
 	// A GL leg posting to AR / asset / revenue accounts => 'ar'; else 'ap'.
 	var scope string
 	err = tx.QueryRow(r.Context(),

@@ -1,6 +1,6 @@
 # services/agent-runtime/tests/test_link.py
 # Cross-linking algorithm tests — synthetic document sets with known-correct results.
-# Per docs 06 §2 + 09 §1. No network, no API key needed.
+# No network, no API key needed.
 
 import sys
 import os

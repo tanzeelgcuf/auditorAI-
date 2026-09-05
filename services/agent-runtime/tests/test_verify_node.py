@@ -122,7 +122,7 @@ def test_presence_flags_are_sent():
 
 
 def test_absent_leg_reports_false_not_a_zero_total():
-    """A two-leg group (bank+GL only — deposits, fees; doc 09) must report
+    """A two-leg group (bank+GL only — deposits, fees) must report
     has_invoice=false, NOT has_invoice=true with a total of 0. Those two are
     different questions to the money tier: absent means 'do not compare this
     leg', zero means 'this leg says zero'."""

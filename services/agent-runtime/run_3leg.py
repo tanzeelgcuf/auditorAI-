@@ -6,7 +6,7 @@ and runs the linker to prove row 1 (2-invoice many-to-many) and row 2 (3-member
 high finding) form full 3-leg groups — the pieces the earlier run couldn't show
 because extraction amounts were wrong.
 
-Invoice truth (doc 12 / eval fixture):
+Invoice truth:
   INV-1001 $342.50 = 34250
   INV-1002 $128.75 = 12875
   BCH-2291 $899.00 = 89900

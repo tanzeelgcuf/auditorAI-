@@ -1,6 +1,6 @@
 package pipeline
 
-// Coordinator — the missing bridge in the document pipeline (doc 12 §1).
+// Coordinator — the missing bridge in the document pipeline.
 //
 //   document.uploaded ──> ingestion gRPC (parse OFX/CSV/PDF) ──> extracted_entities
 //        ──> entity.extraction.requested ──> agent-runtime (link/classify)
@@ -256,7 +256,7 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	// Fetch the book's CSV column mapping (doc 08 §1) so structured formats parse
+	// Fetch the book's CSV column mapping so structured formats parse
 	// with the correct header mapping, not an empty one. The mapping is chosen
 	// by matching the file's actual header row against each stored mapping's
 	// source columns — a firm may hold multiple exports (QBO, Xero, custom)

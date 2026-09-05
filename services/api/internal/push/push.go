@@ -1,6 +1,6 @@
 package push
 
-// Mobile push bridge (doc 03 §3.10 / doc 07 §8). High-severity findings page a
+// Mobile push bridge. High-severity findings page a
 // controller via Expo push. Device tokens are registered by the mobile app and
 // stored per-firm; SendFindingAlert fans out to Expo's push service.
 
@@ -167,7 +167,7 @@ func (s *Service) SendFindingAlert(ctx context.Context, sysDB *pgxpool.Pool, fir
 	return nil
 }
 
-// severityShouldNotify gates alerts — only high-severity pages a human (doc 03 §3.10).
+// severityShouldNotify gates alerts — only high-severity pages a human.
 func severityShouldNotify(severity string) bool {
 	return severity == "high"
 }

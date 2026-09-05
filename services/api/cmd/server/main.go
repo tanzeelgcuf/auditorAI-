@@ -124,7 +124,7 @@ func main() {
 		slog.Warn("failed to seed COA templates", "error", err)
 	}
 
-	// Proactive stale document-request reminder loop (doc 10 §7). Sweeps every
+	// Proactive stale document-request reminder loop. Sweeps every
 	// firm, so it cannot be scoped to one — sysPool.
 	go notify.Run(ctx, sysPool, notify.DefaultInterval)
 
@@ -171,7 +171,7 @@ func main() {
 	}
 
 	// Pipeline coordinator: consumes document.uploaded -> ingestion gRPC ->
-	// extracted_entities -> entity.extraction.requested (doc 12 §1).
+	// extracted_entities -> entity.extraction.requested.
 	if pipelineClient != nil && st != nil {
 		if ingURL := os.Getenv("INGESTION_GRPC_ADDR"); ingURL != "" {
 			coord, err := pipeline.NewCoordinator(os.Getenv("NATS_URL"), ingURL, sysPool, st)
@@ -324,14 +324,14 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 
-	// Rate limiters (per-IP token bucket, doc 00 §3.10). Auth and uploads are
+	// Rate limiters (per-IP token bucket). Auth and uploads are
 	// the brute-force / abuse surfaces; admin key operations are low-traffic.
 	// Rates: auth 5 req/s burst 20; upload 3 req/s burst 10; admin 2 req/s burst 5.
 	authLimiter := middleware.NewIPRateLimiter(5, 20)
 	uploadLimiter := middleware.NewIPRateLimiter(3, 10)
 	adminLimiter := middleware.NewIPRateLimiter(2, 5)
 
-	// Client portal login (public — invite-token based, doc 07 §5)
+	// Client portal login (public — invite-token based)
 	r.With(middleware.RateLimit(authLimiter)).Post("/v1/portal/login", portalSvc.HandleLogin)
 
 	// Stripe webhook (public by necessity, 2026-09-04).
@@ -421,18 +421,18 @@ func main() {
 		// Entities
 		r.Get("/v1/books/{bookId}/entities", entitySvc.HandleList)
 
-		// Human override (doc 11) — manual entity creation + group split/merge
+		// Human override — manual entity creation + group split/merge
 		r.Post("/v1/books/{bookId}/entities/manual", humanSvc.HandleCreateManualEntity)
 		r.Post("/v1/reconciliation-groups/{groupId}/split", humanSvc.HandleSplitGroup)
 		r.Post("/v1/reconciliation-groups/merge", humanSvc.HandleMergeGroups)
 
-		// Config change history (doc 11 §3)
+		// Config change history
 		r.Get("/v1/books/{bookId}/config-history", humanSvc.HandleConfigHistory)
 
-		// Automation rate (doc 11 §5)
+		// Automation rate
 		r.Get("/v1/books/{bookId}/automation-rate", humanSvc.HandleAutomationRate)
 
-		// Tags (doc 11 §6)
+		// Tags
 		r.Get("/v1/tags", humanSvc.HandleListTags)
 		r.Post("/v1/tags", humanSvc.HandleCreateTag)
 		r.Post("/v1/entities/tag", humanSvc.HandleTagEntity)
@@ -460,21 +460,21 @@ func main() {
 		// the bug — see the public registration above. HandleCheckout stays in this
 		// group because it legitimately has a JWT and must be RLS-scoped.
 
-		// Periods (close workflow, doc 10 §1)
+		// Periods (close workflow)
 		r.Get("/v1/books/{bookId}/periods", periodsSvc.HandleListPeriods)
 		r.Post("/v1/books/{bookId}/periods", periodsSvc.HandleCreatePeriod)
 		r.Post("/v1/books/{bookId}/periods/{periodId}/close", periodsSvc.HandleClosePeriod)
 		r.Post("/v1/books/{bookId}/periods/{periodId}/reopen", periodsSvc.HandleReopenPeriod)
 
-		// Document requests (doc 10 §4)
+		// Document requests
 		r.Get("/v1/books/{bookId}/document-requests", periodsSvc.HandleListDocumentRequests)
 		r.Post("/v1/books/{bookId}/document-requests", periodsSvc.HandleCreateDocumentRequest)
 		r.Post("/v1/books/{bookId}/document-requests/{requestId}/waive", periodsSvc.HandleWaiveDocumentRequest)
 
-		// Firm dashboard (doc 08 §6)
+		// Firm dashboard
 		r.Get("/v1/firm/dashboard", periodsSvc.HandleFirmDashboard)
 
-		// Book settings (doc 07/08/09)
+		// Book settings
 		r.Get("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleListChartOfAccounts)
 		r.Post("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleCreateChartAccount)
 		r.Patch("/v1/books/{bookId}/chart-of-accounts/{accountId}", settingsSvc.HandleUpdateChartAccount)
@@ -496,25 +496,25 @@ func main() {
 			r.Patch("/settings", tenantSvc.HandleUpdateFirmSettings)
 			r.Post("/rotate-keys", tenantSvc.HandleRotateKeys)
 
-			// API keys (doc 07 §7)
+			// API keys
 			r.Get("/api-keys", settingsSvc.HandleListAPIKeys)
 			r.Post("/api-keys", settingsSvc.HandleCreateAPIKey)
 			r.Delete("/api-keys/{keyId}", settingsSvc.HandleRevokeAPIKey)
 
-			// Webhooks (doc 07 §7)
+			// Webhooks
 			r.Get("/webhooks", settingsSvc.HandleListWebhooks)
 			r.Post("/webhooks", settingsSvc.HandleCreateWebhook)
 			r.Delete("/webhooks/{webhookId}", settingsSvc.HandleDeleteWebhook)
 			r.Post("/webhooks/{webhookId}/test", settingsSvc.HandleTestWebhook)
 		})
 
-		// Mobile push device registration (doc 07 §8)
+		// Mobile push device registration
 		r.Post("/v1/push/register", pushSvc.HandleRegisterDevice)
 	})
 
 	// MCP tools (internal, called by agent-runtime). Outside the user-auth
 	// group: authenticated with the shared internal key instead of a user JWT,
-	// scoping to the client_book_id in the request body (doc 05 §3).
+	// scoping to the client_book_id in the request body.
 	//
 	// Both pools: sysPool resolves book -> firm (the step that establishes scope,
 	// so it cannot itself be scoped), then the handlers run on an RLS-primed

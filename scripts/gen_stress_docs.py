@@ -169,7 +169,7 @@ def gen_gl_csv(path):
 
 def gen_readme(path):
     readme = textwrap.dedent("""\
-        # STRESS TEST — pass/fail bar (doc 14 / Prompt B)
+        # STRESS TEST — pass/fail bar
 
         Purpose: verify the live pipeline against deliberate ambiguity that the
         clean Riverside set couldn't produce.

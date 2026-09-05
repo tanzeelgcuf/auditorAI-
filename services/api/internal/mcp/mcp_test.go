@@ -116,7 +116,7 @@ func TestCreateEntityLinkRejectsRatherThanCoercing(t *testing.T) {
 	}
 }
 
-// TestCreateEntityLinkRequiresBankAndGL — doc 09: a group need not have all
+// TestCreateEntityLinkRequiresBankAndGL — a group need not have all
 // three legs (bank+GL only is valid for deposits and fees), but invoice-only is
 // not a reconciliation of anything.
 func TestCreateEntityLinkRequiresBankAndGL(t *testing.T) {

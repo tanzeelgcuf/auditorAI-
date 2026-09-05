@@ -165,7 +165,7 @@ impl IngestionService for IngestionServiceImpl {
         }
 
         // Route to backend. Structured formats use a per-request backend so the
-        // book's CSV column mapping (doc 08 §1) is applied; OCR uses the singleton.
+        // book's CSV column mapping is applied; OCR uses the singleton.
         let response = match format {
             DetectedFormat::Csv => {
                 let backend = crate::ocr::structured::CsvParser::new(

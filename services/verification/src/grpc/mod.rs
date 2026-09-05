@@ -125,7 +125,7 @@ impl VerificationService for VerificationServiceImpl {
 
         // Convert to rust_decimal for processing. A leg is included only when
         // the caller marks it present (has_invoice/has_bank/has_gl) — an absent
-        // leg (e.g. invoice on a bank+GL-only deposit group, doc 09) must not
+        // leg (e.g. invoice on a bank+GL-only deposit group) must not
         // be compared as 0, or |0-bank| flags a balanced 2-leg group.
         let invoice_group = if req.has_invoice {
             vec![rust_decimal::Decimal::from_i64(req.invoice_amount_cents)

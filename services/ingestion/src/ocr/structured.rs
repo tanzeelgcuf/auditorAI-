@@ -349,7 +349,7 @@ impl OcrBackend for CsvParser {
 
             // Double-entry CSV exports carry Debit + Credit columns; the column map
             // points amount at one of them. If the mapped amount is empty but the
-            // OTHER side exists in the raw row, fall back to it (doc 08 §1).
+            // OTHER side exists in the raw row, fall back to it.
             let raw_amount = resolve_amount(&mapped, &row_data);
             // Fail the document, do NOT default to 0. This loop already aborts on a
             // malformed row, so an amount the parser cannot read unambiguously is
@@ -498,7 +498,7 @@ impl OcrBackend for XlsxParser {
 
             // Double-entry CSV exports carry Debit + Credit columns; the column map
             // points amount at one of them. If the mapped amount is empty but the
-            // OTHER side exists in the raw row, fall back to it (doc 08 §1).
+            // OTHER side exists in the raw row, fall back to it.
             let raw_amount = resolve_amount(&mapped, &row_data);
             // Fail the document, do NOT default to 0. This loop already aborts on a
             // malformed row, so an amount the parser cannot read unambiguously is
@@ -827,7 +827,7 @@ mod tests {
         assert!(mapped.get("description").is_none());
     }
 
-    // Doc 08 §1: real Riverside GL headers (Debit/Credit) require the per-book
+    // Real Riverside GL headers (Debit/Credit) require the per-book
     // column mapping to extract amounts. Debit or Credit non-empty => amount.
     #[test]
     fn test_map_columns_riverside_gl() {
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(parse_date("20260608120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 8).unwrap()));
     }
 
-    // Doc 08: double-entry GL debit+credit pairs collapse to one entity.
+    // Double-entry GL debit+credit pairs collapse to one entity.
     #[test]
     fn test_dedupe_gl_pairs() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(out.len(), 2, "debit+credit pairs must collapse to one each");
     }
 
-    // Doc 08: with a transaction ref present, dedup keys on the REF, so two
+    // With a transaction ref present, dedup keys on the REF, so two
     // distinct entries sharing date+counterparty+amount are NOT collapsed.
     #[test]
     fn test_dedupe_gl_pairs_uses_ref() {

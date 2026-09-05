@@ -1,7 +1,7 @@
 package middleware
 
 // InternalAuth authenticates internal service-to-service calls (agent-runtime
-// -> API MCP tools) with a shared secret instead of a user JWT (doc 05 §3).
+// -> API MCP tools) with a shared secret instead of a user JWT.
 //
 // The request carries client_book_id in its JSON body; we resolve its firm and
 // set a firm_admin context so RLSInjector grants access to that book. Without

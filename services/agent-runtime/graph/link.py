@@ -1,7 +1,7 @@
 # services/agent-runtime/graph/link.py
 # Cross-linking algorithm — fuzzy matches entities across document types.
 # This is retrieval/scoring, NOT financial calculation.
-# Follows docs 06 §2 + 09 §1: bounded combinatorial group matching.
+# Bounded combinatorial group matching: groups, not 1:1:1 links.
 
 import structlog
 import jellyfish
@@ -21,7 +21,7 @@ DATE_WINDOW_DAYS = 3
 # before the payment; _dates_match keeps enforcing the tight 3-day window for
 # same-side legs (invoice↔invoice = the affected rows stay real). The rejection
 # for invoice-after-payment is an asymmetric cap that catches a real matching
-# error (doc 11 Round 5) without admitting spurious dates.
+# error without admitting spurious dates.
 INVOICE_LOOKBACK_DAYS = 14
 # Jaro-Winkler floor for two names to be "the same vendor". 0.80 admitted
 # confusable pairs (Stress Set #2: "Sunrise Landscaping & Grounds" vs "Sunrise
@@ -220,7 +220,7 @@ def _score_group(
 ) -> float:
     """Compute link confidence score 0.0-1.0.
 
-    Weights (doc 06 §2): amount 0.5, date 0.2, counterparty 0.3.
+    Weights: amount 0.5, date 0.2, counterparty 0.3.
     """
     if is_exact:
         return 1.0
@@ -302,20 +302,20 @@ def build_candidate_groups(
 ) -> List[ReconciliationGroup]:
     """Build candidate reconciliation groups using bounded combinatorial search.
 
-    doc 09 §1: groups, not 1:1:1 links. Handles:
+    Groups, not 1:1:1 links. Handles:
     - one bank payment covering N invoices (bounded by MAX_GROUP_SIZE)
     - one invoice paid in N installments
     - ambiguous ties (multiple equally-plausible groupings all surface)
     """
     candidates: List[ReconciliationGroup] = []
 
-    # Exclude voided entities from reconciliation entirely (doc 08 §5)
+    # Exclude voided entities from reconciliation entirely
     invoices = [e for e in invoices if e.entity_subtype != "void"]
     banks = [e for e in banks if e.entity_subtype != "void"]
     gls = [e for e in gls if e.entity_subtype != "void"]
 
     # Pass 1: 1:1:1 exact fast path — filtered by date window + counterparty
-    # (doc 06 §2: candidate search constrains amount AND date AND counterparty)
+    # (candidate search constrains amount AND date AND counterparty)
     for bank in banks:
         for inv in invoices:
             if not _dates_match(inv.transaction_date, bank.transaction_date):
@@ -388,7 +388,7 @@ def build_candidate_groups(
                             ))
 
     # Pass 4: bank+GL two-member groups — transactions with no invoice leg
-    # (deposits, bank fees) still reconcile bank against GL (doc 09 §1: a
+    # (deposits, bank fees) still reconcile bank against GL (a
     # group need not have all three legs).
     for bank in banks:
         for gl in gls:
@@ -414,7 +414,7 @@ def build_candidate_groups(
     # discrepancy a human must see, NOT a silent "unmatched". Mark it mismatch=True
     # so score_and_route routes it to needs_review regardless of the (hair-thin)
     # confidence threshold, and the verification tier computes the variance and
-    # flags severity (doc 12 §2 / Round 5). Pass 4 already covered matching
+    # flags severity. Pass 4 already covered matching
     # pairs; this pass catches the mismatch case it would have dropped.
     for bank in banks:
         for gl in gls:
@@ -436,7 +436,7 @@ def build_candidate_groups(
             # and amount) — e.g. BCH-2291 $899.00 sits against bank -89900 while
             # GL mis-posted 89400. The invoice belongs in the group so the
             # verification tier sees the full 3-way variance, not a dangling
-            # 2-member pair with an orphaned invoice (doc 12 §2).
+            # 2-member pair with an orphaned invoice.
             attached_invs = [
                 inv.id for inv in invoices
                 if _counterparties_match(inv.counterparty, bank.counterparty)
@@ -612,8 +612,8 @@ def score_and_route(
         # the strength of being obviously the same transaction, which it is. Those
         # are two different questions and only one of them was being asked.
         #
-        # This is a deliberate change to documented routing (doc 06 §2 describes
-        # the threshold, not this conjunct). The weights and thresholds are
+        # This narrows the auto-link gate rather than retuning it: the score
+        # threshold used to be the whole test. The weights and thresholds are
         # untouched; what changes is that clearing the threshold is now necessary
         # and not sufficient. A non-exact group still gets its score, still ranks
         # in the review queue by it, and is still linked as a group — it just

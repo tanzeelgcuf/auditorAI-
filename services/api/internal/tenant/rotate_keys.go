@@ -11,7 +11,7 @@ import (
 // HandleRotateKeys (POST /v1/admin/rotate-keys, firm_admin) rotates the firm's
 // data encryption key: a new key reference is activated and prior active keys
 // are moved to 'rotating' so ciphertext can be re-encrypted before retirement
-// (doc 05 §5). The key_ref is a storage reference (KMS id / envelope key path);
+// The key_ref is a storage reference (KMS id / envelope key path);
 // the key material itself never passes through the API.
 func (s *Service) HandleRotateKeys(w http.ResponseWriter, r *http.Request) {
 	firmID := middleware.GetFirmID(r.Context())

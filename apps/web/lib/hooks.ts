@@ -129,7 +129,7 @@ function norm(s: string): string {
 }
 
 /**
- * Auto-suggest a detected source column for a target field (doc 08 §1).
+ * Auto-suggest a detected source column for a target field.
  * Normalized substring/equality match against a per-field alias list.
  */
 function suggestField(field: string, headerNames: string[]): string {

@@ -29,7 +29,7 @@ type Service struct {
 	// verification, not writing, is what this service needs it for. May be nil
 	// when storage.New() failed at startup; HandleAddAttachment answers 503.
 	storage *storage.Client
-	// Notifier delivers report.generated webhook events (doc 07 §7). Injected by
+	// Notifier delivers report.generated webhook events. Injected by
 	// main.go to avoid an import cycle (webhooks imports nothing from findings).
 	Notifier ReportNotifier
 }
@@ -197,7 +197,7 @@ func (s *Service) HandleUpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If resolving, set reviewed_by/reviewed_at unless already reviewed (doc 10 §3)
+	// If resolving, set reviewed_by/reviewed_at unless already reviewed
 	if req.Status == "resolved" {
 		var reviewedBy *string
 		_ = c.QueryRow(r.Context(),
@@ -494,7 +494,7 @@ func (s *Service) HandleGetReport(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleGetCitation returns the exact source region (document, page, bbox) that
-// produced a finding — the product's core trust mechanism (doc 04/05).
+// produced a finding — the product's core trust mechanism.
 func (s *Service) HandleGetCitation(w http.ResponseWriter, r *http.Request) {
 	reportID := r.PathValue("reportId")
 	findingID := r.PathValue("findingId")

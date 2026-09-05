@@ -65,10 +65,12 @@ pub fn compute_greater_of_tolerance(
 /// Grouped tolerance: sum each group, then check variance across groups.
 /// For 3-way reconciliation: invoice_total vs bank_total vs gl_total.
 ///
-/// A leg may be absent (e.g. a deposit group is bank+GL only — doc 09). An
-/// absent leg contributes nothing: comparing it as 0 would inflate |0-bank| to
-/// the full bank amount and flag a balanced 2-leg group. Only variances between
-/// PRESENT legs are computed; absent legs are excluded.
+/// A leg may be absent (e.g. a deposit group is bank+GL only). A leg is present
+/// iff it has at least one entity — CLAUDE.md rule 10, presence is membership,
+/// not a non-zero total. An absent leg contributes nothing: comparing it as 0
+/// would inflate |0-bank| to the full bank amount and flag a balanced 2-leg
+/// group. Only variances between PRESENT legs are computed; absent legs are
+/// excluded.
 pub fn compute_three_way_variance(
     invoice_group: &[Decimal],
     bank_group: &[Decimal],
@@ -373,7 +375,7 @@ mod tests {
     }
 
     // Prompt 3 regression: a 2-leg group (bank+GL only, no invoice — deposits,
-    // fees, AR, doc 09) must not compare the absent invoice leg as 0. |0-bank|
+    // fees, AR) must not compare the absent invoice leg as 0. |0-bank|
     // would inflate to the full bank amount and flag a balanced group. Variance
     // must be computed only between present legs.
     #[test]

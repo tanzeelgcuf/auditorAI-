@@ -1,6 +1,6 @@
 package documents
 
-// ClamAV malware scan on upload (doc 06 §5) — accepting arbitrary file uploads
+// ClamAV malware scan on upload — accepting arbitrary file uploads
 // from users without a scan is a real risk. Uses clamdscan against the local
 // clamd daemon; if the daemon is down the upload is REJECTED (fail closed — we
 // don't want an unscanned file entering the pipeline).

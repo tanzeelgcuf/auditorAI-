@@ -1,4 +1,4 @@
-// First-login onboarding helpers (doc 07 §9).
+// First-login onboarding helpers.
 // v1 uses localStorage; the backend users.has_completed_onboarding flag is
 // deferred. ponytail: switch to the API flag once accounts have multi-device need.
 
