@@ -398,13 +398,40 @@ func main() {
 		r.Use(middleware.RLSInjector(pool))
 
 		// Tenant/Book management
+		//
+		// The three write routes below are firm_admin-only, and were NOT before
+		// 2026-09-06. tenant.go carried two comments asserting the restriction —
+		// "Only firm_admin can assign staff — enforced by RequireRole middleware at
+		// /v1/admin" and "Only firm_admin can reach this route anyway (RequireRole on
+		// the /v1/admin group)" — but the routes are mounted HERE, in the general
+		// protected group, and the only RequireRole in this file is at the /v1/admin
+		// group below. The comments described an intention; the router applied none
+		// of it.
+		//
+		// What that cost: user_book_assignments is governed by
+		// assignments_own_firm_only (init.sql:606), which gates on FIRM, not on
+		// app.assigned_books. So for this one table the Go layer was the only
+		// book-level control, and HandleAssignStaff never checked bookId against the
+		// caller's assignments either. Any staff JWT could POST
+		// /v1/books/{anyBookInTheirFirm}/staff with their own user_id, and on the very
+		// next request RLSInjector recomputes app.assigned_books from that table —
+		// defeating the second level of the two-level RLS model outright and exposing
+		// every document, entity, group, finding and report of every client of the
+		// firm. HandleRemoveStaff was the mirror image: any staff could unassign the
+		// firm admin from any book.
+		//
+		// Kept at these paths rather than moved under /v1/admin: nothing in apps/web
+		// calls them (grep for "/staff" finds only the /admin/team nav link), so the
+		// path is free to move, but the role belongs on the route and moving URLs
+		// would make the fix look like a refactor in the diff. The handlers enforce
+		// firm membership of the target user independently — see tenant.go.
 		r.Route("/v1/books", func(r chi.Router) {
 			r.Get("/", tenantSvc.HandleListBooks)
-			r.Post("/", tenantSvc.HandleCreateBook)
+			r.With(middleware.RequireRole("firm_admin")).Post("/", tenantSvc.HandleCreateBook)
 			r.Get("/{bookId}", tenantSvc.HandleGetBook)
 			r.Patch("/{bookId}/settings", tenantSvc.HandleUpdateBookSettings)
-			r.Post("/{bookId}/staff", tenantSvc.HandleAssignStaff)
-			r.Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
+			r.With(middleware.RequireRole("firm_admin")).Post("/{bookId}/staff", tenantSvc.HandleAssignStaff)
+			r.With(middleware.RequireRole("firm_admin")).Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
 		})
 
 		// Documents — upload-url is a storage-abuse surface (presigned PUTs),

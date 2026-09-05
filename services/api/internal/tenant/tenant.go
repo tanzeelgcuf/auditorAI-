@@ -128,8 +128,16 @@ func (s *Service) HandleCreateBook(w http.ResponseWriter, r *http.Request) {
 	slog.Info("book created", "book_id", bookID, "firm_id", firmID, "user_id", userID)
 	// Both arms of the previous `if role == "firm_admin"` returned byte-identical
 	// bodies, which read as a role-dependent response that does not exist. Collapsed;
-	// no behaviour change. Only firm_admin can reach this route anyway (RequireRole on
-	// the /v1/admin group), so the branch could not have differentiated anything.
+	// no behaviour change.
+	//
+	// The comment here used to add "Only firm_admin can reach this route anyway
+	// (RequireRole on the /v1/admin group), so the branch could not have
+	// differentiated anything." That was FALSE when written: this route is mounted
+	// at main.go inside the general protected group, not under /v1/admin, and the
+	// only RequireRole in main.go is on that admin group. As of 2026-09-06 the claim
+	// is true because the route now carries
+	// `r.With(middleware.RequireRole("firm_admin"))` — the fix, not the comment, is
+	// what makes it so.
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"id": bookID, "client_name": req.ClientName,
 	})
@@ -303,25 +311,71 @@ func (s *Service) HandleUpdateBookSettings(w http.ResponseWriter, r *http.Reques
 	// Audit every config mutation into config_change_log (part of the same logical
 	// change). The write must run on the request's primed connection — CLAUDE.md
 	// rule 14; an unprimed write against an RLS table RAISES, it does not no-op.
-	s.auditConfigChange(r, bookID, settings.ClientName, "client_name")
-	s.auditConfigChange(r, bookID, settings.BaseCurrency, "base_currency")
-	s.auditConfigChange(r, bookID, settings.FiscalYearStartMonth, "fiscal_year_start_month")
-	s.auditConfigChange(r, bookID, settings.AutoLinkConfidenceThreshold, "auto_link_confidence_threshold")
-	s.auditConfigChange(r, bookID, settings.ReviewConfidenceFloor, "review_confidence_floor")
+	auditConfigChange(s, r, bookID, "client_name", settings.ClientName)
+	auditConfigChange(s, r, bookID, "base_currency", settings.BaseCurrency)
+	auditConfigChange(s, r, bookID, "fiscal_year_start_month", settings.FiscalYearStartMonth)
+	auditConfigChange(s, r, bookID, "auto_link_confidence_threshold", settings.AutoLinkConfidenceThreshold)
+	auditConfigChange(s, r, bookID, "review_confidence_floor", settings.ReviewConfidenceFloor)
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "settings updated"})
 }
 
-// auditConfigChange records a changed setting to config_change_log when the
-// pointer is non-nil. Old-value capture deferred; the change itself is recorded.
-func (s *Service) auditConfigChange(r *http.Request, bookID string, v interface{}, field string) {
+// auditConfigChange records one changed setting to config_change_log, and is a
+// no-op when the field was absent from the request body. Old-value capture is
+// still deferred; the change itself is recorded.
+//
+// It takes a TYPED pointer and is therefore a generic function rather than a
+// method, which is the fix for a real bug and not a style preference. It used to
+// be `func (s *Service) auditConfigChange(r, bookID string, v interface{}, field
+// string)`, and all five call sites hand it a `*string`/`*int`/`*float64`
+// straight out of the decoded body. Assigning a nil typed pointer to an
+// interface produces an interface value that is NOT equal to nil — it carries a
+// type descriptor — so `if v == nil` never once fired. A PATCH setting a single
+// field wrote FIVE rows: the real one plus four asserting that untouched fields
+// had changed. `strVal` then hit the identical trap one layer down, and its type
+// switch has no pointer case, so `fmt.Sprint` formatted the pointer itself: the
+// four fabricated rows recorded new_value "<nil>" and the REAL row recorded a
+// hex address like "0xc000123456" instead of the value the user set.
+// GET /v1/books/{bookId}/config-history serves exactly these rows, so the
+// customer-visible config audit trail was wrong in both directions at once —
+// inventing changes that never happened and mis-recording the one that did.
+//
+// Nothing type-checked wrong; this compiled clean and TestStrVal stayed green
+// because it only ever passed concrete values and an untyped nil, never the
+// typed pointer every real caller passes. With a `*T` parameter `v == nil` is an
+// ordinary pointer comparison, and `*v` hands strVal a string/int/float64 its
+// switch already handled correctly.
+func auditConfigChange[T any](s *Service, r *http.Request, bookID, field string, v *T) {
 	if v == nil {
 		return
 	}
 	userID := middleware.GetUserID(r.Context())
-	humanoverride.LogConfigChange(r.Context(), s.db, bookID, userID, field, nil, v)
+	humanoverride.LogConfigChange(r.Context(), s.db, bookID, userID, field, nil, *v)
 }
 
+// HandleAssignStaff grants a user access to a client book. firm_admin only, and
+// that is now enforced by the router (main.go) as well as asserted here.
+//
+// Before 2026-09-06 this function carried the comment "Only firm_admin can assign
+// staff — enforced by RequireRole middleware at /v1/admin" and NOTHING enforced
+// it: the route is mounted in the general protected group, the only RequireRole in
+// main.go is on the /v1/admin group, and this handler checked neither the caller's
+// role nor whether bookId was one of the caller's own assignments. It was a
+// privilege escalation, not a stale comment. user_book_assignments is governed by
+// assignments_own_firm_only (init.sql:606), which gates on FIRM rather than on
+// app.assigned_books, so RLS permitted a staff user to insert an assignment for
+// any book in their firm — and RLSInjector rebuilds app.assigned_books from this
+// very table on the next request, so one POST bought read access to every
+// document, entity, reconciliation group, finding and report of every client of
+// the firm.
+//
+// Two independent controls now stand where there were none, deliberately, because
+// a router-only fix rots the moment someone adds a second mount:
+//  1. RequireRole("firm_admin") on the route.
+//  2. The write itself SELECTs its values out of users and client_books on the
+//     RLS-primed connection, so the row is unconstructible unless both the target
+//     user and the book survive the caller's own firm policies. That makes
+//     Postgres the enforcement rather than a Go comparison a later edit can drop.
 func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
 	if bookID == "" {
@@ -329,7 +383,6 @@ func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only firm_admin can assign staff — enforced by RequireRole middleware at /v1/admin
 	var req struct {
 		UserID string `json:"user_id"`
 	}
@@ -342,8 +395,44 @@ func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(),
-		`INSERT INTO user_book_assignments (user_id, client_book_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
+	}
+
+	// Both existence checks run on the primed connection, so "not found" and "in
+	// another firm" are the same answer and neither leaks the difference. The
+	// comparison is `id::text = $1` rather than `id = $1` so a malformed path
+	// segment is a 404 instead of a 22P02 that surfaces as a 500.
+	var exists int
+	err := db.QueryRow(r.Context(),
+		`SELECT 1 FROM client_books WHERE id::text = $1`, bookID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+			return
+		}
+		slog.Error("failed to resolve book for staff assignment", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	err = db.QueryRow(r.Context(),
+		`SELECT 1 FROM users WHERE id::text = $1`, req.UserID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			return
+		}
+		slog.Error("failed to resolve user for staff assignment", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	_, err = db.Exec(r.Context(),
+		`INSERT INTO user_book_assignments (user_id, client_book_id)
+		 SELECT u.id, b.id FROM users u, client_books b
+		  WHERE u.id::text = $1 AND b.id::text = $2
+		 ON CONFLICT DO NOTHING`,
 		req.UserID, bookID)
 	if err != nil {
 		slog.Error("failed to assign staff", "error", err)
@@ -351,9 +440,27 @@ func (s *Service) HandleAssignStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An access grant is exactly the kind of event this product exists to make
+	// traceable, and it was previously unrecorded anywhere. config_change_log is
+	// book-scoped and already written on the primed connection, so the grant lands
+	// in the same trail GET /v1/books/{bookId}/config-history already serves.
+	humanoverride.LogConfigChange(r.Context(), s.db, bookID,
+		middleware.GetUserID(r.Context()), "staff_assigned", nil, req.UserID)
+
+	slog.Info("staff assigned to book", "book_id", bookID, "target_user_id", req.UserID,
+		"actor_user_id", middleware.GetUserID(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]string{"message": "staff assigned"})
 }
 
+// HandleRemoveStaff revokes a user's access to a client book. firm_admin only,
+// enforced by the router as of 2026-09-06 — see HandleAssignStaff for what the
+// missing gate cost. The mirror of that hole was that any staff user could
+// unassign anyone, including the firm admin, from any book in the firm.
+//
+// ponytail: this does not refuse to remove the last remaining assignee, nor the
+// caller themselves. Both are real policy questions (a book with no assignee is
+// invisible to everyone but a re-assigning admin) and inventing an answer here
+// would be worse than naming the gap.
 func (s *Service) HandleRemoveStaff(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
 	userID := r.PathValue("userId")
@@ -362,19 +469,40 @@ func (s *Service) HandleRemoveStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(),
-		`DELETE FROM user_book_assignments WHERE user_id = $1 AND client_book_id = $2`,
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
+	}
+
+	tag, err := db.Exec(r.Context(),
+		`DELETE FROM user_book_assignments
+		  WHERE user_id::text = $1 AND client_book_id::text = $2`,
 		userID, bookID)
 	if err != nil {
 		slog.Error("failed to remove staff", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove staff"})
 		return
 	}
+	// assignments_own_firm_only bounds the DELETE to this firm's books, so zero
+	// rows means "there was nothing to remove", not "removal was refused". Saying
+	// so keeps a no-op from reading as a successful revocation in an audit review.
+	if tag.RowsAffected() == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "assignment not found"})
+		return
+	}
 
+	humanoverride.LogConfigChange(r.Context(), s.db, bookID,
+		middleware.GetUserID(r.Context()), "staff_removed", nil, userID)
+
+	slog.Info("staff removed from book", "book_id", bookID, "target_user_id", userID,
+		"actor_user_id", middleware.GetUserID(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]string{"message": "staff removed"})
 }
 
-// HandleListStaff lists all users in the current firm (admin only)
+// HandleListStaff lists all users in the current firm (admin only — RequireRole
+// on the /v1/admin group, main.go, which for THIS handler is accurate; two of its
+// neighbours made the same claim without the mount to back it, see
+// HandleAssignStaff).
 func (s *Service) HandleListStaff(w http.ResponseWriter, r *http.Request) {
 	firmID := middleware.GetFirmID(r.Context())
 	if firmID == "" {
@@ -382,7 +510,12 @@ func (s *Service) HandleListStaff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := middleware.DB(r.Context(), s.db).Query(r.Context(),
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
+	}
+
+	rows, err := db.Query(r.Context(),
 		"SELECT id::text, email, role FROM users WHERE firm_id = $1 ORDER BY created_at DESC", firmID)
 	if err != nil {
 		slog.Error("failed to list staff", "error", err)
@@ -395,9 +528,19 @@ func (s *Service) HandleListStaff(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, email, role string
 		if err := rows.Scan(&id, &email, &role); err != nil {
+			slog.Error("failed to scan staff row", "error", err)
 			continue
 		}
 		staff = append(staff, map[string]string{"id": id, "email": email, "role": role})
+	}
+	// Same reason as HandleListBooks: without rows.Err() a connection failure
+	// mid-stream answers 200 with a short list, and a truncated team list is
+	// indistinguishable from staff having been removed. The bare `continue` above
+	// also swallowed scan errors silently; it now logs.
+	if err := rows.Err(); err != nil {
+		slog.Error("staff list iteration failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
 	}
 	if staff == nil {
 		staff = []map[string]string{}
@@ -412,8 +555,13 @@ func (s *Service) HandleGetFirmSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
+	}
+
 	var name, brandColor, reportFooter string
-	err := middleware.DB(r.Context(), s.db).QueryRow(r.Context(),
+	err := db.QueryRow(r.Context(),
 		"SELECT name, brand_primary_color, COALESCE(report_footer_text, '') FROM firms WHERE id = $1",
 		firmID).Scan(&name, &brandColor, &reportFooter)
 	if err != nil {
@@ -446,6 +594,11 @@ func (s *Service) HandleUpdateFirmSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
+	}
+
 	setClauses := []string{}
 	args := []interface{}{}
 	argIdx := 1
@@ -472,7 +625,7 @@ func (s *Service) HandleUpdateFirmSettings(w http.ResponseWriter, r *http.Reques
 
 	args = append(args, firmID)
 	query := "UPDATE firms SET " + join(setClauses, ", ") + " WHERE id = $" + itoa(argIdx)
-	_, err := middleware.DB(r.Context(), s.db).Exec(r.Context(), query, args...)
+	_, err := db.Exec(r.Context(), query, args...)
 	if err != nil {
 		slog.Error("failed to update firm settings", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update settings"})
