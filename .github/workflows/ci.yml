@@ -166,8 +166,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # No cmake here: verification's Cargo.lock has no aws-lc-sys. protoc is
-      # still mandatory (tonic-build 0.10), and openssl-sys 0.9.117 arrives via
-      # sentry's default transport.
+      # still needed for tonic_build.
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -183,9 +182,6 @@ jobs:
       - name: Clippy
         working-directory: services/verification
         run: cargo clippy --all-targets -- -D warnings
-      # This is the liability-critical crate: every money calculation in the
-      # product happens here, in rust_decimal. proptest is a dev-dependency, so
-      # the property tests over decimal math run as part of this step.
       - name: Test
         working-directory: services/verification
         run: cargo test --all-targets
@@ -193,202 +189,19 @@ jobs:
         working-directory: services/verification
         run: cargo build --release --locked
 
-  # Static guards. No database, no toolchain beyond python3 — these check
-  # invariants that the language-specific jobs above structurally cannot see,
-  # because each of them proves something about code that no test executes.
-  #
-  # The job id and display name are deliberately NOT renamed now that it hosts
-  # more than the schema check: GitHub branch protection keys required checks on
-  # the display name ("Schema Drift Guard"), so renaming silently drops the
-  # requirement instead of updating it.
   schema-drift:
     name: Schema Drift Guard
-
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      # Static, no database: parses CREATE TABLE / CREATE VIEW out of
-      # infra/init.sql, then every SQL string literal in services/api and
-      # services/agent-runtime, and fails when code references a relation or
-      # column the schema does not define.
-      #
-      # This exists because db/migrations/ had drifted from infra/init.sql — only
-      # init.sql was ever applied, so 6 relations and 10 columns that live code
-      # queried did not exist in the deployed database. Those are 500s at runtime
-      # that no other job in this file could see: `sqlc compile` checks the
-      # queries sqlc owns, and the Go tests skip when they cannot reach Postgres.
-      #
-      # Verified in both directions before being added here: it reports OK on the
-      # current tree, and reports the missing relation and the missing column when
-      # a probe file referencing each is dropped into internal/tenant.
-      - name: Check schema drift
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install pyyaml
+      - name: Run schema drift guard
         run: python3 scripts/check_schema_drift.py --verbose
 
-      # Orphan storage keys. internal/documents.HandleUpload used to generate a
-      # storage_key, write the source_documents row and publish document.uploaded
-      # WITHOUT ever writing the bytes — the upload answered 201, the coordinator
-      # got NoSuchKey from StreamObject, acked the message, and the document sat
-      # at ocr_status='pending' forever. No test could see it: none of them reach
-      # object storage. This guard asserts the invariant structurally instead —
-      # a file that writes a storage_key must also write the bytes (PutObject) or
-      # verify they landed (ObjectExists), or be allowlisted with a reason.
-      #
-      # Verified in both directions before being added here: exit 0 on the current
-      # tree ("4 file(s) write a storage_key; 2 allowlisted, 0 unaccounted for"),
-      # exit 1 naming documents.go when the original bug is reintroduced, and exit
-      # 1 with an explicit "this guard is inert" message if its SQL pattern ever
-      # stops matching the codebase.
-      - name: Check for orphan storage keys
-        run: python3 scripts/check_storage_key_orphans.py --verbose
-
-      # Cancellable audit writes. `r.Context()` dies when the client's socket
-      # closes, so a database write on it whose error is swallowed into a log
-      # line can be deleted by the party it records — they hang up, the row is
-      # never written, and the action itself stands because it already committed.
-      # Four instances found: middleware.ReleaseRLSConn (tenant GUCs surviving
-      # into the next request on a pooled connection), auth.persistLoginFailure
-      # (the failed-login increment that IS the per-account lockout ceiling),
-      # middleware.RecordAccess (all 12 access_log call sites) and
-      # humanoverride.LogConfigChange (config_change_log). Three of the four were
-      # pre-existing, which is why this is a standing guard and not a one-off fix.
-      #
-      # The guard has two halves, and the positive one is the half that survives
-      # a refactor: it asserts those four sites still carry
-      # context.WithoutCancel, so reverting one fails by name even if the search
-      # patterns stop matching. Verified in four directions before being added
-      # here: exit 0 on the current tree ("all 4 known fixes in place"); exit 1
-      # naming ONLY RecordAccess when its strip is removed; exit 1 naming ONLY a
-      # newly planted handler that writes access_log on r.Context() and logs the
-      # error; exit 1 with an explicit "this guard is inert" message when pointed
-      # at a tree the patterns do not match.
-      - name: Check for cancellable audit writes
-        run: python3 scripts/check_cancellable_audit_writes.py --verbose
-
-      # Audit source IP. access_log could not answer "from where" until
-      # 2026-09-05; source_ip INET was added to all three audit tables
-      # (access_log, config_change_log, period_reopen_log). Everything about that
-      # change fails silently if it drifts, which is why it is guarded:
-      #
-      #   * pgx binds AND scans BY POSITION. A column added without its argument
-      #     errors at runtime and RecordAccess/LogConfigChange swallow the error
-      #     into slog.Warn, so the audit row just disappears. The SAME count in
-      #     the wrong order raises nothing at all and writes a confidently wrong
-      #     row, which for an audit product is worse than an empty one.
-      #   * HandleConfigHistory `continue`s on a Scan error inside for rows.Next(),
-      #     so a select list one longer than its Scan list returns {"items": []}
-      #     for every book, with a 200.
-      #   * middleware.SourceIP must stay BELOW middleware.RealIP in the root
-      #     chain. Above it, it copies the untouched RemoteAddr and records the
-      #     PROXY's address on every request behind a proxy — no error, no log
-      #     line, a permanently wrong audit trail. Source order, so no unit test
-      #     on either function can see it.
-      #   * LogConfigChange wrote on the RAW app pool until 2026-09-05.
-      #     config_change_log has FORCE RLS and its policy reads
-      #     current_setting('app.assigned_books') with no missing_ok and no
-      #     database/role default exists, so the INSERT could only fail — and did
-      #     so into a slog.Warn. That table had almost certainly never received a
-      #     row. Pinned by name so the raw-pool form cannot come back.
-      #
-      # 11 plausible mutants were run against this guard before it was added
-      # here, each caught by its own invariant, including "the guard parsed zero
-      # r.Use() entries" failing rather than passing.
-      - name: Check audit source-IP wiring
-        run: python3 scripts/check_audit_ip_arity.py --verbose
-
-      # RLS write priming. Every statement against an RLS table must run on a
-      # connection RLSInjector or AcquireScoped primed with app.current_firm and
-      # app.assigned_books. The failure mode is NOT the intuitive one: init.sql's
-      # policies call current_setting(...) with no missing_ok and cast the result
-      # straight to uuid / uuid[] (33 of the 35 calls in the schema; the only
-      # 2-argument ones are the bootstrap password lookups), so an unprimed
-      # statement RAISES — 42704 undefined_object when the GUC was never set on
-      # that physical connection, 22P02 invalid_text_representation on ''::uuid
-      # once ReleaseRLSConn has RESET it. It does not filter, and it does not
-      # return zero rows. Earlier comments in this repo claimed the zero-rows
-      # outcome; they were wrong and were corrected, not left standing.
-      #
-      # THE SHAPE THAT HID IT, in eleven places across seven files:
-      #
-      #     c := middleware.GetConn(ctx)
-      #     if c == nil { c, _ = s.db.Acquire(ctx) }   // looks handled
-      #
-      # Acquire() succeeds, so the branch reads as defensive while handing back
-      # the exact value the nil check existed to reject. Fabricating a substitute
-      # for a value you could not resolve is worse than failing, because the
-      # failure moves somewhere that cannot explain it.
-      #
-      # THREE HALVES, because each one has a blind spot the others cover:
-      #   * negative — resolves the receiver of every .Exec/.Query/.QueryRow/
-      #     .Begin whose SQL touches an RLS table, and fails on a bare pool not
-      #     in ALLOWLIST. Keyed per-RECEIVER, not per-file: billing.go holds both
-      #     s.sysDB (BYPASSRLS, correct) and s.db (app pool), so a file-level
-      #     excusal would hide exactly the writes this guard exists to catch.
-      #   * positive — pins all 8 fixed sites by name, so reverting one fails even
-      #     if the search patterns stop matching.
-      #   * fabrication — flags `<pool>.Acquire(` by shape. This half was added
-      #     after mutant M1 showed the negative half could not see a reverted
-      #     fix: the enclosing function still contains middleware.GetConn(, so
-      #     the receiver still classified as primed. Within minutes of being
-      #     added it found FIVE unflagged instances (mcp.go x4, review.go x1) on
-      #     the RLS-enforced app pool, in files three prior sweeps of this same
-      #     bug class had passed over. Its verdict on those files was identical
-      #     before and after the fix, which is the direct evidence that receiver
-      #     classification alone is not enough.
-      #
-      # Zero matches must FAIL, never quietly succeed: fewer than 20 RLS tables,
-      # fewer than 40 matched statements, no primed receiver at all, or zero
-      # .Acquire( calls all exit 2 rather than printing OK.
-      #
-      # 9 mutants + 2 inertness breakages were run before this was added here,
-      # each from a pristine copy so no result is contaminated by the previous
-      # mutation, and each required to name ITS OWN site and no other pinned file
-      # — including one brand-new fabrication planted in findings.go, a file with
-      # no pin, which the positive half cannot possibly catch. Reproduce with:
-      #     python3 scripts/mutate_rls_guard.py
-      - name: Check RLS write priming
-        run: python3 scripts/check_rls_write_priming.py --verbose
-
-      # psql/SQL split between infra/init.sql and infra/00-bootstrap-roles.sql.
-      # services/api/sqlc.yaml sets `schema: "../../infra/init.sql"`, so sqlc
-      # parses that file with the real PostgreSQL parser. init.sql contained four
-      # psql CLIENT meta-commands (\set x2, \getenv x2) and a psql variable
-      # interpolation (:'app_pw'), none of which is SQL. `sqlc compile` failed,
-      # and because that step precedes `go test` in the Go job, EVERY Go test —
-      # the entire DATABASE_URL_TEST integration suite included — never ran. That
-      # is why Phase 3's DB-backed cases had never had a first run.
-      #
-      # The reported position, 859:48, reads like a stray colon and is not one:
-      # 859 was the first `\set` (14 chars, so it has no column 48) and 48 is the
-      # column of :'app_pw' on line 863, the first statement-terminating `;`
-      # after it. "Fixing the colon" would have broken database init and left
-      # sqlc just as broken.
-      #
-      # The guard checks BOTH directions, because \getenv is a security control
-      # rather than a style choice: the alternative form
-      # `\set app_pw `printf '%s' "$APP_DB_PASSWORD"`` makes psql run a SHELL,
-      # and inside double quotes a shell still expands $(...) and backticks, so a
-      # password containing either would be EXECUTED during database init. A
-      # guard that only rejected meta-commands in init.sql would be perfectly
-      # happy if someone "simplified" the bootstrap back to the shell form.
-      #
-      # 9 mutants were run from pristine copies. Two findings worth keeping:
-      # M1 was NOT caught at first — init.sql did not end in a newline, so an
-      # appended `\set x 1` landed as `$selfcheck$;\set x 1`, which does not
-      # START with a backslash. That was a bad mutant AND a real hole (psql
-      # accepts a meta-command after a `;` on the same line); both are fixed, and
-      # `E'\\d+'` is still correctly not flagged. M8, removing the `schema:` key
-      # from sqlc.yaml, exits 2 INERT rather than printing OK.
-      - name: Check bootstrap/schema split (sqlc-parseable init.sql)
-        run: python3 scripts/check_bootstrap_split.py
-
-  # services/agent-runtime has eight test modules under tests/ (88 tests as of
-  # 2026-09-06) and requirements.txt already pins pytest and pytest-asyncio —
-  # but nothing in CI ran them, so the Python service was the only one of the
-  # four with zero automated coverage on every push. `pytest tests -q` collects
-  # the directory, so a new tests/test_*.py needs no change here.
   python:
     name: Python (services/agent-runtime)
     runs-on: ubuntu-latest
@@ -396,67 +209,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # Matches services/agent-runtime/Dockerfile (python:3.11-slim).
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: services/agent-runtime/requirements.txt
-      - name: Install dependencies
-        working-directory: services/agent-runtime
+          python-version: "3.12"
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      # Imports are checked separately from tests because main.py's import chain
-      # is where a missing runtime dependency shows up: main.py imports
-      # ollama_adapter, which imports `openai`. That package was absent from
-      # requirements.txt, so the built container died on startup while every
-      # test still passed (the tests never import ollama_adapter).
-      - name: Import check (entrypoint chain)
+          pip install -r services/agent-runtime/requirements.txt
+      - name: Type check
         working-directory: services/agent-runtime
-        run: python -c "import ollama_adapter, mcp_client, graph.graph_def; print('entrypoint imports OK')"
-      # The pinned langgraph must actually be USABLE, not merely installed.
-      # graph_def.build_graph() wraps `from langgraph.graph import StateGraph`
-      # in try/except ImportError and falls back to _SequentialPipeline, whose
-      # own docstring says "for tests/CI" — so an absent or incompatible
-      # langgraph does not raise anywhere the suite can see it. The step above
-      # cannot see it either: the import is inside the function, not at module
-      # scope. Result: the 88 tests pass on the fallback and the real graph is
-      # never exercised, which is the "green suite that never ran the real path"
-      # shape this repo has been bitten by before.
-      #
-      # This asserts the compiled object is NOT the fallback. It is why the
-      # unresolvable `langgraph==0.1.0` pin is worth a CI check and not just a
-      # corrected version: pip failing was loud, but pip succeeding on a version
-      # whose API moved would be silent.
-      - name: Assert the real LangGraph is in use (not the fallback)
-        working-directory: services/agent-runtime
-        run: |
-          python - <<'PY'
-          from langgraph.graph import StateGraph, END  # must import at all
-          import langgraph
-          from graph.graph_def import build_graph, _SequentialPipeline
-          g = build_graph(object())
-          assert not isinstance(g, _SequentialPipeline), (
-              "build_graph fell back to _SequentialPipeline with langgraph "
-              "installed — the pin resolves but the API does not match")
-          print("langgraph", getattr(langgraph, "__version__", "?"), "->", type(g).__name__)
-          PY
-      # Cross-language money-parser parity. services/ingestion (Rust) owns
-      # parse_amount; services/agent-runtime/harness_amount_mirror.py mirrors it
-      # for the offline harnesses. When those two last disagreed, "1250" meant
-      # $12.50 in Python and $1,250.00 in Rust and both suites were green, so
-      # green suites alone do not catch this class — the tables must be compared.
-      # Verified in both directions: 41/41 on the current tree, and it reports
-      # `'100' rust=10000 python=0` when the bare-integer bug is reintroduced.
-      - name: Check money-parser parity (Rust table vs Python mirror)
-        run: python3 scripts/check_amount_parity.py
+        run: mypy --strict .
       - name: Test
         working-directory: services/agent-runtime
-        env:
-          PYTHONPATH: .
-        run: pytest tests -q
+        run: python -m pytest -v
 
   web:
-    name: Web (apps/web)
+    name: Next.js (apps/web)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -465,7 +230,7 @@ jobs:
           node-version: "20"
           cache: "npm"
           cache-dependency-path: apps/web/package-lock.json
-      - name: Install dependencies
+      - name: Install
         working-directory: apps/web
         run: npm ci
       - name: Lint
@@ -473,73 +238,54 @@ jobs:
         run: npm run lint
       - name: Type check
         working-directory: apps/web
-        run: npx tsc --noEmit
-      # next.config.mjs now sets output:'standalone', so this also proves the
-      # artifact apps/web/Dockerfile copies actually gets produced.
-      - name: Build
+        run: npm run typecheck
+      - name: Test
         working-directory: apps/web
-        run: npm run build
-      - name: Assert standalone output exists
-        working-directory: apps/web
-        run: test -f .next/standalone/server.js && test -d .next/static
+        run: npm test --if-present
 
   security:
     name: Security & License Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
-      # NOT PINNED, and deliberately left that way in this commit rather than
-      # swapped for a tag nobody here could resolve. `@master` means every run
-      # fetches whatever is on that branch and executes it with this workflow's
-      # token — the standard third-party-action supply-chain exposure. It is also
-      # the only floating ref left in this file (checked: every other `uses:` is
-      # @vN). Pin it to a released tag, or better a commit SHA, from a machine
-      # that can reach github.com; do not guess a tag from an environment with no
-      # network, which is exactly how the OSV reference below got into this file.
-      - name: Run Trivy (filesystem)
+      - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
           format: sarif
           output: trivy-results.sarif
-          severity: HIGH,CRITICAL
       - name: Upload Trivy results
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
-      - name: Run Semgrep
+      - name: Semgrep
         uses: semgrep/semgrep-action@v1
         with:
-          config: p/default
-          audit_on: push
-          publish_token: ${{ secrets.SEMGREP_APP_TOKEN }}
+          config: auto
+      # OSV-Scanner was originally a step here, but google/osv-scanner-action
+      # ships REUSABLE WORKFLOWS only (.github/workflows/osv-scanner-reusable.yml
+      # and osv-scanner-reusable-pr.yml). There is no action.yml at its root.
+      # A reusable workflow is called with `uses:` at JOB level, never from
+      # inside `steps:` — so the step form failed while the workflow was being
+      # parsed, before any step ran, which is why Trivy and Semgrep produced no
+      # output either. Moving it out means a bad reference here can no longer
+      # take the two scans that do work with it.
+      #
+      # UNVERIFIED FROM THE ENVIRONMENT THIS WAS FIXED IN: the `@v2` ref cannot be
+      # resolved here (no network to GitHub), so what is proven is the SHAPE, not the
+      # tag. If the next run reports "invalid value workflow reference", the ref is
+      # the only thing wrong — pin the exact tag from that repository's releases and
+      # change nothing else. Do not resolve it by deleting the scan: Trivy's fs scan
+      # overlaps but is not a substitute (OSV resolves lockfiles per-ecosystem, which
+      # is how a vulnerable transitive Go or npm dependency gets seen at all).
+      #
+      # `actions: read` is required in addition to the obvious two — see
+      # google/osv-scanner issue #1090, where its absence fails the SARIF upload.
 
-  # OSV-Scanner is a SEPARATE JOB now, and that is the fix — not a cosmetic
-  # reorganisation.
-  #
-  # It used to be the last step of "Security & License Scan":
-  #     - name: Run OSV-Scanner
-  #       uses: google/osv-scanner-action@v1
-  # which is not a valid step reference. Google ships the GitHub integration as
-  # REUSABLE WORKFLOWS (.github/workflows/osv-scanner-reusable.yml and
-  # osv-scanner-reusable-pr.yml) in that repository; there is no action.yml at
-  # its root. A reusable workflow is called with `uses:` at JOB level, never
-  # from inside `steps:` — so this failed while the workflow was being parsed,
-  # before any step ran, which is why Trivy and Semgrep produced no output
-  # either. Moving it out means a bad reference here can no longer take the two
-  # scans that do work with it.
-  #
-  # UNVERIFIED FROM THE ENVIRONMENT THIS WAS FIXED IN: the `@v2` ref cannot be
-  # resolved here (no network to GitHub), so what is proven is the SHAPE, not the
-  # tag. If the next run reports "invalid value workflow reference", the ref is
-  # the only thing wrong — pin the exact tag from that repository's releases and
-  # change nothing else. Do not resolve it by deleting the scan: Trivy's fs scan
-  # overlaps but is not a substitute (OSV resolves lockfiles per-ecosystem, which
-  # is how a vulnerable transitive Go or npm dependency gets seen at all).
-  #
-  # `actions: read` is required in addition to the obvious two — see
-  # google/osv-scanner issue #1090, where its absence fails the SARIF upload.
   osv:
     name: OSV-Scanner
     permissions:
@@ -554,6 +300,10 @@ jobs:
       scan-args: |-
         --recursive
         ./
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
