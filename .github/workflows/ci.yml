@@ -89,7 +89,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v4
         with:
-          version: v2.12
+          version: v2.12.2
           working-directory: services/api
 
       # Four DSNs, and the split between them is the test contract:
