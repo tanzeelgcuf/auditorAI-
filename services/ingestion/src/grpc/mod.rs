@@ -170,12 +170,18 @@ impl IngestionService for IngestionServiceImpl {
         let response = match format {
             DetectedFormat::Csv => {
                 let backend = crate::ocr::structured::CsvParser::new(
-                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
+                    process_req.column_map.clone(),
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
                 backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
             DetectedFormat::Xlsx => {
                 let backend = crate::ocr::structured::XlsxParser::new(
-                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
+                    process_req.column_map.clone(),
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
                 backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
             DetectedFormat::Ofx => {
@@ -184,7 +190,9 @@ impl IngestionService for IngestionServiceImpl {
                 // Not Found — the structured ofx parser was never routed to.
                 // Prompt B wiring-first catch.
                 let backend = crate::ocr::structured::OfxParser::new(
-                    self.s3_client.clone(), self.bucket.clone());
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
                 backend.process(&process_req).await.map_err(ocr_error_to_status)?
             }
             _ => {

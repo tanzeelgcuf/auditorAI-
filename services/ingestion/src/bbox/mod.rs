@@ -20,8 +20,12 @@ impl BoundingBox {
     }
 
     pub fn from_pixel_coords(
-        x: f32, y: f32, width: f32, height: f32,
-        page_width: f32, page_height: f32
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        page_width: f32,
+        page_height: f32,
     ) -> Self {
         Self {
             x: (x / page_width).clamp(0.0, 1.0),
@@ -31,7 +35,11 @@ impl BoundingBox {
         }
     }
 
-    pub fn to_pixel_coords(&self, page_width: f32, page_height: f32) -> (f32, f32, f32, f32) {
+    pub fn to_pixel_coords(
+        &self,
+        page_width: f32,
+        page_height: f32,
+    ) -> (f32, f32, f32, f32) {
         (
             self.x * page_width,
             self.y * page_height,
@@ -100,7 +108,14 @@ mod tests {
 
     #[test]
     fn test_bbox_normalization() {
-        let bbox = BoundingBox::from_pixel_coords(100.0, 200.0, 50.0, 30.0, 1000.0, 2000.0);
+        let bbox = BoundingBox::from_pixel_coords(
+            100.0,
+            200.0,
+            50.0,
+            30.0,
+            1000.0,
+            2000.0,
+        );
         assert_eq!(bbox.x, 0.1);
         assert_eq!(bbox.y, 0.1);
         assert_eq!(bbox.width, 0.05);

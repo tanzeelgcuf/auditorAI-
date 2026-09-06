@@ -458,8 +458,11 @@ mod tests {
     fn test_format_formula() {
         let formula = format_formula(
             "GL Reconciliation",
-            dec!(1500.00), dec!(1500.00), dec!(1500.50),
-            dec!(0.50), 1,
+            dec!(1500.00),
+            dec!(1500.00),
+            dec!(1500.50),
+            dec!(0.50),
+            1,
         );
         assert!(formula.contains("GL Reconciliation"));
         assert!(formula.contains("variance=0.50"));
@@ -473,8 +476,11 @@ mod tests {
     fn test_format_formula_zero_values() {
         let formula = format_formula(
             "Reconciliation",
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            Decimal::ZERO, 0,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            0,
         );
         assert!(formula.contains("Reconciliation"));
         assert!(formula.contains("variance=0.00"));

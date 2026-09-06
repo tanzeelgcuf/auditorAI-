@@ -288,7 +288,10 @@ mod tests {
         let svc = VerificationServiceImpl::new(engine);
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10000, 10000, 10000, 1,
+            10000,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 0);
@@ -315,7 +318,10 @@ mod tests {
         // variance = 1 cent, tolerance = 10 => info (within tolerance)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10001, 10000, 10000, 10,
+            10001,
+            10000,
+            10000,
+            10,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 1);
@@ -330,7 +336,10 @@ mod tests {
         // variance = 2 cents, tolerance = 1 => low
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10002, 10000, 10000, 1,
+            10002,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "low");
@@ -344,7 +353,10 @@ mod tests {
         // variance = 15 cents, tolerance = 1 => medium (10 < 15 <= 100)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10015, 10000, 10000, 1,
+            10015,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "medium");
@@ -358,7 +370,19 @@ mod tests {
         // variance = 150 cents, tolerance = 1 => high (> 100)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10150, 10000, 10000, 1,
+            10150,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            1,
+make_req(
+            &Uuid::new_v4().to_string(),
+            
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "high");
@@ -373,7 +397,19 @@ mod tests {
         // t=1, t*10=10, t*100=100. 50 > 10 and 50 <= 100 => medium
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10000, 10000, 10050, 1,
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10050,
+make_req(
+            &Uuid::new_v4().to_string(),
+            1,
+make_req(
+            &Uuid::new_v4().to_string(),
+            
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 50);
@@ -386,7 +422,16 @@ mod tests {
         let svc = VerificationServiceImpl::new(engine);
         let req = tonic::Request::new(make_req(
             "not-a-uuid",
-            10000, 10000, 10000, 1,
+make_req(
+            10000,
+make_req(
+            10000,
+make_req(
+            10000,
+make_req(
+            1,
+make_req(
+            
         ));
         let result = svc.evaluate_reconciliation(req).await;
         assert!(result.is_err());
@@ -401,7 +446,19 @@ mod tests {
         // vib=5, igl=10, bgl=5 => max = 10
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            100, 95, 90, 1,
+            100,
+make_req(
+            &Uuid::new_v4().to_string(),
+            95,
+make_req(
+            &Uuid::new_v4().to_string(),
+            90,
+make_req(
+            &Uuid::new_v4().to_string(),
+            1,
+make_req(
+            &Uuid::new_v4().to_string(),
+            
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 10);
@@ -505,7 +562,19 @@ mod tests {
         // Same input but with different tolerance (passed at runtime, not compile-time)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10050, 10000, 10000, 10,
+            10050,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10,
+make_req(
+            &Uuid::new_v4().to_string(),
+            
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         // variance=50, tolerance=10 => low (10<50<=100)
@@ -514,7 +583,19 @@ mod tests {
         // With tolerance=100, variance=50 => info (within tolerance)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10050, 10000, 10000, 100,
+            10050,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            10000,
+make_req(
+            &Uuid::new_v4().to_string(),
+            100,
+make_req(
+            &Uuid::new_v4().to_string(),
+            
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "info");
