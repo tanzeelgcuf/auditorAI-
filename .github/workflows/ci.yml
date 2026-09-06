@@ -550,17 +550,10 @@ jobs:
     # Ref pinned to google/osv-scanner-action release v2.5.1 (commit 6e4298e).
     # If this fails again, check releases page for the new tag; do not guess.
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.1
-    # Ref pinned to google/osv-scanner-action release v2.5.1 (commit 6e4298e).
-    # If this fails again, check releases page for the new tag; do not guess.
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.1
     with:
       scan-args: |-
         --recursive
         ./
-
-  docker:
-    name: Docker Build
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
