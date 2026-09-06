@@ -49,17 +49,17 @@ impl BoundingBox {
     }
 
     pub fn contains(&self, other: &BoundingBox) -> bool {
-        other.x >= self.x &&
-        other.y >= self.y &&
-        other.x + other.width <= self.x + self.width &&
-        other.y + other.height <= self.y + self.height
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.width <= self.x + self.width
+            && other.y + other.height <= self.y + self.height
     }
 
     pub fn intersects(&self, other: &BoundingBox) -> bool {
-        self.x < other.x + other.width &&
-        self.x + self.width > other.x &&
-        self.y < other.y + other.height &&
-        self.y + self.height > other.y
+        self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.y < other.y + other.height
+            && self.y + self.height > other.y
     }
 
     pub fn intersection_area(&self, other: &BoundingBox) -> f32 {

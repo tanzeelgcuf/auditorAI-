@@ -384,6 +384,12 @@ func (r *responseRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// EncodeJSON returns the JSON encoding of v as a byte slice.
+// Used by handlers to produce idempotency-cacheable response bodies.
+func EncodeJSON(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
+}
+
 // writeProblem writes an RFC 7807 problem+json response
 func writeProblem(w http.ResponseWriter, r *http.Request, typ, title string, status int, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
