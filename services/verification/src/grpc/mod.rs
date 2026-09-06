@@ -1,9 +1,9 @@
 // services/verification/src/grpc/mod.rs
-use tonic::{Request, Response, Status};
-use uuid::Uuid;
 use std::sync::Arc;
 
 use rust_decimal::prelude::*;
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use crate::decimal_math;
 use crate::zen::{RuleEngine, ReconciliationInput};

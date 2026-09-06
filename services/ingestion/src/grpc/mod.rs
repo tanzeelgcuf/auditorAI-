@@ -1,11 +1,12 @@
-use crate::ocr::{
-    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError,
-    ProcessDocumentRequest,
-};
 use std::sync::Arc;
 
 use async_nats::jetstream::Context as JetStream;
 use tonic::{Request, Response, Status};
+
+use crate::ocr::{
+    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError,
+    ProcessDocumentRequest,
+};
 
 pub mod ingestion_service {
     tonic::include_proto!("ingestion");
