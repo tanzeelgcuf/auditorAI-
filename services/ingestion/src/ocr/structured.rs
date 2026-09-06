@@ -858,8 +858,14 @@ mod tests {
     // OFX timestamps are YYYYMMDDHHMMSS — parse_date must take the date portion.
     #[test]
     fn test_parse_date_ofx_timestamp() {
-        assert_eq!(parse_date("20260606120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 6).unwrap()));
-        assert_eq!(parse_date("20260608120000"), Some(NaiveDate::from_ymd_opt(2026, 6, 8).unwrap()));
+        assert_eq!(
+            parse_date("20260606120000"),
+            Some(NaiveDate::from_ymd_opt(2026, 6, 6).unwrap())
+        );
+        assert_eq!(
+            parse_date("20260608120000"),
+            Some(NaiveDate::from_ymd_opt(2026, 6, 8).unwrap())
+        );
     }
 
     // Double-entry GL debit+credit pairs collapse to one entity.
@@ -876,13 +882,22 @@ mod tests {
             transaction_ref: None,
             currency: "USD".into(),
             page_number: 1,
-            bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            bbox: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
             confidence: 1.0,
             source_format: "structured".into(),
         };
         let input = vec![mk(47125), mk(47125), mk(21500), mk(-21500)];
         let out = dedupe_gl_pairs(input);
-        assert_eq!(out.len(), 2, "debit+credit pairs must collapse to one each");
+        assert_eq!(
+            out.len(),
+            2,
+            "debit+credit pairs must collapse to one each"
+        );
     }
 
     // With a transaction ref present, dedup keys on the REF, so two
@@ -900,7 +915,12 @@ mod tests {
             transaction_ref: Some(rf.to_string()),
             currency: "USD".into(),
             page_number: 1,
-            bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            bbox: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
             confidence: 1.0,
             source_format: "structured".into(),
         };
@@ -910,6 +930,10 @@ mod tests {
         assert_eq!(out.len(), 2, "distinct refs must not be collapsed");
         // Same ref, debit+credit legs = 1 entry.
         let input2 = vec![mk(47125, "X"), mk(47125, "X")];
-        assert_eq!(dedupe_gl_pairs(input2).len(), 1, "same ref legs collapse to one");
+        assert_eq!(
+            dedupe_gl_pairs(input2).len(),
+            1,
+            "same ref legs collapse to one"
+        );
     }
 }

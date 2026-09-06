@@ -40,7 +40,7 @@ DOC_ID = UUID("22222222-2222-2222-2222-222222222222")
 DAY = date(2026, 3, 10)
 
 
-def ent(etype, amount_cents, subtype="standard"):
+def ent(etype: str, amount_cents: int, subtype: str = "standard") -> ExtractedEntity:
     return ExtractedEntity(
         client_book_id=BOOK_ID,
         source_document_id=DOC_ID,
@@ -79,7 +79,12 @@ class FakeClient:
         return r
 
 
-def group(invoices, banks, gls, status="auto_linked"):
+def group(
+    invoices: list[ExtractedEntity],
+    banks: list[ExtractedEntity],
+    gls: list[ExtractedEntity],
+    status: str = "auto_linked",
+) -> ReconciliationGroup:
     return ReconciliationGroup(
         client_book_id=BOOK_ID,
         invoice_entity_ids=[e.id for e in invoices],
@@ -90,7 +95,11 @@ def group(invoices, banks, gls, status="auto_linked"):
     )
 
 
-def state_for(groups, entities, tolerance=1):
+def state_for(
+    groups: list[ReconciliationGroup],
+    entities: list[ExtractedEntity],
+    tolerance: int = 1,
+) -> dict:
     return {
         "client_book_id": BOOK_ID,
         "book_config": BookConfig(id=BOOK_ID, tolerance_cents=tolerance),
@@ -101,7 +110,7 @@ def state_for(groups, entities, tolerance=1):
 
 # ---- 1. the presence flags reach the wire ----
 
-def test_presence_flags_are_sent():
+def test_presence_flags_are_sent() -> None:
     """Defect 1. Without these three kwargs the Rust side sees no legs at all and
     cannot return exceeds_tolerance=true for any input."""
     inv, bank, gl = ent("invoice_line_item", 89900), ent("bank_transaction", -89900), ent("gl_entry", 89900)
@@ -121,7 +130,7 @@ def test_presence_flags_are_sent():
     assert call["client_book_id"] == str(BOOK_ID)
 
 
-def test_absent_leg_reports_false_not_a_zero_total():
+def test_absent_leg_reports_false_not_a_zero_total() -> None:
     """A two-leg group (bank+GL only — deposits, fees) must report
     has_invoice=false, NOT has_invoice=true with a total of 0. Those two are
     different questions to the money tier: absent means 'do not compare this
@@ -137,7 +146,7 @@ def test_absent_leg_reports_false_not_a_zero_total():
     assert call["invoice_amount_cents"] == 0
 
 
-def test_zero_net_leg_is_present_with_total_zero():
+def test_zero_net_leg_is_present_with_total_zero() -> None:
     """The other half of the same rule, and the one that diverged from
     verify_worker.go's BOOL_OR(m.role=…): an invoice plus its full credit note
     nets to 0, but the leg HAS members, so it is present with total 0 and Rust
@@ -157,7 +166,7 @@ def test_zero_net_leg_is_present_with_total_zero():
     assert g.status == "needs_review"
 
 
-def test_totals_are_a_plain_sum_of_extracted_cents():
+def test_totals_are_a_plain_sum_of_extracted_cents() -> None:
     """The node may sum already-extracted integer cents to fill the request; it
     must not compute a variance, a percentage, or a verdict. Asserted here as
     the literal expected sums so a stray calculation shows up as a diff."""
@@ -176,7 +185,7 @@ def test_totals_are_a_plain_sum_of_extracted_cents():
 
 # ---- 2. the verdict is applied ----
 
-def test_exceeds_tolerance_downgrades_to_needs_review():
+def test_exceeds_tolerance_downgrades_to_needs_review() -> None:
     """Defect 2. The result used to land in state['results'], which nothing
     reads, while status stayed auto_linked and main.py persisted it."""
     inv, bank, gl = ent("invoice_line_item", 89900), ent("bank_transaction", -89899), ent("gl_entry", 89901)
@@ -189,7 +198,7 @@ def test_exceeds_tolerance_downgrades_to_needs_review():
     )
 
 
-def test_clean_verdict_leaves_auto_linked_alone():
+def test_clean_verdict_leaves_auto_linked_alone() -> None:
     """The fix must not invert into flagging everything."""
     inv, bank, gl = ent("invoice_line_item", 89900), ent("bank_transaction", -89900), ent("gl_entry", 89900)
     g = group([inv], [bank], [gl])
@@ -199,7 +208,7 @@ def test_clean_verdict_leaves_auto_linked_alone():
     assert g.status == "auto_linked"
 
 
-def test_needs_review_group_is_never_promoted():
+def test_needs_review_group_is_never_promoted() -> None:
     """Downgrade only, never promote — same rule as verify_worker.go's
     `AND status = 'auto_linked'` guard. exceeds_tolerance=false answers 'the
     amounts reconcile', not 'a human need not look': a group is in review for
@@ -216,7 +225,7 @@ def test_needs_review_group_is_never_promoted():
 
 # ---- 3. failure paths fail closed ----
 
-def test_grpc_exception_fails_closed():
+def test_grpc_exception_fails_closed() -> None:
     """Defect 3. A group whose verification call blew up is a group nothing
     verified; leaving it auto_linked publishes it as reconciled."""
     inv, bank, gl = ent("invoice_line_item", 89900), ent("bank_transaction", -89900), ent("gl_entry", 89900)
@@ -233,7 +242,7 @@ def test_grpc_exception_fails_closed():
     )
 
 
-def test_unresolved_member_fails_closed_without_calling_out():
+def test_unresolved_member_fails_closed_without_calling_out() -> None:
     """A member id with no matching classified entity would silently shrink that
     leg's total, and the money tier's answer would then be precise and wrong.
     Fail closed instead of verifying a total known to be incomplete."""
@@ -254,7 +263,7 @@ def test_unresolved_member_fails_closed_without_calling_out():
     assert any("Unresolved group members" in e for e in state.get("errors", []))
 
 
-def test_one_bad_group_does_not_stop_the_others():
+def test_one_bad_group_does_not_stop_the_others() -> None:
     """Per-group failure isolation: the first group raises, the second must still
     be verified and downgraded."""
     a_inv, a_bank, a_gl = ent("invoice_line_item", 10000), ent("bank_transaction", -10000), ent("gl_entry", 10000)
