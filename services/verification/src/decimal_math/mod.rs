@@ -2,8 +2,8 @@
 // ALL monetary arithmetic lives here — deterministic, unit-tested to 100% branch coverage.
 // NEVER use f32/f64 for money. ONLY rust_decimal::Decimal.
 
-use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,8 +39,7 @@ pub fn sum(values: &[Decimal]) -> MathResult<Decimal> {
 /// Returns (variance, exceeded).
 #[allow(dead_code)]
 pub fn check_tolerance(variance: Decimal, tolerance_cents: i64) -> (Decimal, bool) {
-    let tolerance_dec = Decimal::from_i64(tolerance_cents)
-        .unwrap_or(Decimal::ZERO);
+    let tolerance_dec = Decimal::from_i64(tolerance_cents).unwrap_or(Decimal::ZERO);
     (variance, variance > tolerance_dec)
 }
 
@@ -76,9 +75,21 @@ pub fn compute_three_way_variance(
     bank_group: &[Decimal],
     gl_group: &[Decimal],
 ) -> MathResult<Vec<Decimal>> {
-    let inv_sum = if invoice_group.is_empty() { None } else { Some(sum(invoice_group)?) };
-    let bank_sum = if bank_group.is_empty() { None } else { Some(sum(bank_group)?) };
-    let gl_sum = if gl_group.is_empty() { None } else { Some(sum(gl_group)?) };
+    let inv_sum = if invoice_group.is_empty() {
+        None
+    } else {
+        Some(sum(invoice_group)?)
+    };
+    let bank_sum = if bank_group.is_empty() {
+        None
+    } else {
+        Some(sum(bank_group)?)
+    };
+    let gl_sum = if gl_group.is_empty() {
+        None
+    } else {
+        Some(sum(gl_group)?)
+    };
 
     let mut variances = Vec::with_capacity(3);
     // ALL three comparisons use ABSOLUTE values, and the reason is that the
@@ -139,8 +150,8 @@ pub fn format_formula(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
     use proptest::prelude::*;
+    use rust_decimal_macros::dec;
 
     // ---- sum tests ----
 

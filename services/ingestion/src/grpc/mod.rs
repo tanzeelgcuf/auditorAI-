@@ -4,8 +4,7 @@ use async_nats::jetstream::Context as JetStream;
 use tonic::{Request, Response, Status};
 
 use crate::ocr::{
-    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError,
-    ProcessDocumentRequest,
+    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError, ProcessDocumentRequest,
 };
 
 pub mod ingestion_service {
@@ -13,10 +12,8 @@ pub mod ingestion_service {
 }
 
 use ingestion_service::{
-    ingestion_service_server::IngestionService,
-    BoundingBox as GrpcBoundingBox,
-    ExtractedEntity as GrpcExtractedEntity,
-    ProcessDocumentRequest as GrpcProcessRequest,
+    ingestion_service_server::IngestionService, BoundingBox as GrpcBoundingBox,
+    ExtractedEntity as GrpcExtractedEntity, ProcessDocumentRequest as GrpcProcessRequest,
     ProcessDocumentResponse as GrpcProcessResponse,
 };
 
@@ -104,7 +101,10 @@ impl IngestionServiceImpl {
             entity_type: e.entity_type.clone(),
             amount_cents: e.amount_cents,
             currency: e.currency.clone(),
-            transaction_date: e.transaction_date.map(|d| d.to_string()).unwrap_or_default(),
+            transaction_date: e
+                .transaction_date
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
             counterparty: e.counterparty.clone().unwrap_or_default(),
             description: e.description.clone().unwrap_or_default(),
             gl_account_code: e.gl_account_code.clone().unwrap_or_default(),
@@ -174,7 +174,10 @@ impl IngestionService for IngestionServiceImpl {
                     self.s3_client.clone(),
                     self.bucket.clone(),
                 );
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
             DetectedFormat::Xlsx => {
                 let backend = crate::ocr::structured::XlsxParser::new(
@@ -182,7 +185,10 @@ impl IngestionService for IngestionServiceImpl {
                     self.s3_client.clone(),
                     self.bucket.clone(),
                 );
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
             DetectedFormat::Ofx => {
                 // OFX is structured (STMTTRN blocks), NOT OCR. It was falling
@@ -193,11 +199,16 @@ impl IngestionService for IngestionServiceImpl {
                     self.s3_client.clone(),
                     self.bucket.clone(),
                 );
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
-            _ => {
-                self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)?
-            }
+            _ => self
+                .ocr_backend
+                .process(&process_req)
+                .await
+                .map_err(ocr_error_to_status)?,
         };
 
         let entities: Vec<GrpcExtractedEntity> =
@@ -210,7 +221,10 @@ impl IngestionService for IngestionServiceImpl {
             "entity_count": entities.len(),
             "status": "completed"
         });
-        let _ = self.js.publish("ingestion.completed", event.to_string().into()).await;
+        let _ = self
+            .js
+            .publish("ingestion.completed", event.to_string().into())
+            .await;
 
         Ok(Response::new(GrpcProcessResponse { entities }))
     }
@@ -234,12 +248,30 @@ mod tests {
 
     #[test]
     fn test_format_detection() {
-        assert_eq!(FormatDetector::from_extension("test.pdf"), DetectedFormat::Ocr);
-        assert_eq!(FormatDetector::from_extension("test.csv"), DetectedFormat::Csv);
-        assert_eq!(FormatDetector::from_extension("test.ofx"), DetectedFormat::Ofx);
-        assert_eq!(FormatDetector::from_extension("test.xlsx"), DetectedFormat::Xlsx);
-        assert_eq!(FormatDetector::from_extension("test.xls"), DetectedFormat::Xlsx);
-        assert_eq!(FormatDetector::from_extension("test.qfx"), DetectedFormat::Ofx);
+        assert_eq!(
+            FormatDetector::from_extension("test.pdf"),
+            DetectedFormat::Ocr
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.csv"),
+            DetectedFormat::Csv
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.ofx"),
+            DetectedFormat::Ofx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.xlsx"),
+            DetectedFormat::Xlsx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.xls"),
+            DetectedFormat::Xlsx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.qfx"),
+            DetectedFormat::Ofx
+        );
     }
 
     #[test]

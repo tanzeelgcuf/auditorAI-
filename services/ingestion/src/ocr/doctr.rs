@@ -1,4 +1,7 @@
-use super::{ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest, ProcessDocumentResponse, BoundingBox};
+use super::{
+    BoundingBox, ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest,
+    ProcessDocumentResponse,
+};
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use reqwest::Client;
@@ -68,10 +71,19 @@ impl DoctrBackend {
     }
 
     fn generate_presigned_url(&self, key: &str) -> Result<String, OcrError> {
-        Ok(format!("{}/{}", self.base_url.replace("ocr-sidecar:8000", "minio:9000"), key))
+        Ok(format!(
+            "{}/{}",
+            self.base_url.replace("ocr-sidecar:8000", "minio:9000"),
+            key
+        ))
     }
 
-    fn normalize_bbox(&self, geometry: [[f32; 2]; 4], page_width: f32, page_height: f32) -> BoundingBox {
+    fn normalize_bbox(
+        &self,
+        geometry: [[f32; 2]; 4],
+        page_width: f32,
+        page_height: f32,
+    ) -> BoundingBox {
         let xs: Vec<f32> = geometry.iter().map(|p| p[0]).collect();
         let ys: Vec<f32> = geometry.iter().map(|p| p[1]).collect();
 
@@ -205,7 +217,8 @@ impl DoctrBackend {
                     // date separator.
                     let before = i.checked_sub(1).map(|j| chars[j]).unwrap_or(' ');
                     let after = chars.get(slice_end).copied().unwrap_or(' ');
-                    let is_date_char = |c: char| c.is_ascii_digit() || c == '/' || c == '-' || c == '.';
+                    let is_date_char =
+                        |c: char| c.is_ascii_digit() || c == '/' || c == '-' || c == '.';
                     if !is_date_char(before) && !is_date_char(after) {
                         return Some(d);
                     }
@@ -238,7 +251,11 @@ impl DoctrBackend {
     /// Generalizes across real layouts: QBO exports and firm invoices put dates
     /// in varied positions (header, side, near the total). Proximity + label
     /// preference is the general rule; this invoice's exact layout is not baked in.
-    fn attach_date(amount_text: &str, amount_y: f32, block_lines: &[(String, f32)]) -> Option<NaiveDate> {
+    fn attach_date(
+        amount_text: &str,
+        amount_y: f32,
+        block_lines: &[(String, f32)],
+    ) -> Option<NaiveDate> {
         if let Some(d) = Self::extract_date(amount_text) {
             return Some(d);
         }
@@ -283,9 +300,23 @@ impl DoctrBackend {
     /// of the document header, not a fixed offset.
     fn attach_counterparty(amount_text: &str, block_lines: &[(String, f32)]) -> Option<String> {
         let skip = [
-            "invoice", "amount", "qty", "description", "total", "date", "due",
-            "bill to", "customer", "po box", "service", "payment terms",
-            "unit price", "memo", "amt", "subtotal", "balance",
+            "invoice",
+            "amount",
+            "qty",
+            "description",
+            "total",
+            "date",
+            "due",
+            "bill to",
+            "customer",
+            "po box",
+            "service",
+            "payment terms",
+            "unit price",
+            "memo",
+            "amt",
+            "subtotal",
+            "balance",
         ];
         for (text, _) in block_lines {
             let t = text.trim();
@@ -314,7 +345,10 @@ impl DoctrBackend {
 
 #[async_trait]
 impl OcrBackend for DoctrBackend {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError> {
         // The sidecar downloads the object itself via storage_key (S3-compatible).
         let resp = self
             .client
@@ -435,15 +469,15 @@ mod tests {
             ("$150.00", 0.30),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     #[test]
     fn no_date_in_block_yields_none() {
-        let lines = block(&[
-            ("Consulting services", 0.20),
-            ("$150.00", 0.30),
-        ]);
+        let lines = block(&[("Consulting services", 0.20), ("$150.00", 0.30)]);
         assert_eq!(DoctrBackend::attach_date("$150.00", 0.30, &lines), None);
     }
 
@@ -456,7 +490,10 @@ mod tests {
             ("$150.00", 0.30),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     #[test]
@@ -468,7 +505,10 @@ mod tests {
             ("$150.00", 0.32),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.32, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     // ---- counterparty (vendor) attachment ----
@@ -504,10 +544,7 @@ mod tests {
 
     #[test]
     fn counterparty_none_when_only_boilerplate() {
-        let lines = block(&[
-            ("INVOICE", 0.08),
-            ("Total: $150.00", 0.20),
-        ]);
+        let lines = block(&[("INVOICE", 0.08), ("Total: $150.00", 0.20)]);
         let cp = DoctrBackend::attach_counterparty("Total: $150.00", &lines);
         assert_eq!(cp, None);
     }

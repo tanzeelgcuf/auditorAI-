@@ -1,7 +1,10 @@
-use super::{ExtractedEntity, BoundingBox, OcrBackend, OcrError, ProcessDocumentRequest, ProcessDocumentResponse};
+use super::{
+    BoundingBox, ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest,
+    ProcessDocumentResponse,
+};
 use async_trait::async_trait;
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
+use aws_sdk_s3::Client as S3Client;
 use calamine::{open_workbook_from_rs, DataType, Reader, Xlsx};
 use chrono::{Datelike, NaiveDate};
 use csv::ReaderBuilder;
@@ -32,7 +35,9 @@ pub(crate) async fn build_s3_client() -> S3Client {
 // ── S3 download helper ──
 
 pub(crate) async fn download_from_s3(
-    client: &S3Client, bucket: &str, key: &str,
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
 ) -> Result<Vec<u8>, OcrError> {
     let resp = client
         .get_object()
@@ -110,13 +115,18 @@ fn keep_numeric(body: &str) -> Option<String> {
     for c in body.chars() {
         if c.is_ascii_digit() || c == '.' || c == ',' {
             kept.push(c);
-        } else if c.is_whitespace() || c == '\u{00a0}' || c == '\'' || CURRENCY_SYMBOLS.contains(&c) {
+        } else if c.is_whitespace() || c == '\u{00a0}' || c == '\'' || CURRENCY_SYMBOLS.contains(&c)
+        {
             continue;
         } else {
             return None;
         }
     }
-    if kept.is_empty() { None } else { Some(kept) }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept)
+    }
 }
 
 /// Every thousands group must be exactly 3 digits, and the leading group 1-3.
@@ -128,9 +138,10 @@ fn valid_grouping(int_part: &str, sep: char) -> bool {
     if groups[0].is_empty() || groups[0].len() > 3 {
         return false;
     }
-    groups.iter().enumerate().all(|(i, g)| {
-        g.chars().all(|c| c.is_ascii_digit()) && (i == 0 || g.len() == 3)
-    })
+    groups
+        .iter()
+        .enumerate()
+        .all(|(i, g)| g.chars().all(|c| c.is_ascii_digit()) && (i == 0 || g.len() == 3))
 }
 
 /// Normalize an unsigned amount to canonical `digits[.digits]`, or None when the
@@ -143,7 +154,11 @@ fn normalize_decimal(body: &str) -> Option<String> {
     // Which character is the decimal point, if any?
     let dec: Option<char> = if dots > 0 && commas > 0 {
         // Both present: the rightmost is the decimal point ("1.234,56" / "1,234.56").
-        if kept.rfind('.') > kept.rfind(',') { Some('.') } else { Some(',') }
+        if kept.rfind('.') > kept.rfind(',') {
+            Some('.')
+        } else {
+            Some(',')
+        }
     } else if dots + commas == 0 {
         None // bare integer dollars
     } else {
@@ -182,7 +197,13 @@ fn normalize_decimal(body: &str) -> Option<String> {
     let thou = match dec {
         Some('.') => ',',
         Some(',') => '.',
-        _ => if dots > 0 { '.' } else { ',' },
+        _ => {
+            if dots > 0 {
+                '.'
+            } else {
+                ','
+            }
+        }
     };
     if !int_raw.is_empty() && !valid_grouping(int_raw, thou) {
         return None;
@@ -199,7 +220,11 @@ fn normalize_decimal(body: &str) -> Option<String> {
     if frac.len() > 2 {
         return None;
     }
-    let int_part = if int_part.is_empty() { "0".to_string() } else { int_part };
+    let int_part = if int_part.is_empty() {
+        "0".to_string()
+    } else {
+        int_part
+    };
     Some(if frac.is_empty() {
         int_part
     } else {
@@ -242,13 +267,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         s
     };
     let fmts = &[
-        "%Y-%m-%d",
-        "%m/%d/%Y",
-        "%d/%m/%Y",
-        "%m/%d/%y",
-        "%d-%m-%Y",
-        "%d/%m/%y",
-        "%Y%m%d",
+        "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m/%d/%y", "%d-%m-%Y", "%d/%m/%y", "%Y%m%d",
         "%m-%d-%Y",
     ];
     for fmt in fmts {
@@ -274,7 +293,14 @@ pub fn resolve_amount(mapped: &HashMap<String, String>, raw: &HashMap<String, St
     // at one side (e.g. debit_amount); a credit row has that side empty, so fall
     // back to the OTHER side. Handles plain "Debit"/"Credit" and the
     // "*_amount" variants (Prompt B: stress GL uses debit_amount/credit_amount).
-    for key in ["Debit", "Credit", "debit", "credit", "debit_amount", "credit_amount"] {
+    for key in [
+        "Debit",
+        "Credit",
+        "debit",
+        "credit",
+        "debit_amount",
+        "credit_amount",
+    ] {
         if let Some(v) = raw.get(key) {
             if !v.trim().is_empty() {
                 return v.clone();
@@ -315,21 +341,33 @@ pub struct CsvParser {
 }
 
 impl CsvParser {
-    pub fn new(column_map: HashMap<String, String>, s3_client: Arc<S3Client>, bucket: String) -> Self {
-        Self { column_map, s3_client, bucket }
+    pub fn new(
+        column_map: HashMap<String, String>,
+        s3_client: Arc<S3Client>,
+        bucket: String,
+    ) -> Self {
+        Self {
+            column_map,
+            s3_client,
+            bucket,
+        }
     }
 }
 
 #[async_trait]
 impl OcrBackend for CsvParser {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError> {
         let data = download_from_s3(&self.s3_client, &self.bucket, &request.storage_key).await?;
         let mut reader = ReaderBuilder::new()
             .flexible(true)
             .has_headers(true)
             .from_reader(data.as_slice());
 
-        let headers = reader.headers()
+        let headers = reader
+            .headers()
             .map_err(|e| OcrError::ParsingError(format!("csv headers: {e}")))?
             .clone();
 
@@ -367,10 +405,14 @@ impl OcrBackend for CsvParser {
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
             let account_code = mapped.get("account_code").cloned();
-            let currency = mapped.get("currency").cloned().unwrap_or_else(|| "USD".to_string());
+            let currency = mapped
+                .get("currency")
+                .cloned()
+                .unwrap_or_else(|| "USD".to_string());
             // The transaction reference (e.g. QuickBooks "Num" column) identifies a
             // journal entry so debit/credit legs can be keyed on it, not a heuristic.
-            let tx_ref = mapped.get("transaction_ref")
+            let tx_ref = mapped
+                .get("transaction_ref")
                 .or_else(|| row_data.get("Num"))
                 .or_else(|| row_data.get("Ref"))
                 .map(|s| s.trim().to_string())
@@ -386,7 +428,12 @@ impl OcrBackend for CsvParser {
                 gl_account_code: account_code,
                 transaction_ref: tx_ref,
                 page_number: 1,
-                bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+                bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -442,14 +489,25 @@ pub struct XlsxParser {
 }
 
 impl XlsxParser {
-    pub fn new(column_map: HashMap<String, String>, s3_client: Arc<S3Client>, bucket: String) -> Self {
-        Self { column_map, s3_client, bucket }
+    pub fn new(
+        column_map: HashMap<String, String>,
+        s3_client: Arc<S3Client>,
+        bucket: String,
+    ) -> Self {
+        Self {
+            column_map,
+            s3_client,
+            bucket,
+        }
     }
 }
 
 #[async_trait]
 impl OcrBackend for XlsxParser {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError> {
         let data = download_from_s3(&self.s3_client, &self.bucket, &request.storage_key).await?;
         let cursor = Cursor::new(data);
         let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
@@ -516,10 +574,14 @@ impl OcrBackend for XlsxParser {
             let description = mapped.get("description").cloned();
             let counterparty = mapped.get("counterparty").cloned();
             let account_code = mapped.get("account_code").cloned();
-            let currency = mapped.get("currency").cloned().unwrap_or_else(|| "USD".to_string());
+            let currency = mapped
+                .get("currency")
+                .cloned()
+                .unwrap_or_else(|| "USD".to_string());
             // The transaction reference (e.g. QuickBooks "Num" column) identifies a
             // journal entry so debit/credit legs can be keyed on it, not a heuristic.
-            let tx_ref = mapped.get("transaction_ref")
+            let tx_ref = mapped
+                .get("transaction_ref")
                 .or_else(|| row_data.get("Num"))
                 .or_else(|| row_data.get("Ref"))
                 .map(|s| s.trim().to_string())
@@ -535,7 +597,12 @@ impl OcrBackend for XlsxParser {
                 gl_account_code: account_code,
                 transaction_ref: tx_ref,
                 page_number: 1,
-                bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+                bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -554,7 +621,11 @@ fn cell_string(cell: &DataType) -> String {
         DataType::String(s) => s.clone(),
         DataType::Float(f) => {
             let s = format!("{f}");
-            if s.ends_with(".0") { strip_commas(&s[..s.len()-2]) } else { strip_commas(&s) }
+            if s.ends_with(".0") {
+                strip_commas(&s[..s.len() - 2])
+            } else {
+                strip_commas(&s)
+            }
         }
         DataType::Int(i) => i.to_string(),
         DataType::DateTime(d) => {
@@ -589,14 +660,23 @@ pub struct OfxParser {
 }
 
 impl OfxParser {
-    pub fn new(s3_client: Arc<S3Client>, bucket: String) -> Self {
-        Self { s3_client, bucket }
+    pub fn new(
+        s3_client: Arc<S3Client>,
+        bucket: String,
+    ) -> Self {
+        Self {
+            s3_client,
+            bucket,
+        }
     }
 }
 
 #[async_trait]
 impl OcrBackend for OfxParser {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError> {
         let data = download_from_s3(&self.s3_client, &self.bucket, &request.storage_key).await?;
         let content = String::from_utf8_lossy(&data);
 
@@ -660,7 +740,12 @@ impl OcrBackend for OfxParser {
                 gl_account_code: None,
                 transaction_ref: fitid.clone(),
                 page_number: 1,
-                bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+                bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -696,7 +781,12 @@ pub fn create_structured_entity(
         gl_account_code,
         transaction_ref: None,
         page_number,
-        bbox: BoundingBox { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+        bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
         confidence: 1.0,
         source_format: "structured".to_string(),
     }
@@ -806,9 +896,18 @@ mod tests {
 
     #[test]
     fn test_parse_date_formats() {
-        assert_eq!(parse_date("2024-01-15"), Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
-        assert_eq!(parse_date("01/15/2024"), Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
-        assert_eq!(parse_date("20240115"), Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
+        assert_eq!(
+            parse_date("2024-01-15"),
+            Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
+        assert_eq!(
+            parse_date("01/15/2024"),
+            Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
+        assert_eq!(
+            parse_date("20240115"),
+            Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
     }
 
     #[test]
@@ -836,7 +935,10 @@ mod tests {
         data.insert("Transaction Type".to_string(), "Bill Payment".to_string());
         data.insert("Num".to_string(), "10456".to_string());
         data.insert("Name".to_string(), "Acme Office Supplies Co.".to_string());
-        data.insert("Memo".to_string(), "Payment - INV-1001, INV-1002".to_string());
+        data.insert(
+            "Memo".to_string(),
+            "Payment - INV-1001, INV-1002".to_string(),
+        );
         data.insert("Account".to_string(), "Accounts Payable".to_string());
         data.insert("Debit".to_string(), "471.25".to_string());
         data.insert("Credit".to_string(), "".to_string());
@@ -851,8 +953,14 @@ mod tests {
         let mapped = map_columns(&data, &col_map);
         assert_eq!(mapped.get("amount").unwrap(), "471.25");
         assert_eq!(parse_amount(mapped.get("amount").unwrap()).unwrap(), 47125);
-        assert_eq!(mapped.get("counterparty").unwrap(), "Acme Office Supplies Co.");
-        assert_eq!(parse_date(mapped.get("date").unwrap()).unwrap(), NaiveDate::from_ymd_opt(2026, 6, 6).unwrap());
+        assert_eq!(
+            mapped.get("counterparty").unwrap(),
+            "Acme Office Supplies Co."
+        );
+        assert_eq!(
+            parse_date(mapped.get("date").unwrap()).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 6).unwrap()
+        );
     }
 
     // OFX timestamps are YYYYMMDDHHMMSS — parse_date must take the date portion.
