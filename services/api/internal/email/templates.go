@@ -1,4 +1,4 @@
-// Package email — templates for transactional mail (doc 12 §4).
+// Package email — templates for transactional mail.
 package email
 
 import (

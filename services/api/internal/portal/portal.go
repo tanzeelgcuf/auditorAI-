@@ -1,6 +1,6 @@
 package portal
 
-// Client portal (doc 07 §5) — a firm's client logs in READ-ONLY to see their own
+// Client portal — a firm's client logs in READ-ONLY to see their own
 // book's audit_reports and audit_findings. Never extracted_entities or raw
 // documents, no mutations.
 //

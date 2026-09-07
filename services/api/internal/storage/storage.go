@@ -1,6 +1,6 @@
 package storage
 
-// MinIO/S3 file storage (doc 12 §1). Presigned-URL upload flow: the client PUTs
+// MinIO/S3 file storage. Presigned-URL upload flow: the client PUTs
 // file bytes directly to storage, then confirms — the API verifies bytes landed
 // before triggering ingestion. MinIO is S3-compatible so the same client serves
 // both.

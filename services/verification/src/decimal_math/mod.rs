@@ -2,8 +2,8 @@
 // ALL monetary arithmetic lives here — deterministic, unit-tested to 100% branch coverage.
 // NEVER use f32/f64 for money. ONLY rust_decimal::Decimal.
 
-use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,8 +39,7 @@ pub fn sum(values: &[Decimal]) -> MathResult<Decimal> {
 /// Returns (variance, exceeded).
 #[allow(dead_code)]
 pub fn check_tolerance(variance: Decimal, tolerance_cents: i64) -> (Decimal, bool) {
-    let tolerance_dec = Decimal::from_i64(tolerance_cents)
-        .unwrap_or(Decimal::ZERO);
+    let tolerance_dec = Decimal::from_i64(tolerance_cents).unwrap_or(Decimal::ZERO);
     (variance, variance > tolerance_dec)
 }
 
@@ -65,27 +64,62 @@ pub fn compute_greater_of_tolerance(
 /// Grouped tolerance: sum each group, then check variance across groups.
 /// For 3-way reconciliation: invoice_total vs bank_total vs gl_total.
 ///
-/// A leg may be absent (e.g. a deposit group is bank+GL only — doc 09). An
-/// absent leg contributes nothing: comparing it as 0 would inflate |0-bank| to
-/// the full bank amount and flag a balanced 2-leg group. Only variances between
-/// PRESENT legs are computed; absent legs are excluded.
+/// A leg may be absent (e.g. a deposit group is bank+GL only). A leg is present
+/// iff it has at least one entity — CLAUDE.md rule 10, presence is membership,
+/// not a non-zero total. An absent leg contributes nothing: comparing it as 0
+/// would inflate |0-bank| to the full bank amount and flag a balanced 2-leg
+/// group. Only variances between PRESENT legs are computed; absent legs are
+/// excluded.
 pub fn compute_three_way_variance(
     invoice_group: &[Decimal],
     bank_group: &[Decimal],
     gl_group: &[Decimal],
 ) -> MathResult<Vec<Decimal>> {
-    let inv_sum = if invoice_group.is_empty() { None } else { Some(sum(invoice_group)?) };
-    let bank_sum = if bank_group.is_empty() { None } else { Some(sum(bank_group)?) };
-    let gl_sum = if gl_group.is_empty() { None } else { Some(sum(gl_group)?) };
+    let inv_sum = if invoice_group.is_empty() {
+        None
+    } else {
+        Some(sum(invoice_group)?)
+    };
+    let bank_sum = if bank_group.is_empty() {
+        None
+    } else {
+        Some(sum(bank_group)?)
+    };
+    let gl_sum = if gl_group.is_empty() {
+        None
+    } else {
+        Some(sum(gl_group)?)
+    };
 
     let mut variances = Vec::with_capacity(3);
-    // ALL three comparisons use ABSOLUTE values. An invoice is a billed amount
-    // (positive); its bank payment and GL entry carry the opposite sign by
-    // convention (bank debit -, GL credit +). The linker's _amounts_match
-    // already treats them as matching on abs; the verifier must too, or every
-    // legit 3-way group flags as a full-amount variance (Set #2: invoice +150,
-    // bank -150, GL +150 flagged $300 high). This extends the earlier
-    // bank↔GL-only abs fix (Prompt B) to invoice↔bank and invoice↔gl.
+    // ALL three comparisons use ABSOLUTE values, and the reason is that the
+    // sign is NOT DECIDABLE HERE — not that it follows a known convention.
+    //
+    // This comment used to say "An invoice is a billed amount (positive); its
+    // bank payment and GL entry carry the opposite sign by convention (bank
+    // debit -, GL credit +)." CORRECTED 2026-09-06: that is one of at least two
+    // conventions live in this product, and it is not the one the repo's own
+    // fixtures use. services/ingestion/test_fixtures parsed into legs (see
+    // agent-runtime/tests/test_pilot_fixtures.entities_from_fixtures) gives
+    // invoice, bank and GL sign-for-sign IDENTICAL, aligned deliberately because
+    // OFX reports a refund as a positive CREDIT while the invoice and GL report
+    // it as a negative. Whether the `gl` leg is the expense/revenue line (same
+    // sign as the invoice) or the CASH line (same sign as the bank) is a fact
+    // about the customer's chart of accounts. See the block above
+    // _sign_pattern_ok in agent-runtime/graph/link.py for the measurement.
+    //
+    // Taking abs() is therefore correct under EVERY convention, which is a
+    // stronger argument than the one it replaces. Without it, a legit 3-way
+    // group under the side-encoded convention flags as a full-amount variance
+    // (Set #2: invoice +150, bank -150, GL +150 flagged $300 high). This extends
+    // the earlier bank↔GL-only abs fix (Prompt B) to invoice↔bank and invoice↔gl.
+    //
+    // The linker's _amounts_match matches on abs for the same reason and says so
+    // in its docstring; agent-runtime/tests/test_link_sign.py asserts by source
+    // text that these three .abs() calls are still here, so making this
+    // sign-aware lands as a red Python test rather than as a silent divergence
+    // between the two tiers. The sign question is asked ONCE, in the linker's
+    // routing, where it can only downgrade a group to needs_review.
     if let (Some(a), Some(b)) = (inv_sum, bank_sum) {
         variances.push((a.abs() - b.abs()).abs());
     }
@@ -116,8 +150,8 @@ pub fn format_formula(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
     use proptest::prelude::*;
+    use rust_decimal_macros::dec;
 
     // ---- sum tests ----
 
@@ -352,7 +386,7 @@ mod tests {
     }
 
     // Prompt 3 regression: a 2-leg group (bank+GL only, no invoice — deposits,
-    // fees, AR, doc 09) must not compare the absent invoice leg as 0. |0-bank|
+    // fees, AR) must not compare the absent invoice leg as 0. |0-bank|
     // would inflate to the full bank amount and flag a balanced group. Variance
     // must be computed only between present legs.
     #[test]
@@ -382,9 +416,16 @@ mod tests {
         assert_eq!(v, vec![dec!(100.00)]);
     }
 
-    // Prompt B regression: a bank debit (-) and its GL credit (+) are the same
-    // payment (sign is a side convention, doc 09 §1). |bank-gl| must compare
-    // absolute values, or every legit payment flags as a full-amount variance.
+    // Prompt B regression: under the side-encoded convention a bank debit (-)
+    // and its GL credit (+) are the same payment, so |bank-gl| must compare
+    // absolute values or every payment recorded that way flags as a
+    // full-amount variance. CORRECTED 2026-09-06: this used to justify itself
+    // with "sign is a side convention, doc 09 §1" — there is no doc 09 in this
+    // repository, and side-encoding is one of at least two conventions live in
+    // the product rather than the rule. The test is right either way: abs() is
+    // required because the convention is NOT KNOWABLE here, so a 2-leg group
+    // must reconcile whichever way its book records sides. See the block above
+    // compute_three_way_variance and CLAUDE.md rule 16.
     #[test]
     fn test_two_leg_opposite_signs_is_a_match() {
         let bank = [dec!(-150.00)];
@@ -428,8 +469,11 @@ mod tests {
     fn test_format_formula() {
         let formula = format_formula(
             "GL Reconciliation",
-            dec!(1500.00), dec!(1500.00), dec!(1500.50),
-            dec!(0.50), 1,
+            dec!(1500.00),
+            dec!(1500.00),
+            dec!(1500.50),
+            dec!(0.50),
+            1,
         );
         assert!(formula.contains("GL Reconciliation"));
         assert!(formula.contains("variance=0.50"));
@@ -443,8 +487,11 @@ mod tests {
     fn test_format_formula_zero_values() {
         let formula = format_formula(
             "Reconciliation",
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            Decimal::ZERO, 0,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            0,
         );
         assert!(formula.contains("Reconciliation"));
         assert!(formula.contains("variance=0.00"));

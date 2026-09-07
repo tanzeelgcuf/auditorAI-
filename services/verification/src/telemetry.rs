@@ -109,9 +109,7 @@ mod tests {
             .default_integrations(false); // must not install its own panic hook
         let transport = Arc::new(TestTransport::default());
         let collect = transport.clone();
-        sentry::Hub::current().bind_client(Some(Arc::new(
-            options.transport(transport).into(),
-        )));
+        sentry::Hub::current().bind_client(Some(Arc::new(options.transport(transport).into())));
 
         let hook_fired = Arc::new(AtomicBool::new(false));
         let hook_count = hook_fired.clone();

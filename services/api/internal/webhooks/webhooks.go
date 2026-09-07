@@ -1,6 +1,6 @@
 package webhooks
 
-// Webhook delivery engine (doc 07 §7) — delivers finding.created and
+// Webhook delivery engine — delivers finding.created and
 // report.generated events to firm-subscribed endpoints with HMAC-SHA256
 // signatures, retry with backoff, and auto-disable after repeated failures.
 

@@ -1,9 +1,18 @@
--- AI Auditor v1 — Database Initialization (DDL from docs 05-10)
+-- AI Auditor v1 — Database Initialization
 --
--- THIS FILE IS THE ENTIRE APPLIED SCHEMA. It is the only DDL that any
--- environment runs: infra/docker-compose*.yml mount it into
--- /docker-entrypoint-initdb.d/, and .github/workflows/ci.yml loads it with
--- `psql -v ON_ERROR_STOP=1 -f infra/init.sql`. There is no migration runner.
+-- THIS FILE IS THE ENTIRE APPLIED SCHEMA — every table, view, index, policy and
+-- grant. It is the only DDL that any environment runs: infra/docker-compose*.yml
+-- mount it into /docker-entrypoint-initdb.d/, and .github/workflows/ci.yml loads
+-- it with `psql -v ON_ERROR_STOP=1 -f infra/init.sql`. There is no migration
+-- runner.
+--
+-- ONE thing is not here: the two `CREATE ROLE` statements, which moved to
+-- `infra/00-bootstrap-roles.sql` on 2026-09-06 because they need psql's `\getenv`
+-- to read a password without going through a shell, and psql meta-commands are
+-- not SQL — sqlc parses THIS file as its schema and could not read them. That
+-- file runs first everywhere this one runs. Nothing else moved: no relation and no
+-- policy lives outside this file, and `scripts/check_bootstrap_split.py` fails if
+-- one appears there.
 -- services/api/db/migrations/ used to hold 8 .up.sql files that NOTHING ever
 -- applied — the only reference to that directory in the whole repo was a line
 -- of prose in .claude/agents/backend-agent.md. Everything they created is
@@ -204,7 +213,7 @@ CREATE TABLE extracted_entities (
     extraction_confidence NUMERIC(4,3) NOT NULL,
     source_format TEXT NOT NULL DEFAULT 'ocr' CHECK (source_format IN ('ocr', 'structured')),
     transaction_ref TEXT,
-    -- Folded from migration 000008 (doc 11 §1, human override / manual entry).
+    -- Folded from migration 000008.
     -- humanoverride.go:99-102 INSERTs created_by/manually_created_by/
     -- corrects_entity_id and :116 UPDATEs status, so POST
     -- /v1/books/{bookId}/entities/manual could not work without these four.
@@ -234,7 +243,7 @@ CREATE TABLE reconciliation_groups (
     -- :265 literal 'needs_review', seed-demo, security_test), so this changes no
     -- current behaviour — it changes what the NEXT writer gets for free.
     status TEXT NOT NULL DEFAULT 'needs_review' CHECK (status IN ('auto_linked','needs_review','confirmed','rejected','superseded')),
-    -- Folded from migration 000010 (doc 12 §2): AP vs AR reconciled separately.
+    -- Folded from migration 000010: AP vs AR reconciled separately.
     -- mcp.go:234 INSERTs this on the agent's create_entity_link write path.
     group_scope TEXT NOT NULL DEFAULT 'ap' CHECK (group_scope IN ('ap', 'ar', 'other')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -392,14 +401,32 @@ CREATE TABLE api_keys (
     revoked_at TIMESTAMPTZ
 );
 
+-- Idempotency cache. firm_id and client_book_id were added 2026-09-05 together with
+-- RLS below and with firm+book entering the hash in middleware/idempotency.go. All
+-- three had to move at once: a tenancy column nobody writes is decorative, a policy
+-- on a column that is always NULL denies everything, and a hash that omits the book
+-- lets one user replay book A's response against a book B request.
+--
+-- client_book_id is NULLable because idempotency is offered on routes that have no
+-- {bookId} segment; today both mounts are book-scoped, but a firm-level POST is a
+-- normal thing to add and must not be forced to invent a book.
+--
+-- ON DELETE CASCADE is deliberate and is the only CASCADE in this file. Every other
+-- FK here is RESTRICT-by-default because the rows it protects are records a tenant
+-- must not lose. These rows are a 24h cache with no evidentiary value, and without
+-- CASCADE a firm or book delete would fail on a FK violation for up to a day
+-- (billing_test.go:277 already does DELETE FROM firms).
 CREATE TABLE idempotency_keys (
     key_hash TEXT PRIMARY KEY,
+    firm_id UUID NOT NULL REFERENCES firms(id) ON DELETE CASCADE,
+    client_book_id UUID REFERENCES client_books(id) ON DELETE CASCADE,
     user_id UUID NOT NULL,
     response_status INTEGER NOT NULL,
     response_body JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_idempotency_keys_created ON idempotency_keys (created_at);
+CREATE INDEX idx_idempotency_keys_firm ON idempotency_keys (firm_id);
 
 CREATE TABLE webhook_subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -471,7 +498,7 @@ CREATE TABLE coa_templates (
 -- the HTTP route that reaches it, so a future reader can tell live schema from
 -- speculative schema.
 
--- From 000002. Per-tenant data encryption keys (doc 05 §5).
+-- From 000002. Per-tenant data encryption keys.
 -- rotate_keys.go:50 SELECTs and :60 INSERTs -> POST /v1/tenant/rotate-keys.
 -- ALSO: middleware/security_test.go:88 TRUNCATEs this table in test setup, so
 -- its absence made the entire security/RLS suite die before its first
@@ -485,7 +512,7 @@ CREATE TABLE data_encryption_keys (
 );
 CREATE INDEX idx_data_encryption_keys_firm ON data_encryption_keys(firm_id, status);
 
--- From 000005. Mobile push targets (doc 03 §3.10 / doc 07 §8).
+-- From 000005. Mobile push targets.
 -- push.go:78 INSERTs -> POST /v1/push/register, which apps/mobile/src/push.ts:15
 -- already calls; push.go:102 SELECTs for delivery.
 CREATE TABLE device_tokens (
@@ -515,7 +542,7 @@ CREATE TABLE config_change_log (
 -- From 000008 §4. Business-day-aware date matching.
 -- NOTE, and this is a real gap rather than an oversight in the fold: `grep -rn
 -- bank_holidays` finds NO reader anywhere in services/ or apps/. The table is
--- carried over so the schema is complete against doc 11, but the business-day
+-- carried over so the fold does not silently drop a table, but the business-day
 -- matching feature it exists for is not implemented. client_book_id is
 -- deliberately nullable = a global (all-books) holiday.
 CREATE TABLE bank_holidays (
@@ -736,14 +763,29 @@ CREATE POLICY entity_tags_book_isolation ON entity_tags
         WHERE client_book_id = ANY(string_to_array(current_setting('app.assigned_books'), ',')::uuid[])
     ));
 
+-- Idempotency cache. Firm-scoped with an additional book test, because the table has
+-- both columns and a row is only ever legitimately read by the same (firm, book) that
+-- wrote it. The book clause mirrors bank_holidays_book_or_global: NULL client_book_id
+-- means the row came from a route with no {bookId}, and is scoped by firm alone.
+--
+-- This table was on the "deliberately not RLS-protected" list until 2026-09-05. The
+-- reason given there was accurate at the time and worth preserving: idempotency.go
+-- queried the RAW pool, and adding RLS to a table whose statements run unprimed does
+-- not protect it — it breaks it, because every policy below calls current_setting()
+-- with no missing_ok and there is no GUC default, so the statement raises or tests
+-- against '' and is denied. The pool fix (middleware.DB) landed first for that reason.
+ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
+CREATE POLICY idempotency_keys_firm_book_isolation ON idempotency_keys
+    USING (firm_id = current_setting('app.current_firm')::uuid
+           AND (client_book_id IS NULL
+                OR client_book_id = ANY(string_to_array(current_setting('app.assigned_books'), ',')::uuid[])));
+
 -- ----- DELIBERATELY NOT RLS-PROTECTED (documented, not overlooked) -----
 -- coa_templates: global chart-of-accounts templates, no tenant column. Read by
 --   templates.go:16,28 and settings.go:351,407.
--- idempotency_keys: keyed by key_hash = sha256(user_id || ':' || client key)
---   (middleware/idempotency.go:35), so a key from firm A cannot collide with
---   firm B's. It is also queried on the RAW pool (idempotency.go:41,102), which
---   has no tenant GUC set, so adding RLS here would break every retry-safe
---   request instead of protecting anything.
+--
+-- idempotency_keys was removed from this list on 2026-09-05; it now has firm_id,
+-- client_book_id and idempotency_keys_firm_book_isolation above.
 
 -- ===== INDEXES =====
 CREATE INDEX idx_source_documents_book ON source_documents(client_book_id);
@@ -809,60 +851,26 @@ CREATE INDEX idx_access_log_source_ip ON access_log(source_ip, occurred_at DESC)
 -- BYPASSRLS rather than superuser is the point: auditor_sys can read across
 -- tenants but cannot create objects, cannot read other databases, and holds only
 -- the DML grants issued below.
--- Passwords come from the environment, never from this file. Both compose (via
--- the postgres service env) and CI must export APP_DB_PASSWORD and
--- SYS_DB_PASSWORD or this script stops here on purpose.
+-- THE TWO `CREATE ROLE` STATEMENTS ARE NOT IN THIS FILE. They live in
+-- `infra/00-bootstrap-roles.sql`, which runs FIRST — read that file's header
+-- before changing either one.
 --
--- \getenv, not `printf '%s' "$APP_DB_PASSWORD"`. The backquote form makes psql
--- run a SHELL, and inside double quotes the shell still expands $(...) and
--- backticks — so a password containing either would have been executed as a
--- command during database init. \getenv (psql 14+, and the postgres:16 image
--- ships psql 16) reads the variable directly with no shell involved.
+-- Moved out 2026-09-06 because they could not be expressed in SQL. Passwords come
+-- from the environment, never from a file, and psql's `\getenv` is the only way to
+-- read one without handing it to a shell. `\set`, `\getenv` and `:'app_pw'` are
+-- psql CLIENT constructs; `services/api/sqlc.yaml` points `schema:` at THIS file,
+-- so sqlc parsed them with the PostgreSQL parser and failed — and `sqlc compile`
+-- runs before `go test` in the Go job, so nothing downstream of it ever ran,
+-- including the whole DATABASE_URL_TEST suite. Keeping the credential bootstrap
+-- in a psql-only file and this file pure SQL fixes that without weakening the
+-- injection control. `scripts/check_bootstrap_split.py` fails if a psql
+-- meta-command or a `:'var'` interpolation reappears here, and also if the
+-- bootstrap file stops using `\getenv`.
 --
--- The two \set lines are not redundant: \getenv leaves the psql variable
--- UNCHANGED when the environment variable is absent, so without a defined
--- default, :'app_pw' would be emitted literally and fail with a syntax error
--- instead of the actionable message the DO block below raises.
-\set app_pw ''
-\set sys_pw ''
-\getenv app_pw APP_DB_PASSWORD
-\getenv sys_pw SYS_DB_PASSWORD
-SELECT set_config('auditor.bootstrap_app_pw', :'app_pw', false);
-SELECT set_config('auditor.bootstrap_sys_pw', :'sys_pw', false);
+-- What still lives here, and depends on those roles already existing: the GRANT
+-- block immediately below, and the final self-check that RAISEs if auditor_app is
+-- missing or is superuser/BYPASSRLS.
 
-DO $bootstrap$
-DECLARE
-    app_pw text := current_setting('auditor.bootstrap_app_pw', true);
-    sys_pw text := current_setting('auditor.bootstrap_sys_pw', true);
-BEGIN
-    IF app_pw IS NULL OR length(app_pw) < 16 THEN
-        RAISE EXCEPTION 'APP_DB_PASSWORD is unset or shorter than 16 chars. '
-            'Set it in .env (see .env.example) and re-create the postgres volume; '
-            'the api connects as auditor_app and RLS depends on it.';
-    END IF;
-    IF sys_pw IS NULL OR length(sys_pw) < 16 THEN
-        RAISE EXCEPTION 'SYS_DB_PASSWORD is unset or shorter than 16 chars. '
-            'Set it in .env (see .env.example); auth and the background workers '
-            'connect as auditor_sys.';
-    END IF;
-    IF app_pw = sys_pw THEN
-        RAISE EXCEPTION 'APP_DB_PASSWORD and SYS_DB_PASSWORD must differ; they '
-            'are the RLS-enforced and RLS-bypassing credentials respectively.';
-    END IF;
-
-    -- format(%L) quotes and escapes; the literal never appears in this file.
-    EXECUTE format(
-        'CREATE ROLE auditor_app LOGIN PASSWORD %L '
-        'NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT', app_pw);
-    EXECUTE format(
-        'CREATE ROLE auditor_sys LOGIN PASSWORD %L '
-        'NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS NOINHERIT', sys_pw);
-END
-$bootstrap$;
-
--- Scrub the passwords out of the session before anything else runs.
-SELECT set_config('auditor.bootstrap_app_pw', '', false);
-SELECT set_config('auditor.bootstrap_sys_pw', '', false);
 -- ----- PRIVILEGES -----
 -- Least privilege: DML only. No CREATE, no TRUNCATE, no ownership. Test suites
 -- that need TRUNCATE (middleware/security_test.go:86) must connect as the owner
@@ -962,13 +970,15 @@ BEGIN
         RAISE EXCEPTION 'RLS-enabled but unforced or policy-less: %', missing;
     END IF;
 
-    -- 3. The two intentional exemptions are still the ONLY ones. Any new table
-    --    that forgets RLS trips this instead of silently shipping unprotected.
+    -- 3. The one intentional exemption is still the ONLY one. Any new table that
+    --    forgets RLS trips this instead of silently shipping unprotected.
+    --    idempotency_keys was removed from this list on 2026-09-05 when it gained
+    --    firm_id, client_book_id and a policy.
     SELECT string_agg(c.relname, ', ' ORDER BY c.relname) INTO missing
     FROM pg_class c
     JOIN pg_namespace ns ON ns.oid = c.relnamespace
     WHERE ns.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity
-      AND c.relname NOT IN ('coa_templates', 'idempotency_keys');
+      AND c.relname NOT IN ('coa_templates');
     IF missing IS NOT NULL THEN
         RAISE EXCEPTION 'table(s) without RLS and not on the documented exemption '
             'list: %. Add a policy, or add it to the list here and say why.', missing;

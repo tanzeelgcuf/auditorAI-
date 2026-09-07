@@ -1,6 +1,6 @@
 package billing
 
-// Stripe billing — subscription per firm (docs 06 §9 tiers). v1 keeps billing
+// Stripe billing — subscription per firm. v1 keeps billing
 // simple: flat per-firm subscription via Stripe Checkout, webhook syncs status.
 
 import (

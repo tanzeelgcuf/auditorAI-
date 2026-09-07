@@ -22,7 +22,10 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
 )
 
-const maxUploadSize = 25 * 1024 * 1024 // 25MB per doc 06 §5
+// 25MB. This constant is the one that actually rejects;
+// apps/web/components/upload/dropzone.tsx mirrors it as a client-side pre-check
+// and the two must be changed together.
+const maxUploadSize = 25 * 1024 * 1024
 
 var allowedDocTypes = map[string]string{
 	".pdf":  "invoice", // default; refined at extraction by content
@@ -121,7 +124,7 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Malware scan (ClamAV) before the file enters the pipeline (doc 06 §5).
+	// Malware scan (ClamAV) before the file enters the pipeline.
 	// Fail closed: if the scanner is unavailable, reject rather than accept unscanned.
 	if err := scanWithClamAV(r.Context(), data); err != nil {
 		if err == errInfected {
@@ -135,7 +138,7 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Content hash for duplicate detection (doc 07 §3)
+	// Content hash for duplicate detection
 	hash := sha256.Sum256(data)
 	contentHash := hex.EncodeToString(hash[:])
 
@@ -145,7 +148,7 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Duplicate check within the same book -> 409 (doc 07 §3)
+	// Duplicate check within the same book -> 409
 	var existingID string
 	err = c.QueryRow(r.Context(),
 		`SELECT id::text FROM source_documents
@@ -216,15 +219,18 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		"id": docID, "client_book_id": bookID, "filename": header.Filename,
 		"doc_type": docType, "ocr_status": "pending",
 	})
-	// Store idempotent response (non-fatal on failure — retry would reprocess)
-	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
-		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	// Non-fatal for THIS request — the 201 below is already decided. But it is logged,
+	// not discarded: a persistently failing store means every retry re-ingests the
+	// same upload, which is the exact duplicate this header exists to prevent.
+	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
+		slog.Error("idempotency store failed", "error", err, "doc_id", docID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)
 }
 
-// HandlePresignUpload (doc 12 §1) creates a document row + returns a presigned
+// HandlePresignUpload creates a document row + returns a presigned
 // PUT URL. The client uploads bytes directly to storage, then calls confirm.
 func (s *Service) HandlePresignUpload(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -292,7 +298,7 @@ func (s *Service) HandlePresignUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleConfirmUpload (doc 12 §1) verifies bytes landed in storage, computes the
+// HandleConfirmUpload verifies bytes landed in storage, computes the
 // content hash by streaming, then triggers ingestion via NATS.
 func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -346,7 +352,7 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stream + hash the object for duplicate detection (doc 07 §3).
+	// Stream + hash the object for duplicate detection.
 	data, err := s.storage.StreamObject(r.Context(), storageKey)
 	if err != nil {
 		slog.Error("failed to stream object", "error", err)
@@ -367,7 +373,7 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Malware scan before ingestion (doc 06 §5).
+	// Malware scan before ingestion.
 	if err := scanWithClamAV(r.Context(), data); err != nil {
 		if err == errInfected {
 			writeProblem(w, http.StatusUnprocessableEntity, "https://ai-auditor.dev/errors/malware",

@@ -43,8 +43,17 @@ services:
       SYS_DB_PASSWORD: ${SYS_DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # TWO files, and the order is load-bearing. The postgres entrypoint globs
+      # /docker-entrypoint-initdb.d/* in lexical order, so `00-bootstrap-roles.sql`
+      # runs before `init.sql` — which is required, because init.sql's GRANTs and
+      # its final self-check both assume auditor_app/auditor_sys already exist.
+      # The bootstrap is a separate file because it uses psql meta-commands
+      # (\getenv) that sqlc's PostgreSQL parser cannot read; see that file's
+      # header. Do NOT rename it to sort after init.sql.
+      #
       # ./init.sql == infra/init.sql. Runs ONLY on an empty data volume; after
       # the first `up`, schema changes need a migration or a volume reset.
+      - ./00-bootstrap-roles.sql:/docker-entrypoint-initdb.d/00-bootstrap-roles.sql:ro
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U auditor -d ai_auditor"]

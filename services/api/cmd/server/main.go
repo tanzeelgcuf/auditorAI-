@@ -124,7 +124,7 @@ func main() {
 		slog.Warn("failed to seed COA templates", "error", err)
 	}
 
-	// Proactive stale document-request reminder loop (doc 10 §7). Sweeps every
+	// Proactive stale document-request reminder loop. Sweeps every
 	// firm, so it cannot be scoped to one — sysPool.
 	go notify.Run(ctx, sysPool, notify.DefaultInterval)
 
@@ -171,7 +171,7 @@ func main() {
 	}
 
 	// Pipeline coordinator: consumes document.uploaded -> ingestion gRPC ->
-	// extracted_entities -> entity.extraction.requested (doc 12 §1).
+	// extracted_entities -> entity.extraction.requested.
 	if pipelineClient != nil && st != nil {
 		if ingURL := os.Getenv("INGESTION_GRPC_ADDR"); ingURL != "" {
 			coord, err := pipeline.NewCoordinator(os.Getenv("NATS_URL"), ingURL, sysPool, st)
@@ -222,8 +222,12 @@ func main() {
 	periodsSvc := periods.NewService()
 	periodsSvc.SetDB(pool)
 
+	// settings takes no pool: every statement in it runs on the RLS-primed request
+	// connection, and its one pre-scope function (settings.AuthAPIKey, currently
+	// unwired) takes sysPool as an explicit parameter. The SetDB(pool) that used to
+	// be here fed a field that became write-only when conn() stopped falling back
+	// to Acquire().
 	settingsSvc := settings.NewService()
-	settingsSvc.SetDB(pool)
 	billingSvc.SetDB(pool)
 	// The Stripe webhook is a cross-firm actor with no JWT, so it cannot satisfy the
 	// `firms` RLS policy (init.sql:466 -> id = current_setting('app.current_firm')).
@@ -234,7 +238,12 @@ func main() {
 	// HandleCheckout keeps using the RLS-bound pool; only the webhook uses this one.
 	billingSvc.SetSysDB(sysPool)
 	mcpSvc := mcp.NewService()
-	mcpSvc.SetDB(pool)
+	// No mcpSvc.SetDB: the service holds no pool. All four /mcp/tools/* handlers
+	// run on the connection InternalAuth primed via AcquireScoped; the field this
+	// call used to set existed only to feed an Acquire() fallback, which returned
+	// an UNPRIMED connection from this same RLS-enforced pool and so could not
+	// have served any of the queries it was reached for.
+
 	if pipelineClient != nil {
 		mcpSvc.SetVerificationPublisher(pipelineClient)
 	}
@@ -255,8 +264,11 @@ func main() {
 	portalSvc.SetSysDB(sysPool)
 	portalSvc.SetAuth(authSvc)
 
+	// push takes no pool either, for the same reason, and for a second one: its
+	// background fan-out (push.SendFindingAlert) needs sysPool while its handler
+	// needs the primed request connection. One field could only ever have been right
+	// for one of them, and SetDB(pool) made it the wrong one for the fan-out.
 	pushSvc := push.NewService()
-	pushSvc.SetDB(pool)
 
 	humanSvc := humanoverride.NewService()
 	humanSvc.SetDB(pool)
@@ -312,14 +324,14 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 
-	// Rate limiters (per-IP token bucket, doc 00 §3.10). Auth and uploads are
+	// Rate limiters (per-IP token bucket). Auth and uploads are
 	// the brute-force / abuse surfaces; admin key operations are low-traffic.
 	// Rates: auth 5 req/s burst 20; upload 3 req/s burst 10; admin 2 req/s burst 5.
 	authLimiter := middleware.NewIPRateLimiter(5, 20)
 	uploadLimiter := middleware.NewIPRateLimiter(3, 10)
 	adminLimiter := middleware.NewIPRateLimiter(2, 5)
 
-	// Client portal login (public — invite-token based, doc 07 §5)
+	// Client portal login (public — invite-token based)
 	r.With(middleware.RateLimit(authLimiter)).Post("/v1/portal/login", portalSvc.HandleLogin)
 
 	// Stripe webhook (public by necessity, 2026-09-04).
@@ -386,13 +398,40 @@ func main() {
 		r.Use(middleware.RLSInjector(pool))
 
 		// Tenant/Book management
+		//
+		// The three write routes below are firm_admin-only, and were NOT before
+		// 2026-09-06. tenant.go carried two comments asserting the restriction —
+		// "Only firm_admin can assign staff — enforced by RequireRole middleware at
+		// /v1/admin" and "Only firm_admin can reach this route anyway (RequireRole on
+		// the /v1/admin group)" — but the routes are mounted HERE, in the general
+		// protected group, and the only RequireRole in this file is at the /v1/admin
+		// group below. The comments described an intention; the router applied none
+		// of it.
+		//
+		// What that cost: user_book_assignments is governed by
+		// assignments_own_firm_only (init.sql:606), which gates on FIRM, not on
+		// app.assigned_books. So for this one table the Go layer was the only
+		// book-level control, and HandleAssignStaff never checked bookId against the
+		// caller's assignments either. Any staff JWT could POST
+		// /v1/books/{anyBookInTheirFirm}/staff with their own user_id, and on the very
+		// next request RLSInjector recomputes app.assigned_books from that table —
+		// defeating the second level of the two-level RLS model outright and exposing
+		// every document, entity, group, finding and report of every client of the
+		// firm. HandleRemoveStaff was the mirror image: any staff could unassign the
+		// firm admin from any book.
+		//
+		// Kept at these paths rather than moved under /v1/admin: nothing in apps/web
+		// calls them (grep for "/staff" finds only the /admin/team nav link), so the
+		// path is free to move, but the role belongs on the route and moving URLs
+		// would make the fix look like a refactor in the diff. The handlers enforce
+		// firm membership of the target user independently — see tenant.go.
 		r.Route("/v1/books", func(r chi.Router) {
 			r.Get("/", tenantSvc.HandleListBooks)
-			r.Post("/", tenantSvc.HandleCreateBook)
+			r.With(middleware.RequireRole("firm_admin")).Post("/", tenantSvc.HandleCreateBook)
 			r.Get("/{bookId}", tenantSvc.HandleGetBook)
 			r.Patch("/{bookId}/settings", tenantSvc.HandleUpdateBookSettings)
-			r.Post("/{bookId}/staff", tenantSvc.HandleAssignStaff)
-			r.Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
+			r.With(middleware.RequireRole("firm_admin")).Post("/{bookId}/staff", tenantSvc.HandleAssignStaff)
+			r.With(middleware.RequireRole("firm_admin")).Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
 		})
 
 		// Documents — upload-url is a storage-abuse surface (presigned PUTs),
@@ -409,18 +448,18 @@ func main() {
 		// Entities
 		r.Get("/v1/books/{bookId}/entities", entitySvc.HandleList)
 
-		// Human override (doc 11) — manual entity creation + group split/merge
+		// Human override — manual entity creation + group split/merge
 		r.Post("/v1/books/{bookId}/entities/manual", humanSvc.HandleCreateManualEntity)
 		r.Post("/v1/reconciliation-groups/{groupId}/split", humanSvc.HandleSplitGroup)
 		r.Post("/v1/reconciliation-groups/merge", humanSvc.HandleMergeGroups)
 
-		// Config change history (doc 11 §3)
+		// Config change history
 		r.Get("/v1/books/{bookId}/config-history", humanSvc.HandleConfigHistory)
 
-		// Automation rate (doc 11 §5)
+		// Automation rate
 		r.Get("/v1/books/{bookId}/automation-rate", humanSvc.HandleAutomationRate)
 
-		// Tags (doc 11 §6)
+		// Tags
 		r.Get("/v1/tags", humanSvc.HandleListTags)
 		r.Post("/v1/tags", humanSvc.HandleCreateTag)
 		r.Post("/v1/entities/tag", humanSvc.HandleTagEntity)
@@ -448,21 +487,21 @@ func main() {
 		// the bug — see the public registration above. HandleCheckout stays in this
 		// group because it legitimately has a JWT and must be RLS-scoped.
 
-		// Periods (close workflow, doc 10 §1)
+		// Periods (close workflow)
 		r.Get("/v1/books/{bookId}/periods", periodsSvc.HandleListPeriods)
 		r.Post("/v1/books/{bookId}/periods", periodsSvc.HandleCreatePeriod)
 		r.Post("/v1/books/{bookId}/periods/{periodId}/close", periodsSvc.HandleClosePeriod)
 		r.Post("/v1/books/{bookId}/periods/{periodId}/reopen", periodsSvc.HandleReopenPeriod)
 
-		// Document requests (doc 10 §4)
+		// Document requests
 		r.Get("/v1/books/{bookId}/document-requests", periodsSvc.HandleListDocumentRequests)
 		r.Post("/v1/books/{bookId}/document-requests", periodsSvc.HandleCreateDocumentRequest)
 		r.Post("/v1/books/{bookId}/document-requests/{requestId}/waive", periodsSvc.HandleWaiveDocumentRequest)
 
-		// Firm dashboard (doc 08 §6)
+		// Firm dashboard
 		r.Get("/v1/firm/dashboard", periodsSvc.HandleFirmDashboard)
 
-		// Book settings (doc 07/08/09)
+		// Book settings
 		r.Get("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleListChartOfAccounts)
 		r.Post("/v1/books/{bookId}/chart-of-accounts", settingsSvc.HandleCreateChartAccount)
 		r.Patch("/v1/books/{bookId}/chart-of-accounts/{accountId}", settingsSvc.HandleUpdateChartAccount)
@@ -484,25 +523,25 @@ func main() {
 			r.Patch("/settings", tenantSvc.HandleUpdateFirmSettings)
 			r.Post("/rotate-keys", tenantSvc.HandleRotateKeys)
 
-			// API keys (doc 07 §7)
+			// API keys
 			r.Get("/api-keys", settingsSvc.HandleListAPIKeys)
 			r.Post("/api-keys", settingsSvc.HandleCreateAPIKey)
 			r.Delete("/api-keys/{keyId}", settingsSvc.HandleRevokeAPIKey)
 
-			// Webhooks (doc 07 §7)
+			// Webhooks
 			r.Get("/webhooks", settingsSvc.HandleListWebhooks)
 			r.Post("/webhooks", settingsSvc.HandleCreateWebhook)
 			r.Delete("/webhooks/{webhookId}", settingsSvc.HandleDeleteWebhook)
 			r.Post("/webhooks/{webhookId}/test", settingsSvc.HandleTestWebhook)
 		})
 
-		// Mobile push device registration (doc 07 §8)
+		// Mobile push device registration
 		r.Post("/v1/push/register", pushSvc.HandleRegisterDevice)
 	})
 
 	// MCP tools (internal, called by agent-runtime). Outside the user-auth
 	// group: authenticated with the shared internal key instead of a user JWT,
-	// scoping to the client_book_id in the request body (doc 05 §3).
+	// scoping to the client_book_id in the request body.
 	//
 	// Both pools: sysPool resolves book -> firm (the step that establishes scope,
 	// so it cannot itself be scoped), then the handlers run on an RLS-primed

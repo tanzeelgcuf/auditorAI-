@@ -1,16 +1,14 @@
 // services/ingestion/src/main.rs
 #![deny(clippy::unwrap_used)]
-
-mod grpc;
-mod preprocess;
-mod ocr;
 mod bbox;
+mod grpc;
+mod ocr;
+mod preprocess;
 mod telemetry;
-
+use clap::Parser;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
-use clap::Parser;
 
 use crate::grpc::ingestion_service::ingestion_service_server::IngestionServiceServer;
 use crate::grpc::IngestionServiceImpl;
@@ -22,7 +20,11 @@ struct Args {
     #[arg(long, env = "GRPC_ADDR", default_value = "[::]:50051")]
     grpc_addr: String,
 
-    #[arg(long, env = "OCR_SIDECAR_URL", default_value = "http://ocr-sidecar:8000")]
+    #[arg(
+        long,
+        env = "OCR_SIDECAR_URL",
+        default_value = "http://ocr-sidecar:8000"
+    )]
     ocr_sidecar_url: String,
 
     #[arg(long, env = "NATS_URL", default_value = "nats://nats:4222")]
@@ -45,9 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting ingestion service on {}", args.grpc_addr);
 
     // Initialize OCR backend (docTR sidecar)
-    let ocr_backend: Arc<dyn OcrBackend> = Arc::new(
-        crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url).await?
-    );
+    let ocr_backend: Arc<dyn OcrBackend> =
+        Arc::new(crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url).await?);
 
     // Initialize NATS connection (async-nats, the maintained successor client)
     let nc = async_nats::connect(&args.nats_url).await?;

@@ -3,8 +3,9 @@
 
 Why this exists
 ---------------
-infra/init.sql is the ONLY DDL any environment applies. There is no migration
-runner. Before this guard, services/api/db/migrations/ held 8 .up.sql files that
+infra/init.sql is the only file that defines a RELATION — every table, view,
+index and policy — in every environment. There is no migration runner. Before
+this guard, services/api/db/migrations/ held 8 .up.sql files that
 nothing ever executed, so 6 tables, 1 view and 10 columns were referenced by
 live handlers but absent from the applied schema. Nothing in CI could see it:
 
@@ -13,6 +14,16 @@ live handlers but absent from the applied schema. Nothing in CI could see it:
   * `go build` / `go vet` / lint never parse SQL string literals.
   * the one real-database test suite died in setup on a missing table, so the
     schema failure masked the RLS failure behind it.
+
+Amended 2026-09-06: init.sql is no longer the only .sql file applied.
+infra/00-bootstrap-roles.sql runs first and holds the two CREATE ROLE
+statements, because reading a password safely needs psql's `\getenv` and psql
+meta-commands are not SQL — sqlc parses init.sql as its schema and could not
+read them, which failed `sqlc compile` and, since that step precedes `go test`,
+took every Go test with it. That file defines no relation and this parser does
+not read it; `scripts/check_bootstrap_split.py` fails if a CREATE TABLE / VIEW /
+INDEX / POLICY ever appears there, which is what keeps this parser's single-file
+assumption true rather than merely stated.
 
 So: parse init.sql, extract every table/view/column reference out of the Go and
 Python sources, and diff. Deliberately conservative — it only reports a column
@@ -291,11 +302,15 @@ def referenced_columns(sql: str, known: dict[str, set[str]]) -> set[tuple[str, s
                 pairs.add((table, col))
 
     # UPDATE t SET a = ..., b = ...   (stop at WHERE/RETURNING/FROM)
+    # `=(?!>)` so that a named function argument — make_interval(secs => $1),
+    # jsonb_set(target => ...) — is not read as an assignment to a column `secs`.
+    # Same bug class as the `secs` false positive in single_table_columns below;
+    # found by sweeping for it after fixing that one.
     for m in re.finditer(
         r"\bUPDATE\s+([a-z_][a-z0-9_]*)\s+SET\s+(.*?)(?:\bWHERE\b|\bRETURNING\b|\bFROM\b|$)",
         sql, re.I | re.S):
         table = m.group(1).lower()
-        for assign in re.finditer(r"([a-z_][a-z0-9_]*)\s*=", m.group(2), re.I):
+        for assign in re.finditer(r"([a-z_][a-z0-9_]*)\s*=(?!>)", m.group(2), re.I):
             pairs.add((table, assign.group(1).lower()))
 
     # alias.column / table.column, where the alias resolves to one known table
@@ -338,6 +353,12 @@ def single_table_columns(sql: str, known: dict[str, set[str]]) -> set[tuple[str,
     body = re.sub(r"'(?:[^']|'')*'", " ", sql)
     body = re.sub(r"::\s*[a-z_][a-z0-9_]*(\s*\[\s*\])?", " ", body, flags=re.I)
     body = re.sub(r"\$\d+", " ", body)
+    # Named function arguments: make_interval(secs => $1). `secs` is an argument
+    # name, not a column, and no real column reference is ever followed by `=>`,
+    # so dropping these is a precision fix, not a loosening. It is here because
+    # the guard reported idempotency_keys.secs on 2026-09-05 against SQL that was
+    # correct.
+    body = re.sub(r"\b[a-z_][a-z0-9_]*\s*=>", " ", body, flags=re.I)
     body = re.sub(r"\b[a-z_][a-z0-9_]*\s*\(", " ( ", body, flags=re.I)
     body = re.sub(r"\b[a-z_][a-z0-9_]*\s*\.\s*[a-z_][a-z0-9_]*", " ", body, flags=re.I)
 

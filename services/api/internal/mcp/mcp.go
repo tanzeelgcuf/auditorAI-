@@ -1,7 +1,7 @@
 package mcp
 
 // Internal MCP tool server — called by services/agent-runtime, not external clients.
-// Tools (docs 05 §3): get_pending_entities, create_entity_link, flag_for_review,
+// Tools: get_pending_entities, create_entity_link, flag_for_review,
 // get_book_tolerance.
 
 import (
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 )
 
@@ -23,16 +22,55 @@ type VerificationPublisher interface {
 	PublishVerification(ctx context.Context, groupID, clientBookID string) error
 }
 
+// Service holds no pool. Every statement in this file runs on the RLS-primed
+// request connection, and the only thing the removed `db *pgxpool.Pool` field
+// ever did was feed an Acquire() fallback in four handlers — so once those fail
+// closed, the field was write-only. Fourth instance of that same shape after
+// settings.go, push.go and the tenant package.
 type Service struct {
-	db            *pgxpool.Pool
-	verifyPub     VerificationPublisher
+	verifyPub VerificationPublisher
 }
 
 func NewService() *Service { return &Service{} }
 
-func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
-
 func (s *Service) SetVerificationPublisher(p VerificationPublisher) { s.verifyPub = p }
+
+// primed returns the RLS-primed request connection, or false after logging and
+// writing a 500. ONE resolution point for this file (rule 13); before
+// 2026-09-05 all four handlers carried a byte-identical copy of
+// `c := GetConn(...); if c == nil { c2, _ := s.db.Acquire(...); c = c2 }`.
+//
+// Why there is no Acquire() fallback. mcpSvc.SetDB(pool) at main.go:241 passed
+// the RLS-ENFORCED app pool, so Acquire() returned a connection with no
+// app.current_firm set. Every table these handlers touch — extracted_entities,
+// reconciliation_groups, reconciliation_group_members, client_books — has
+// ENABLE ROW LEVEL SECURITY, and init.sql's policies cast current_setting(...)
+// straight to uuid with no missing_ok, so such a statement raises (42704, or
+// 22P02 on ''::uuid after ReleaseRLSConn RESETs it). The fallback could never
+// have produced a working query; it only moved the failure to a place that
+// could not explain it.
+//
+// OBSERVED: unreachable today, on a path worth spelling out because it is NOT
+// the RLSInjector group. The four /mcp/tools/* routes (main.go:519-522) sit in a
+// group whose only middleware is InternalAuth(pool, sysPool) (main.go:511).
+// InternalAuth resolves book -> firm on sysDB, then calls
+// middleware.AcquireScoped (internal_auth.go:110), which primes a connection
+// from the app pool and stores it under connKey (middleware.go:200) — the same
+// key GetConn reads (middleware.go:262). So GetConn is non-nil here for every
+// authenticated MCP call. REASONED, from those four line references; not
+// executed.
+func (s *Service) primed(w http.ResponseWriter, r *http.Request) (middleware.Querier, bool) {
+	if c := middleware.GetConn(r.Context()); c != nil {
+		return c, true
+	}
+	slog.Error("mcp: no RLS-primed connection; the route is mounted outside both "+
+		"RLSInjector and InternalAuth, and every statement here would raise",
+		"path", r.URL.Path, "method", r.Method)
+	writeProblem(w, http.StatusInternalServerError,
+		"https://ai-auditor.dev/errors/internal", "no db conn")
+	return nil, false
+}
+
 
 func writeProblem(w http.ResponseWriter, status int, typ, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
@@ -63,17 +101,11 @@ func (s *Service) HandleGetPendingEntities(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Scoped by RLS session vars set by the middleware chain; agent-runtime calls
-	// come through the same authenticated path as the web app.
-	c := middleware.GetConn(r.Context())
-	if c == nil {
-		c2, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer c2.Release()
-		c = c2
+	// Scoped by the RLS session vars InternalAuth primed on this connection —
+	// not by RLSInjector, which this route group does not use. See s.primed.
+	c, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	// Batch scoping: when a batch_id (source document) is given, restrict to its
@@ -158,7 +190,7 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request", "invalid body")
 		return
 	}
-	// Doc 09: groups need not have all three legs (bank+GL only is valid — deposits,
+	// Groups need not have all three legs (bank+GL only is valid — deposits,
 	// fees). At least bank+GL required; invoice may be empty.
 	if len(req.BankIDs) == 0 || len(req.GLIDs) == 0 {
 		writeProblem(w, http.StatusBadRequest, "https://ai-auditor.dev/errors/bad-request",
@@ -192,15 +224,9 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	c := middleware.GetConn(r.Context())
-	if c == nil {
-		c2, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer c2.Release()
-		c = c2
+	c, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	tx, err := c.Begin(r.Context())
@@ -234,7 +260,7 @@ func (s *Service) HandleCreateEntityLink(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Derive group scope from the GL legs' chart-of-accounts account type
-	// (doc 12 §2 / Round 7): AR-side activity is categorized, not excluded.
+	// AR-side activity is categorized, not excluded.
 	// A GL leg posting to AR / asset / revenue accounts => 'ar'; else 'ap'.
 	var scope string
 	err = tx.QueryRow(r.Context(),
@@ -317,15 +343,9 @@ func (s *Service) HandleFlagForReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := middleware.GetConn(r.Context())
-	if c == nil {
-		c2, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer c2.Release()
-		c = c2
+	c, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	_, err := c.Exec(r.Context(),
@@ -347,15 +367,9 @@ func (s *Service) HandleGetBookTolerance(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	c := middleware.GetConn(r.Context())
-	if c == nil {
-		c2, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer c2.Release()
-		c = c2
+	c, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	var tolerance, toleranceMode string

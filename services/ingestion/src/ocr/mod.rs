@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedEntity {
-    pub entity_type: String,           // "invoice_line_item", "bank_transaction", "gl_entry"
+    pub entity_type: String, // "invoice_line_item", "bank_transaction", "gl_entry"
     pub amount_cents: i64,
     pub currency: String,
     pub transaction_date: Option<chrono::NaiveDate>,
@@ -20,13 +20,13 @@ pub struct ExtractedEntity {
     pub transaction_ref: Option<String>, // source ref (e.g. GL "Num", OFX "FITID")
     pub page_number: i32,
     pub bbox: BoundingBox,
-    pub confidence: f32,               // 0.0 - 1.0
-    pub source_format: String,         // "ocr" or "structured"
+    pub confidence: f32,       // 0.0 - 1.0
+    pub source_format: String, // "ocr" or "structured"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
-    pub x: f32,      // 0.0 - 1.0
+    pub x: f32, // 0.0 - 1.0
     pub y: f32,
     pub width: f32,
     pub height: f32,
@@ -36,7 +36,7 @@ pub struct BoundingBox {
 pub struct ProcessDocumentRequest {
     pub document_id: Uuid,
     pub storage_key: String,
-    pub doc_type: String,  // "invoice", "bank_statement", "gl_export"
+    pub doc_type: String, // "invoice", "bank_statement", "gl_export"
     pub client_book_id: Uuid,
     pub column_map: std::collections::HashMap<String, String>, // per-book CSV mapping
 }
@@ -65,7 +65,10 @@ pub enum OcrError {
 #[async_trait]
 pub trait OcrBackend: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError>;
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError>;
 }
 
 // ── Format detection ──

@@ -847,8 +847,8 @@ mod tests {
 
     #[test]
     fn test_real_decision_graph_loads_and_compiles() {
-        let engine = RuleEngine::new(&real_graph_path())
-            .expect("the shipped decision graph must compile");
+        let engine =
+            RuleEngine::new(&real_graph_path()).expect("the shipped decision graph must compile");
         assert_eq!(engine.rule_version.len(), 16);
         assert!(engine.rule_id.contains("gl_reconciliation"));
         assert_eq!(
@@ -889,33 +889,54 @@ mod tests {
     fn test_operand_forms() {
         assert_eq!(
             Operand::parse("0").expect("int"),
-            Operand { tol_coeff: 0, konst: 0 }
+            Operand {
+                tol_coeff: 0,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("250").expect("int"),
-            Operand { tol_coeff: 0, konst: 250 }
+            Operand {
+                tol_coeff: 0,
+                konst: 250
+            }
         );
         assert_eq!(
             Operand::parse("tolerance_cents").expect("ident"),
-            Operand { tol_coeff: 1, konst: 0 }
+            Operand {
+                tol_coeff: 1,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("tolerance_cents*10").expect("ident*n"),
-            Operand { tol_coeff: 10, konst: 0 }
+            Operand {
+                tol_coeff: 10,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("100*tolerance_cents").expect("n*ident"),
-            Operand { tol_coeff: 100, konst: 0 }
+            Operand {
+                tol_coeff: 100,
+                konst: 0
+            }
         );
         // Whitespace is not significant.
         assert_eq!(
             Operand::parse(" tolerance_cents * 5 ").expect("spaced"),
-            Operand { tol_coeff: 5, konst: 0 }
+            Operand {
+                tol_coeff: 5,
+                konst: 0
+            }
         );
         // Two constants fold.
         assert_eq!(
             Operand::parse("5*2").expect("n*n"),
-            Operand { tol_coeff: 0, konst: 10 }
+            Operand {
+                tol_coeff: 0,
+                konst: 10
+            }
         );
     }
 

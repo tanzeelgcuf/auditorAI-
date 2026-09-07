@@ -20,8 +20,12 @@ impl BoundingBox {
     }
 
     pub fn from_pixel_coords(
-        x: f32, y: f32, width: f32, height: f32,
-        page_width: f32, page_height: f32
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        page_width: f32,
+        page_height: f32,
     ) -> Self {
         Self {
             x: (x / page_width).clamp(0.0, 1.0),
@@ -41,17 +45,17 @@ impl BoundingBox {
     }
 
     pub fn contains(&self, other: &BoundingBox) -> bool {
-        other.x >= self.x &&
-        other.y >= self.y &&
-        other.x + other.width <= self.x + self.width &&
-        other.y + other.height <= self.y + self.height
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.width <= self.x + self.width
+            && other.y + other.height <= self.y + self.height
     }
 
     pub fn intersects(&self, other: &BoundingBox) -> bool {
-        self.x < other.x + other.width &&
-        self.x + self.width > other.x &&
-        self.y < other.y + other.height &&
-        self.y + self.height > other.y
+        self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.y < other.y + other.height
+            && self.y + self.height > other.y
     }
 
     pub fn intersection_area(&self, other: &BoundingBox) -> f32 {
@@ -85,12 +89,7 @@ impl BoundingBox {
         let cy = self.y + self.height / 2.0;
         let new_w = self.width * factor;
         let new_h = self.height * factor;
-        Self::new(
-            cx - new_w / 2.0,
-            cy - new_h / 2.0,
-            new_w,
-            new_h,
-        )
+        Self::new(cx - new_w / 2.0, cy - new_h / 2.0, new_w, new_h)
     }
 }
 

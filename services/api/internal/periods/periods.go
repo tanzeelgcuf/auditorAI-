@@ -232,7 +232,7 @@ func (s *Service) HandleCreatePeriod(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, p)
 }
 
-// ---- HandleClosePeriod (doc 10 §1) ----
+// ---- HandleClosePeriod ----
 
 func (s *Service) HandleClosePeriod(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -261,7 +261,7 @@ func (s *Service) HandleClosePeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Blocked by open document requests (doc 10 §4) — must be waived first.
+	// Blocked by open document requests — must be waived first.
 	var pending int
 	err = c.QueryRow(r.Context(),
 		`SELECT count(*) FROM document_requests
@@ -306,7 +306,7 @@ func (s *Service) HandleClosePeriod(w http.ResponseWriter, r *http.Request) {
 	}
 	// No GL data: leave trial_balance_* NULL.
 
-	// Recompute vendor spend baselines for the book (doc 10 §5): per
+	// Recompute vendor spend baselines for the book: per
 	// counterparty, avg/stddev of amount_cents over the last 6 periods.
 	baselineRows, err := c.Query(r.Context(),
 		`INSERT INTO vendor_spend_baselines (client_book_id, counterparty_canonical_name,
@@ -365,7 +365,7 @@ func (s *Service) HandleClosePeriod(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
-// ---- HandleReopenPeriod (doc 10 §1) ----
+// ---- HandleReopenPeriod ----
 
 func (s *Service) HandleReopenPeriod(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -603,7 +603,7 @@ func (s *Service) HandleWaiveDocumentRequest(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]string{"message": "document request waived"})
 }
 
-// ---- HandleFirmDashboard (doc 08 §6) ----
+// ---- HandleFirmDashboard ----
 
 func (s *Service) HandleFirmDashboard(w http.ResponseWriter, r *http.Request) {
 	if middleware.GetRole(r.Context()) != "firm_admin" {
@@ -707,7 +707,7 @@ func (s *Service) HandleFirmDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	rows.Close()
 
-	// Stale requests: requests that have had 3+ reminders (doc 10 §7).
+	// Stale requests: requests that have had 3+ reminders.
 	var staleRequests int
 	err = c.QueryRow(r.Context(),
 		`SELECT count(*) FROM document_requests

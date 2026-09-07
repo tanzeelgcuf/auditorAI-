@@ -207,10 +207,150 @@ Session reports live at the workspace root next to the repo:
     `middleware.DB(ctx, db)` **by name**, because reverting that one-line fix
     was tested against every other guard in the repo and produced exit 0
     everywhere. `sysPool` callers (`auth.go` ×8, `webhooks.go` ×3) are correct
-    by design — they must see across firms — and the ~9 remaining suspect
-    app-pool handler sites are listed in `SOC2_READINESS.md` roadmap item 9.
+    by design — they must see across firms. The "~9 remaining suspect app-pool
+    sites" this paragraph used to point at are closed as of 2026-09-05: the
+    honest final count is **eleven sites across seven files**, and
+    `check_rls_write_priming.py` now covers the class in all three directions.
     Before adding any statement against an RLS table, answer two questions:
     which pool does it run on, and is its error returned?
+
+15. **Detect this class by SHAPE, not by receiver name — and never let a
+    fallback fabricate the value the nil check exists to reject.** The
+    anti-pattern is
+
+    ```go
+    c := middleware.GetConn(ctx)
+    if c == nil { c2, err := s.db.Acquire(ctx); ...; c = c2 }
+    ```
+
+    `Acquire()` succeeds, so the branch looks handled while returning an
+    **unprimed** connection — the one value the nil check was written to
+    reject — from the same RLS-enforced pool whose policies it then has to
+    satisfy. Fail closed instead: log, 500, return.
+
+    The load-bearing lesson is about the guard, not the code. A checker that
+    classifies a statement by walking outward to the enclosing function and
+    asking "is `middleware.GetConn(` in scope?" **cannot see this**, because the
+    defective code mentions `GetConn` too. Measured, not reasoned: run against a
+    scratch copy of the pre-fix tree the receiver half reported **108 primed
+    receivers**, and against the fixed tree it reports **108** — identical before
+    and after. It had no opinion at all about five real defects in `mcp.go` ×4
+    and `review.go` ×1, all five on the RLS-enforced pool
+    (`main.go:241`, `main.go:219`). Matching `<receiver>.Acquire(` by shape, with
+    a **per-receiver** allowlist, is strictly stronger: it is the only half that
+    catches a brand-new instance in a file no pin covers.
+
+    Corollary, now seen four times: **a pool field that existed only to feed a
+    fallback becomes write-only the moment the fallback fails closed.** Delete
+    the field and its `SetDB`, and if a pre-scope function genuinely needs
+    `sysPool`, make that an explicit parameter rather than a second field
+    (`settings.AuthAPIKey`, `push.SendFindingAlert`). Deleted from `settings`,
+    `push` and `mcp`; `tenant` and `review` keep theirs for other real uses.
+
+    Corollary, seen once and worth naming: **a test whose mechanism depends on
+    the code you are deleting can keep passing while its premise evaporates.**
+    `mcp_test.go`'s acceptance test used the nil-pool panic from `s.db.Acquire`
+    as its evidence, recovered it, and asserted only "not 400". Deleting `s.db`
+    deleted the panic; the test stayed green and its comment stayed false.
+    Assert the positive observation — the 500 and its `"no db conn"` detail — so
+    that "the request stopped at the resolution point" is checked rather than
+    inferred from the absence of a 400.
+
+16. **Magnitude is not side, and this repo cannot tell you which side is
+    which.** Both tiers compare money on `abs()` — `_amounts_match`
+    (`graph/link.py`) and all three pairs in `compute_three_way_variance`
+    (`decimal_math/mod.rs`). A leg of the right SIZE on the wrong SIDE is
+    therefore variance 0 → `is_exact` True → confidence 1.0 → auto-linked with
+    no human, and `exceeds_tolerance` false in Rust as well. A wrong-side
+    posting, and a refund matched to the charge it reverses, both arrive as
+    clean reconciliations.
+
+    Keep the `abs()`. It is right for a reason stronger than the convention
+    argument that used to justify it: **the sign is not decidable there.**
+    Measured 2026-09-06 — `services/ingestion/test_fixtures/*`, the only data
+    in this repo from real file formats, parse to legs that are sign-for-sign
+    IDENTICAL (invoice, bank and gl all `[150000, 25000, 8999, -50000, 320000,
+    120000, 47550, 199999, 64275, 87500]`), because the fixture builder aligns
+    them on purpose: OFX reports a refund as a positive CREDIT while the
+    invoice and GL report it as a negative. Sign encodes charge-vs-refund
+    there, not side. A gate enforcing the other convention **fails 10 of 77
+    tests, including the real-fixture one.** That is not a gate finding bugs,
+    it is a gate encoding a guess.
+
+    Enumerating three non-zero legs up to a global flip leaves exactly one
+    pattern no convention here permits — invoice and bank agreeing in sign
+    while **GL alone** sits on the other side. `(+,+,+)` is the fixtures'
+    convention, `(+,-,+)` the prose one, `(+,-,-)` a by-the-book bank rec
+    whose GL leg is the CASH line rather than the expense line; which one a
+    firm uses is a fact about its chart of accounts. So `_sign_pattern_ok`
+    asserts that single pattern and asserts **nothing** when invoice and bank
+    disagree, on 2-leg groups, or on a leg netting to zero (rule 10).
+    Downgrade-only per rule 9, and a FLAG read in the `elif` rather than an
+    `and sign_ok` conjunct — `is_exact` pins amount_score at 1.0, so a group
+    with no date or counterparty signal scores exactly `0.500` against a
+    `review_floor` of `0.500`; a bare conjunct drops the class out of BOTH
+    queues, which is worse than the bug, because an unmatched entity reads as
+    "nothing to reconcile here".
+
+    Do **not** make `_amounts_match` sign-aware to fix this. Python would then
+    withhold candidates Rust would reconcile — the 139/600 tier disagreement
+    inverted and invisible, since a suppressed candidate leaves no row
+    anywhere. Ask the sign question once, at routing.
+
+    The generalisation, which is the part worth carrying: **a comment
+    asserting a domain convention is a claim, and two of them here were
+    false.** `_score_group` comment #1 and `compute_three_way_variance`'s both
+    stated "a billed invoice +, its bank debit -, its GL credit +" as settled
+    fact, and both had been quoted as evidence. When a rule rests on one
+    measurement, guard the measurement too —
+    `test_fixtures_are_still_sign_aligned` goes red if the fixtures are
+    re-signed, instead of the comment quietly becoming wrong.
+
+17. **A type error names a line. It does not name the bug — and the fix that
+    silences it is usually not the fix.** Added 2026-09-06 after the first
+    `web` job. Five TypeScript failures were triaged as "type noise"; **two
+    were rendering bugs whose only visible symptom was the type error**, and
+    the widening fix proposed for one of them would have compiled while
+    leaving the bug in place.
+
+    - `MotionButton` took `variant?: VariantKey`, so `variant="secondary"`
+      and `size="icon"` were type errors. The proposed fix was to widen
+      `VariantKey` with `"secondary" | "outline" | "ghost"`. OBSERVED instead,
+      by reading **all 19 call sites**: the component rendered
+      `className={cn(className)}` and never composed `buttonVariants` at all,
+      and not one call site re-declares a background, height, padding, radius
+      or focus ring — they pass only layout (`w-full gap-2`, `h-8 w-8`). So
+      **every MotionButton in the app rendered as an unstyled `<button>`**,
+      including the submit CTAs on login, signup, dashboard, onboarding and
+      settings, and their `disabled={…isPending}` states got no
+      `disabled:opacity-50`. tsc could only see the 9 sites that passed
+      `variant`/`size`; the other 10 typechecked clean and were equally
+      unstyled. Widening would have made all 19 compile and none of them
+      styled. Fixed by exporting `buttonVariants` (it was module-private —
+      *that* was the root cause) and composing it; the animation preset moved
+      to `motionVariant`.
+    - `VariantKey` listed `"fade"`. `grep` found that literal in **exactly one
+      place in the app — the type declaration itself.** The exported object is
+      `fadeIn`, and `pdf-viewer.tsx:87` passes `variant="fadeIn"`. So
+      `presets["fadeIn"]` was `undefined`, and an `undefined` variants prop
+      beside `initial="hidden" animate="visible"` **does not throw** — the
+      animation had silently never run once. Renaming the key to match its
+      object fixes the call site and removes the trap; "fix the call site to
+      `fade`" would have left it.
+
+    Two mechanical tells, both cheap: a props type that a **majority of call
+    sites** violate is describing the wrong thing, not catching mistakes; and
+    a union member that greps to zero call sites has never worked. Neither
+    needs a compiler, which matters here.
+
+    The same pass found a third defect tsc cannot see at all: `skeleton.tsx`
+    carried `backgroundColor: "rgb(var(--color-muted) / <alpha-value>)"` in a
+    React inline `style`, copied out of `tailwind.config.ts:36`.
+    `<alpha-value>` is a Tailwind **config** placeholder substituted when a
+    utility class is emitted; nothing substitutes it in a style prop, so the
+    browser got invalid CSS and dropped the declaration — every skeleton in
+    the app rendered with no fill. Swept: the only `<alpha-value>` outside
+    `tailwind.config.ts`.
 
 ## Group disposition
 
@@ -226,7 +366,7 @@ over tolerance by Rust's own arithmetic.**
 | `pipeline/verify_worker.go` | Success path wrote the finding and stopped; `review.go:71` selects the queue on `status`, so the group never appeared in it. |
 | `link.py is_exact` | Compared each leg against `present_totals[0]` only — a **star**. Two legs one tolerance off the invoice in opposite directions are 2× tolerance apart and passed. Rust takes the **max of all three pairwise** variances. |
 | `link.py` presence | `total != 0`, so a zero-net invoice leg was invisible and the group auto-linked on the other two. |
-| `link.py _score_group` | `abs(vi - vj)` on **signed** totals. 3-way groups carry opposite signs by convention, so `amount_score` clamped to 0.0, the path collapsed to `0.2·date + 0.3·cp`, and a near-miss landed exactly on `review_floor` — a fuzzy counterparty then routed a real discrepancy to **neither queue**. |
+| `link.py _score_group` | `abs(vi - vj)` on **signed** totals, so any group whose legs are recorded on opposite sides had `amount_score` clamped to 0.0, the path collapsed to `0.2·date + 0.3·cp`, and a near-miss landed exactly on `review_floor` — a fuzzy counterparty then routed a real discrepancy to **neither queue**. (The fix is right; the *reason* originally written here — "3-way groups carry opposite signs by convention" — was retired 2026-09-06. See rule 16: the sign is not decidable there, which is a stronger justification for the same `abs()`.) |
 | `mcp.go HandleCreateEntityLink` | Took `req.Status` from the caller. A group created `'confirmed'` is immune to the downgrade *because* that UPDATE is guarded on `auto_linked`. |
 | `graph_def.py _verify_node` | Never sent the presence flags (so every leg arrived absent and no group could be flagged), never applied the result, and left the group `auto_linked` on exception. **Unreachable in production** — `main.py:212` passes no `verification_client` — fixed and pinned anyway. |
 | `infra/init.sql` | `status DEFAULT 'auto_linked'`. A default disposition must mean "nobody decided". Now `'needs_review'`. |
@@ -237,11 +377,16 @@ gap at confidence 1.0. That is why this class is worse than a low-confidence
 mismatch — it is silent and it grows with a customer-configurable number.
 
 Tests: `services/agent-runtime/tests/test_link_tolerance.py` (8),
-`tests/test_verify_node.py` (10), `internal/mcp/mcp_test.go`,
+`tests/test_verify_node.py` (10), `tests/test_link_sign.py` (11, rule 16 — 3
+behavioural and 8 *declared* guards; read its header for the per-test
+non-vacuity attribution), `internal/mcp/mcp_test.go`,
 `internal/pipeline/verify_worker_test.go`. Read the last one's header before
 trusting it — it asserts on source **text**, because a `jetstream.Msg` cannot be
 built outside a live connection, and the behavioural equivalent belongs in the
-`DATABASE_URL_TEST` suite and does not exist yet.
+`DATABASE_URL_TEST` suite and does not exist yet. The whole Python suite is
+**88 passed, 0 failed, 0 skipped-unsupported** as of 2026-09-06 under the
+stdlib pyshim; `pytest tests -q` collects the directory, so a new
+`tests/test_*.py` needs no CI change.
 
 ## Client IP and rate limits
 
@@ -556,20 +701,29 @@ from Stripe with no error on our side. The handler authenticates its own caller
 (secret unset → 503; `webhook.ConstructEvent` verifies the HMAC over the raw body
 → 400) and is rate-limited. Do not "fix" it back into the auth group.
 
-## CI — `.github/workflows/ci.yml`, 8 jobs
+## CI — `.github/workflows/ci.yml`, 9 jobs
 
 `go` · `rust-ingestion` · `rust-verification` · `Schema Drift Guard` · `python` ·
-`web` · `security` · `docker`
+`web` · `security` · `osv` · `docker`
+
+`osv` (display name **OSV-Scanner**) was added 2026-09-06 and is a job-level
+`uses:` of a **reusable workflow**
+(`google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2`), not a
+step-level action. It was previously written as a step-level
+`uses: google/osv-scanner-action@v1`, which does not resolve; that repo publishes
+reusable workflows, and this one additionally needs `actions: read` alongside
+`security-events: write`.
 
 Per-language gates, stated accurately:
 
-- **Go**: real Postgres 16 service container with `infra/init.sql` loaded, `sqlc compile`, golangci-lint, `go test ./... -race` against four distinct DSNs, coverage uploaded to codecov (**no threshold configured**).
+- **Go**: real Postgres 16 service container with `infra/init.sql` loaded, `sqlc compile`, golangci-lint, `go test ./... -race` against four distinct DSNs, coverage uploaded to codecov (**no threshold configured**). **Step order is load-bearing and it is why the DB suite has zero runs**: `Load schema` → `Install sqlc` → `Run sqlc` → `Lint` → `Test`. `sqlc compile` failing at step 5 means step 7 never executes, so a `sqlc` syntax error reads in the log as "Go tests didn't run" rather than as a schema problem.
 - **Rust** (both crates): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, `cargo build --release --locked`. Ingestion is built WITHOUT `--all-features` on purpose — the `enhance` feature gates deliberately-inert stages the shipped image does not enable.
-- **Python**: entrypoint import check (`import ollama_adapter, mcp_client, graph.graph_def`) separately from `pytest tests -q`, because a missing runtime dep shows up in the import chain while every test still passes.
-- **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists.
+- **Python**: entrypoint import check (`import ollama_adapter, mcp_client, graph.graph_def`) separately from `pytest tests -q`, because a missing runtime dep shows up in the import chain while every test still passes. Since 2026-09-06 it also **asserts the real LangGraph is in use** — `graph.graph_def` must not have fallen back to the in-repo `_SequentialPipeline` shim — because an unresolvable pin degraded silently to that shim and every test stayed green.
+- **Web**: `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, then asserts `.next/standalone/server.js` exists. `apps/web/package-lock.json` is lockfileVersion 3, 444 packages, **every one with an integrity hash** — which makes the lockfile admissible local evidence that a pin resolves on the registry, in an environment with no network. That is how the never-published-pin sweep was closed on the npm side without `npm view`.
+
 - **Docker**: builds all 6 images with the same context/`-f` split as `infra/docker-compose.yml`, asserts binaries and the decision graph are actually inside the images, and `docker compose config -q` on both compose files.
 
-Five **static guards** — they exist because each proves something about code that
+Six **static guards** — they exist because each proves something about code that
 no test executes, and each was verified in both directions (clean on the current
 tree, red when the original bug is reintroduced) before being wired in:
 
@@ -580,6 +734,11 @@ tree, red when the original bug is reintroduced) before being wired in:
 | `scripts/check_cancellable_audit_writes.py` | Schema Drift Guard | rule 12 — an audit/security write on a request context whose error is only logged, plus a positive check that the four known fixes still carry `context.WithoutCancel` |
 | `scripts/check_audit_ip_arity.py` | Schema Drift Guard | rule 13 and rule 14 — `source_ip` dropped from an audit INSERT, a column/placeholder/argument arity mismatch, two same-type columns **transposed** (which raises nothing and writes a confidently wrong row), a select list longer than its Scan list, `SourceIP` mounted above `RealIP` or unmounted, and either audit writer reverted from `middleware.DB(ctx, db)` to the raw pool. 11 plausible mutants were run against it, 11 caught, each by its own invariant. |
 | `scripts/check_amount_parity.py` | python | the Rust money parser and its Python mirror disagreeing (they once read `"1250"` as $1,250.00 and $12.50) |
+| `scripts/check_rls_write_priming.py` | Schema Drift Guard | rule 14 and rule 15 — three halves. **Negative**: every `.Exec/.Query/.QueryRow/.Begin` whose SQL names one of the 31 RLS tables, classified by receiver, red on a bare pool. **Positive**: 8 files pinned by name, `must`/`must_not`, pin bodies comment-stripped first or a pin matches the prose describing the bug it forbids. **Fabrication**: `<receiver>.Acquire(` by shape with a per-receiver allowlist — 4 calls in the tree, 4 accounted for. Four **inertness gates** exit **2**, not 1: zero RLS tables parsed, zero statements matched, zero `Acquire` calls found, or a pinned file missing. 9 mutants + 2 inertness breakages run via `scripts/mutate_rls_guard.py`: **9/9 caught and correctly attributed**, both breakages REFUSED. |
+
+Current reading, REAL EXIT read directly (not through a pipe): `144 statements
+against 31 RLS tables, none on an unaccounted bare pool; 4 .Acquire( calls, all
+accounted for; all 8 pinned fixes in place.`
 
 Every one of these fails by **name** as well as by pattern — the positive half
 means silently reverting a fix goes red, which is not hypothetical: reverting
@@ -593,7 +752,7 @@ Lint rules that bite in non-obvious ways:
 - That deny reaches into `#[cfg(test)]` modules and CI passes `--all-targets`, so the 64 test-module unwraps were deny-level errors. Both crates now ship a `clippy.toml` with `allow-unwrap-in-tests` / `allow-expect-in-tests`. Do not "simplify" those files away.
 - `cargo fmt --check` rejects tabs, trailing whitespace, and over-width **code** lines (rustfmt leaves comments alone, and does not split string literals).
 - `clippy -D warnings` rejects `format!` with no arguments (`useless_format`).
-- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts three guards.
+- Renaming a CI job's **display name** silently drops any branch-protection required check keyed on it. `Schema Drift Guard` keeps its name even though it now hosts **five** guards (schema drift, storage-key orphans, cancellable audit writes, audit IP arity, RLS write priming).
 
 ## What is NOT true (read this before repeating a claim from this file)
 
@@ -605,7 +764,11 @@ false:
 - ~~"`pnpm test`"~~ — `grep -rn pnpm .github/workflows/ apps/web/package.json` returns nothing. The web job uses `npm ci`, and `apps/web/package.json` declares only `dev`, `build`, `start`, `lint` — **there is no web test script to run.** The web app has zero automated tests; lint + `tsc --noEmit` + a successful build is its entire gate.
 - ~~"100% branch coverage on verification"~~ — **no Rust coverage gate exists.** The only coverage step in the whole file is `codecov/codecov-action@v4` at line 100, inside the Go job, with no threshold set. `grep -rn 'tarpaulin\|llvm-cov\|grcov'` returns nothing. Treat this as an aspiration, not a gate.
 - ~~"there is no `DATABASE_URL_TEST` suite"~~ — withdrawn 2026-09-05. Repeated across several sessions and wrong. The harness exists: `internal/middleware/security_test.go`, `internal/pipeline/verify_worker_test.go`, `internal/auth/login_lockout_test.go` and `internal/billing/billing_test.go` all gate on `DATABASE_URL_TEST` and `t.Skip` when it is unset, and CI supplies a `postgres:16` service container with four DSNs at `ci.yml:104-107` (`DATABASE_URL` and `DATABASE_URL_TEST` as `auditor_app`, `SYS_DATABASE_URL` as `auditor_sys`, `DATABASE_URL_TEST_OWNER` as the owner). What is actually missing is the specific **cases** — lockout ordering, an `access_log` row landing with a non-NULL `source_ip`, a `config_change_log` row landing at all, `verify_worker`'s downgrade — and the fact that **no run has ever happened.** State the narrow gap, not the wide one.
+- ~~"an unprimed read against an RLS table returns **zero rows** with a 200"~~ — withdrawn 2026-09-05, and it mattered because the wrong version made the class look like a reporting nuisance. It **raises**. OBSERVED in `infra/init.sql`: 33 of the 35 `current_setting()` calls take no `missing_ok` and every one is cast to `uuid` or `uuid[]`; the only 2-argument calls are the bootstrap password lookups at `:868-869`. An unprimed statement therefore fails with **42704 undefined_object**, or **22P02 invalid_text_representation** on `''::uuid` for a connection recycled after `RESET`. Zero-rows-with-a-200 was also the reason an earlier note recorded the class as four instances in two files; the real count is eleven across seven files.
+- ~~"`check_rls_write_priming.py` covers rule 14"~~ — true only after 2026-09-05. Its receiver-classification half **passed all five defects in `mcp.go` and `review.go`** and would still pass a revert of any of them, because the defective shape mentions `middleware.GetConn(` and so classifies as primed. Evidence, not inference: the same half reported **108 primed receivers on the pre-fix scratch tree and 108 on the fixed tree.** Any claim that a guard "covers" a class should name which half of it does the covering, and what that half is blind to.
 - ~~"`FORCE ROW LEVEL SECURITY` is applied to none of the RLS tables"~~ — never committed to this file, but I derived it on 2026-09-05 and nearly reported it as a finding. `grep -nE 'ALTER TABLE \w+ FORCE ROW LEVEL SECURITY' infra/init.sql` returns **nothing**, which reads as absence and would resurrect audit finding #1 (owner bypasses RLS). FORCE *is* applied: `init.sql:880-905` is a `DO` block that selects every table where `relrowsecurity` is set and `relforcerowsecurity` is not, then `EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', t)`. Dynamic, so no static grep for the literal statement can find it, and it self-heals for future tables that get ENABLE without FORCE. **The general rule: a grep returning zero is not evidence of absence when the statement can be generated at runtime.** The only real check is `relforcerowsecurity` in a live catalogue query, which needs the database this environment does not have.
+- ~~"a legitimate 3-way group carries opposite signs by convention — a billed invoice +, its bank debit -, its GL credit +"~~ — retired 2026-09-06, and it had been sitting in **two** places as the stated justification for taking `abs()`: `_score_group` comment #1 in `graph/link.py` and the comment above the three comparisons in `compute_three_way_variance`. It is *one* of at least two conventions live in this product and **not** the one the repo's own fixtures use. OBSERVED: `services/ingestion/test_fixtures/*` parsed into legs give invoice, bank and gl sign-for-sign identical, and a gate enforcing the invoice↔bank-opposite rule **fails 10 of 77 tests including `test_sample_invoice_bank_ofx_produces_valid_reconciliation_group`**. Whether the `gl` leg is the expense/revenue line (same sign as the invoice) or the CASH line (same sign as the bank) is a fact about the customer's chart of accounts and is not knowable from this codebase. The `abs()` calls are correct, for the stronger reason in rule 16; the convention claim is not. **Nothing in this repo establishes a sign convention — if a session needs one, it has to come from the pilot firm's actual books.**
+- ~~"the 139/600 over-tolerance auto-links were a sign-handling bug"~~ — never in this file, but it is an easy inference from the two findings sitting next to each other, and it is wrong. 139/600 belongs to the **star-vs-all-pairs `is_exact`** defect (see Group disposition above), confirmed verbatim in `link.py`'s own comment; that measurement was taken before `_amounts_match` was ever examined for sign. The wrong-side class has **no** measured incidence figure — the fixtures cannot produce one, because they are sign-aligned by construction. Do not attach the 139 to it.
 
 **Nothing in this repo has been compiled or executed in the sessions that wrote
 most of it.** `cargo`, `rustc`, `go`, `gofmt`, `psql` and `docker` are all absent
@@ -630,6 +793,16 @@ upgrades them by repetition:
   about the Go runtime. Precedent for why that distinction matters: the first
   draft of the lockout test asserted a 24-hour ceiling of "40–60 attempts" when
   the measured figure was 64.
+- **`/mcp/tools/*` is primed today, so the fallback removed in rule 15 was latent
+  rather than a live outage.** That group is mounted with no `RLSInjector`, which
+  is what first looked like a dead surface. The chain that primes it anyway:
+  routes at `main.go:519-522` sit under `InternalAuth(pool, sysPool)` at
+  `main.go:511`, which calls `AcquireScoped` at `internal_auth.go:110`, which
+  stores the primed connection under `connKey` at `middleware.go:200`, which is
+  what `GetConn` reads at `middleware.go:262`. REASONED from those five line
+  references; **not executed.** Had it been wrong in either direction the
+  conclusion flips — a live outage on all four MCP tools if `GetConn` is nil, or
+  a cross-firm read if `Acquire` had ever been reached.
 - **Every ✅ in `SOC2_READINESS.md`** rests on source reading, non-DB unit tests
   and the static guards above. That combination has caught real defects — the
   header bypass, the cancellable writes, the unprimed-pool INSERT — and is still
@@ -641,6 +814,9 @@ upgrades them by repetition:
 - **A test that also passes against the pre-fix code proves nothing.** Method used on 2026-09-04: `git archive HEAD` into a scratch tree, copy the new tests in, re-run. 18 new tests → 12 fail there, and the 6 that pass on both sides are over-correction guards. One test was caught this way *after* it was written and looked green: `test_zero_net_invoice_leg_is_compared_not_ignored` passed on both trees, because `build_candidate_groups` never admits a `50000` invoice into a group whose bank leg is `-89900`, so the assertion loop never ran. Rewritten to call `score_and_route` directly.
 - Before calling something a model/tool limitation, run an isolation test that changes one variable and confirms the result changes. The regression test for the graph bug is exactly this shape: same input, two graphs differing only in thresholds, asserted to produce **different** severities.
 - When you fix one instance of a bug class, sweep for the others before closing it. Every guard in the table above found a second or third instance after the first.
+- **Read the pre-fix run by ATTRIBUTION, not by count, and declare which tests are guards before running it.** `3 passed / 8 failed` is not a result on its own: on `test_link_sign.py`'s pre-fix tree, 3 of the 8 failures were the bug reproducing with the right message, 4 died on `AttributeError: 'ReconciliationGroup' object has no attribute 'sign_conflict'` and 1 on `ImportError`, and all three *declared* guards passed on both trees — which is the intended result, since a guard failing pre-fix means it is testing the fix rather than guarding against over-correction. State the split per test. Two mechanical requirements fall out of this: **import a new symbol lazily**, inside the one test that needs it, or the pre-fix tree collapses all N results into a single IMPORT ERROR and destroys the reading; and **give every assertion a message**, or a pre-fix failure arrives as a bare `AssertionError` you cannot attribute.
+- **`main()` that returns a status is not `main()` that exits.** `python3 -c "rt.main([...])"` printed `TOTAL: 10 passed, 1 failed` and `REAL EXIT=0` in the same breath. Wrap it: `sys.exit(rt.main([...]))`. And read the exit code of the command you care about — `${PIPESTATUS[0]}`, not `$?` after a pipe into `tail`.
+- **When a rule rests on a single measurement, guard the measurement.** A comment recording one can rot while every test stays green; `test_fixtures_are_still_sign_aligned` exists for exactly that, and goes red if the fixtures are re-signed rather than letting rule 16's justification quietly evaporate.
 - Report the literal command output, not a summary of what you expect it to say.
 
 ## Subagents
