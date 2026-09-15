@@ -51,3 +51,6 @@ docker-compose.override.yml
 # Generated
 services/api/db/queries/*.go
 packages/shared-types/*.ts
+# Toolchain downloads — 2026-09-16: a 68MB go tarball landed in the repo tree (downloaded while shell cwd was a service dir) and was swept in by `git add -A`. Downloads never belong in the tree.
+*.tar.gz
+*.zip

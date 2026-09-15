@@ -28,9 +28,9 @@ pub fn init_glitchtip() {
             .release(release)
             .traces_sample_rate(0.0) // errors only; tracing stays in OTel
             .default_integrations(false); // panic handling wired manually below
-        // Guard flushes queued events on drop. Forgetting keeps the client alive
-        // for the process lifetime (flush then happens via install_panic_hook's
-        // explicit client.flush before the process dies on panic).
+                                          // Guard flushes queued events on drop. Forgetting keeps the client alive
+                                          // for the process lifetime (flush then happens via install_panic_hook's
+                                          // explicit client.flush before the process dies on panic).
         std::mem::forget(sentry::init(options));
     });
 }

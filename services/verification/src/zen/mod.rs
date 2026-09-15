@@ -172,10 +172,19 @@ impl Operand {
                         let k = ta.konst.checked_mul(tb.konst).ok_or_else(|| {
                             ZenError::LoadError(format!("constant overflow in '{}'", raw))
                         })?;
-                        Ok(Operand { tol_coeff: 0, konst: k })
+                        Ok(Operand {
+                            tol_coeff: 0,
+                            konst: k,
+                        })
                     }
-                    (1, 0) => Ok(Operand { tol_coeff: tb.konst, konst: 0 }),
-                    (0, 1) => Ok(Operand { tol_coeff: ta.konst, konst: 0 }),
+                    (1, 0) => Ok(Operand {
+                        tol_coeff: tb.konst,
+                        konst: 0,
+                    }),
+                    (0, 1) => Ok(Operand {
+                        tol_coeff: ta.konst,
+                        konst: 0,
+                    }),
                     _ => Err(ZenError::LoadError(format!(
                         "'{}' is not linear in {} (at most one {} factor)",
                         raw, TOLERANCE_IDENT, TOLERANCE_IDENT
@@ -192,10 +201,16 @@ impl Operand {
 
     fn atom(tok: &str) -> Result<Self, ZenError> {
         if tok == TOLERANCE_IDENT {
-            return Ok(Operand { tol_coeff: 1, konst: 0 });
+            return Ok(Operand {
+                tol_coeff: 1,
+                konst: 0,
+            });
         }
         tok.parse::<i64>()
-            .map(|n| Operand { tol_coeff: 0, konst: n })
+            .map(|n| Operand {
+                tol_coeff: 0,
+                konst: n,
+            })
             .map_err(|_| {
                 ZenError::LoadError(format!(
                     "'{}' is neither an integer nor the identifier {}",
@@ -310,9 +325,9 @@ fn parse_range(expr: &str) -> Result<(Bound, Bound), ZenError> {
         )));
     }
     let interior = &t[1..t.len() - 1];
-    let (lo_s, hi_s) = interior.split_once("..").ok_or_else(|| {
-        ZenError::LoadError(format!("range '{}' has no '..' separator", expr))
-    })?;
+    let (lo_s, hi_s) = interior
+        .split_once("..")
+        .ok_or_else(|| ZenError::LoadError(format!("range '{}' has no '..' separator", expr)))?;
 
     let lo = if lo_s.trim().is_empty() {
         Bound::Unbounded
@@ -437,7 +452,10 @@ fn compile(graph: &DecisionGraph) -> Result<Vec<CompiledRule>, ZenError> {
 /// original code had a fallback (an `else` arm returning "high"), and a fallback
 /// is precisely what let a graph with no rules at all still return an answer.
 fn validate_coverage(rules: &[CompiledRule]) -> Result<(), ZenError> {
-    let zero = Operand { tol_coeff: 0, konst: 0 };
+    let zero = Operand {
+        tol_coeff: 0,
+        konst: 0,
+    };
     let first = rules
         .first()
         .ok_or_else(|| ZenError::LoadError("no rules to validate".to_string()))?;

@@ -362,7 +362,9 @@ impl OcrBackend for DoctrBackend {
             .map_err(|e| OcrError::SidecarError(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(OcrError::ProcessingFailed(resp.text().await.unwrap_or_default()));
+            return Err(OcrError::ProcessingFailed(
+                resp.text().await.unwrap_or_default(),
+            ));
         }
 
         let doctr_resp: DoctrResponse = resp
@@ -390,7 +392,8 @@ impl OcrBackend for DoctrBackend {
 
                     if let Some(amount) = DoctrBackend::extract_amount(&text) {
                         let bbox = self.normalize_bbox(line.geometry, page.width, page.height);
-                        let date = DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
+                        let date =
+                            DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
 
                         let counterparty = DoctrBackend::attach_counterparty(&text, &block_lines);
 
@@ -420,7 +423,6 @@ impl OcrBackend for DoctrBackend {
         "docTR"
     }
 }
-
 
 #[cfg(test)]
 mod tests {

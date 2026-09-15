@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{error, info};
 
-use crate::grpc::VerificationServiceImpl;
 use crate::grpc::verification_service::verification_service_server::VerificationServiceServer;
+use crate::grpc::VerificationServiceImpl;
 use crate::telemetry::{init_glitchtip, install_panic_hook};
 use crate::zen::RuleEngine;
 

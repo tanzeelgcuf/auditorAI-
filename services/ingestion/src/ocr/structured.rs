@@ -513,11 +513,7 @@ impl OcrBackend for XlsxParser {
         let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
             .map_err(|e| OcrError::ParsingError(format!("xlsx open: {e}")))?;
 
-        let sheet_name = workbook
-            .sheet_names()
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let sheet_name = workbook.sheet_names().first().cloned().unwrap_or_default();
         if sheet_name.is_empty() {
             return Ok(ProcessDocumentResponse { entities: vec![] });
         }
@@ -632,7 +628,9 @@ fn cell_string(cell: &DataType) -> String {
             // Excel serial date: days since 1899-12-30
             let days = *d as i32;
             if let Some(epoch) = NaiveDate::from_ymd_opt(1899, 12, 30) {
-                let target = epoch.num_days_from_ce().checked_add(days)
+                let target = epoch
+                    .num_days_from_ce()
+                    .checked_add(days)
                     .unwrap_or(i32::MAX);
                 if let Some(date) = NaiveDate::from_num_days_from_ce_opt(target) {
                     date.format("%Y-%m-%d").to_string()
@@ -660,14 +658,8 @@ pub struct OfxParser {
 }
 
 impl OfxParser {
-    pub fn new(
-        s3_client: Arc<S3Client>,
-        bucket: String,
-    ) -> Self {
-        Self {
-            s3_client,
-            bucket,
-        }
+    pub fn new(s3_client: Arc<S3Client>, bucket: String) -> Self {
+        Self { s3_client, bucket }
     }
 }
 
@@ -708,13 +700,19 @@ impl OcrBackend for OfxParser {
             let raw_amount = fields.get("TRNAMT").map(|s| s.as_str()).ok_or_else(|| {
                 OcrError::ParsingError(format!(
                     "STMTTRN {}: missing <TRNAMT>",
-                    fields.get("FITID").map(|s| s.as_str()).unwrap_or("<no FITID>")
+                    fields
+                        .get("FITID")
+                        .map(|s| s.as_str())
+                        .unwrap_or("<no FITID>")
                 ))
             })?;
             let amount_cents = parse_amount(raw_amount).ok_or_else(|| {
                 OcrError::ParsingError(format!(
                     "STMTTRN {}: cannot parse <TRNAMT> {raw_amount:?} unambiguously",
-                    fields.get("FITID").map(|s| s.as_str()).unwrap_or("<no FITID>")
+                    fields
+                        .get("FITID")
+                        .map(|s| s.as_str())
+                        .unwrap_or("<no FITID>")
                 ))
             })?;
             let raw_date = fields.get("DTPOSTED").or(fields.get("DTUSER"));
@@ -782,11 +780,11 @@ pub fn create_structured_entity(
         transaction_ref: None,
         page_number,
         bbox: BoundingBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                },
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        },
         confidence: 1.0,
         source_format: "structured".to_string(),
     }
@@ -809,12 +807,28 @@ mod tests {
         ("100", Some(10000), "bare integer is whole dollars"),
         ("$1,500.00", Some(150000), "symbol + thousands"),
         ("€89.99", Some(8999), "non-ascii symbol"),
-        ("471.25", Some(47125), "map_columns fixture below depends on this"),
+        (
+            "471.25",
+            Some(47125),
+            "map_columns fixture below depends on this",
+        ),
         // regressions: each of these was silently WRONG before
-        ("(45.00)", Some(-4500), "was +4500 — accounting credit read as a debit"),
+        (
+            "(45.00)",
+            Some(-4500),
+            "was +4500 — accounting credit read as a debit",
+        ),
         ("(1,234.56)", Some(-123456), "parens with thousands"),
-        ("1.500,00", Some(150000), "was 150 — European, understated 1000x"),
-        ("45.00-", Some(-4500), "was None then 0 — trailing sign, SAP/mainframe"),
+        (
+            "1.500,00",
+            Some(150000),
+            "was 150 — European, understated 1000x",
+        ),
+        (
+            "45.00-",
+            Some(-4500),
+            "was None then 0 — trailing sign, SAP/mainframe",
+        ),
         ("1 234,56", Some(123456), "space thousands, comma decimal"),
         ("1'234.56", Some(123456), "Swiss apostrophe thousands"),
         ("1.234.567,89", Some(123456789), "European multi-group"),
@@ -823,7 +837,11 @@ mod tests {
         ("45.5", Some(4550), "one decimal digit pads to 50"),
         ("0.01", Some(1), "one cent"),
         ("0.00", Some(0), "explicit zero is legitimate"),
-        ("8.65", Some(865), "typical two-dp value, exact here by construction"),
+        (
+            "8.65",
+            Some(865),
+            "typical two-dp value, exact here by construction",
+        ),
         // f64 evidence, measured not assumed: 1.15_f64 * 100.0 is
         // 114.99999999999999, and 1.005_f64 * 100.0 is 100.49999999999999.
         // The old code's .round() hid the first (114.99… -> 115) and silently
@@ -831,7 +849,11 @@ mod tests {
         // 101). Rounding money is itself a calculation, so the exact path takes
         // 1.15 and REJECTS 1.005 rather than choosing for the firm.
         ("1.15", Some(115), "1.15_f64 * 100.0 = 114.99999999999999"),
-        ("999999999999.99", Some(99999999999999), "large, still in i64"),
+        (
+            "999999999999.99",
+            Some(99999999999999),
+            "large, still in i64",
+        ),
         // The four pilot invoice totals (services/ingestion/test_fixtures, used
         // by the agent-runtime eval). They are pinned HERE because this is where
         // the conversion happens: deleting agent-runtime's
@@ -841,16 +863,48 @@ mod tests {
         ("$128.75", Some(12875), "pilot INV-1002 total"),
         ("$899.00", Some(89900), "pilot BCH-2291 total"),
         ("$215.00", Some(21500), "pilot MP-5502 total"),
-        ("97401", Some(9740100), "bare integer in a CSV amount column is dollars"),
+        (
+            "97401",
+            Some(9740100),
+            "bare integer in a CSV amount column is dollars",
+        ),
         // ambiguity and garbage: None, so the caller fails the document
-        ("1.500", None, "$1.50 or EUR 1,500 — unknowable from one field"),
-        ("1,500", None, "$1,500 or EUR 1,50 — unknowable from one field"),
-        ("1234.567", None, "3dp is not cents; picking a rounding is calculation"),
-        ("1.005", None, "the classic f64 rounding trap, rejected outright"),
-        ("45.00 CR", None, "letters may carry the sign; never ignore them"),
-        ("45.00%", None, "a percentage is not an amount — reject, don't strip"),
+        (
+            "1.500",
+            None,
+            "$1.50 or EUR 1,500 — unknowable from one field",
+        ),
+        (
+            "1,500",
+            None,
+            "$1,500 or EUR 1,50 — unknowable from one field",
+        ),
+        (
+            "1234.567",
+            None,
+            "3dp is not cents; picking a rounding is calculation",
+        ),
+        (
+            "1.005",
+            None,
+            "the classic f64 rounding trap, rejected outright",
+        ),
+        (
+            "45.00 CR",
+            None,
+            "letters may carry the sign; never ignore them",
+        ),
+        (
+            "45.00%",
+            None,
+            "a percentage is not an amount — reject, don't strip",
+        ),
         ("4/5", None, "a fraction or a date fragment, not an amount"),
-        ("12,34,567.89", None, "Indian lakh grouping unsupported — reject"),
+        (
+            "12,34,567.89",
+            None,
+            "Indian lakh grouping unsupported — reject",
+        ),
         ("", None, "empty"),
         ("-", None, "sign only"),
         (".", None, "separator only"),
@@ -863,7 +917,8 @@ mod tests {
     fn test_parse_amount_table() {
         for (input, expect, why) in AMOUNT_CASES {
             assert_eq!(
-                parse_amount(input), *expect,
+                parse_amount(input),
+                *expect,
                 "parse_amount({input:?}) — {why}"
             );
         }
@@ -887,7 +942,8 @@ mod tests {
             for cents in 0..100i64 {
                 let s = format!("{dollars}.{cents:02}");
                 assert_eq!(
-                    parse_amount(&s), Some(dollars * 100 + cents),
+                    parse_amount(&s),
+                    Some(dollars * 100 + cents),
                     "inexact conversion for {s}"
                 );
             }
@@ -1001,11 +1057,7 @@ mod tests {
         };
         let input = vec![mk(47125), mk(47125), mk(21500), mk(-21500)];
         let out = dedupe_gl_pairs(input);
-        assert_eq!(
-            out.len(),
-            2,
-            "debit+credit pairs must collapse to one each"
-        );
+        assert_eq!(out.len(), 2, "debit+credit pairs must collapse to one each");
     }
 
     // With a transaction ref present, dedup keys on the REF, so two
