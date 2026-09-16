@@ -55,7 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         "Loaded decision graph: rule_id={}, rule_version={}, bands={}",
-        rule_engine.rule_id, rule_engine.rule_version, rule_engine.rule_count(),
+        rule_engine.rule_id,
+        rule_engine.rule_version,
+        rule_engine.rule_count(),
     );
     // The bands that will actually be applied, logged verbatim at startup.
     //

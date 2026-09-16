@@ -17,8 +17,7 @@ use verification_service::{
     verification_service_server::VerificationService,
     BatchReconciliationRequest as GrpcBatchReconciliationRequest,
     BatchReconciliationResult as GrpcBatchReconciliationResult,
-    GroupReconciliation as GrpcGroupReconciliation,
-    GroupResult as GrpcGroupResult,
+    GroupReconciliation as GrpcGroupReconciliation, GroupResult as GrpcGroupResult,
     ReconciliationRequest as GrpcReconciliationRequest,
     ReconciliationResult as GrpcReconciliationResult,
 };
