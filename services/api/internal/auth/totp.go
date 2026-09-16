@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
 
@@ -19,7 +20,8 @@ import (
 //     was written by /totp/verify and never read by anything, so enabling 2FA
 //     changed nothing about how the account could be logged into.
 //   - It rejects reuse of a code that has already been accepted, for as long as
-//     that code could still pass validation. `totp.Validate` allows +/-1 30s step
+//     that code could still pass validation. Validation (ValidateCustom, Skew 1)
+//     allows +/-1 30s step
 //     (~90s of acceptance for one code), so without this a code observed once —
 //     over a shoulder, in a screenshot, in a phished form — stays usable for the
 //     rest of its window.
@@ -41,7 +43,8 @@ var (
 )
 
 // totpReplayWindow is how long an accepted code is remembered as spent. It must
-// be at least the span over which totp.Validate would still accept that code:
+// be at least the span over which validation (ValidateCustom, Skew 1) would
+// still accept that code:
 // one 30s step plus the default skew of one step on either side = 90s. 120s
 // leaves margin for clock drift between the app and the database's now().
 const totpReplayWindow = 120 * time.Second
@@ -72,8 +75,16 @@ func NormalizeTOTPCode(code string) string {
 // CheckSecondFactor decides whether a login attempt satisfies the account's
 // second factor. It returns nil when the login may proceed.
 //
-// `now` is injected rather than read from time.Now() so the replay window is
-// testable; handlers pass time.Now().UTC().
+// `now` is THE instant the whole decision is judged on — the replay window
+// AND the code's validity. It is injected rather than read from time.Now()
+// so tests are deterministic; handlers pass time.Now().UTC().
+//
+// Before 2026-09-16 the replay window used `now` but validity went through
+// totp.Validate, which reads time.Now() internally: one decision, two clocks.
+// In production the two instants are microseconds apart; in a test with a
+// fixed `now` they were days apart, so the suite could only pass on the
+// literal day its fixture date was chosen. ValidateCustom takes the instant
+// explicitly; the two clocks are now one.
 //
 // FAIL-CLOSED CONTRACT: every path that is not an affirmative success returns a
 // non-nil error. There is deliberately no branch that logs and continues — the
@@ -114,7 +125,19 @@ func CheckSecondFactor(st SecondFactorState, submitted string, now time.Time) er
 		}
 	}
 
-	if !totp.Validate(code, st.Secret) {
+	// ValidateCustom rather than totp.Validate: Validate reads time.Now()
+	// internally; this function's contract is that `now` is the one clock.
+	// Period 30s, Skew 1, 6 digits — the same defaults totp.Validate applies,
+	// so production behavior is unchanged; only the clock source is.
+	valid, err := totp.ValidateCustom(code, st.Secret, now, totp.ValidateOpts{
+		Digits: otp.DigitsSix,
+		Period: 30,
+		Skew:   1,
+	})
+	if err != nil || !valid {
+		// err means the stored secret could not be processed (not valid base32,
+		// wrong length). Fail closed: a secret the library cannot read is never
+		// a reason to accept a login.
 		return ErrTOTPInvalid
 	}
 	return nil
