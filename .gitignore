@@ -58,4 +58,4 @@ packages/shared-types/*.ts
 # Report-render output: HandleGenerateReport writes PDFs to a reports/ dir
 # relative to the process CWD — during go test that is the package dir
 # (observed 2026-09-16: two PDFs in internal/middleware/reports/).
-reports/*.pdf
+**/reports/*.pdf
