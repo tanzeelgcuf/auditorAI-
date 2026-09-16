@@ -54,3 +54,8 @@ packages/shared-types/*.ts
 # Toolchain downloads — 2026-09-16: a 68MB go tarball landed in the repo tree (downloaded while shell cwd was a service dir) and was swept in by `git add -A`. Downloads never belong in the tree.
 *.tar.gz
 *.zip
+
+# Report-render output: HandleGenerateReport writes PDFs to a reports/ dir
+# relative to the process CWD — during go test that is the package dir
+# (observed 2026-09-16: two PDFs in internal/middleware/reports/).
+reports/*.pdf
