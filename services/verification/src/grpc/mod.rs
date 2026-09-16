@@ -16,7 +16,9 @@ pub mod verification_service {
 use verification_service::{
     verification_service_server::VerificationService,
     BatchReconciliationRequest as GrpcBatchReconciliationRequest,
-    BatchReconciliationResult as GrpcBatchReconciliationResult, GroupResult as GrpcGroupResult,
+    BatchReconciliationResult as GrpcBatchReconciliationResult,
+    GroupReconciliation as GrpcGroupReconciliation,
+    GroupResult as GrpcGroupResult,
     ReconciliationRequest as GrpcReconciliationRequest,
     ReconciliationResult as GrpcReconciliationResult,
 };
@@ -32,15 +34,21 @@ impl VerificationServiceImpl {
 
     fn evaluate_single_group(
         &self,
-        inv_total_cents: i64,
-        bank_total_cents: i64,
-        gl_total_cents: i64,
-        tolerance_cents: i32,
-        group_id: &str,
-        has_invoice: bool,
-        has_bank: bool,
-        has_gl: bool,
+        group: &GrpcGroupReconciliation,
     ) -> Result<GrpcGroupResult, Status> {
+        // The proto message IS the argument list. Nine spread parameters hit
+        // clippy::too_many_arguments (observed 2026-09-17, clippy 1.97; CI
+        // runs -D warnings), and passing the message instead of unpacking it
+        // at the call site keeps the data shape honest: batch_evaluate's loop
+        // body is now one line.
+        let inv_total_cents = group.invoice_total_cents;
+        let bank_total_cents = group.bank_total_cents;
+        let gl_total_cents = group.gl_total_cents;
+        let tolerance_cents = group.tolerance_cents;
+        let group_id = group.group_id.as_str();
+        let has_invoice = group.has_invoice;
+        let has_bank = group.has_bank;
+        let has_gl = group.has_gl;
         // Convert to Decimal for arithmetic. Absent legs (has_X = false) are
         // excluded from variance — comparing an absent leg as 0 would inflate
         // |0-bank| to the full bank amount and flag balanced 2-leg groups.
@@ -208,17 +216,8 @@ impl VerificationService for VerificationServiceImpl {
 
         let mut results: Vec<GrpcGroupResult> = Vec::with_capacity(req.groups.len());
 
-        for group in req.groups {
-            let result = self.evaluate_single_group(
-                group.invoice_total_cents,
-                group.bank_total_cents,
-                group.gl_total_cents,
-                group.tolerance_cents,
-                &group.group_id,
-                group.has_invoice,
-                group.has_bank,
-                group.has_gl,
-            )?;
+        for group in &req.groups {
+            let result = self.evaluate_single_group(group)?;
             results.push(result);
         }
 
