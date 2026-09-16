@@ -33,6 +33,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -322,7 +323,23 @@ func (e *securityEnv) do(t *testing.T, router http.Handler, method, path, token 
 	if body != "" {
 		rdr = bytes.NewBufferString(body)
 	}
-	req := httptest.NewRequest(method, path, rdr)
+	// httptest.NewRequest parses a space-containing target as a request LINE
+	// (method/URI/proto) and PANICS on hostile paths — the exact inputs the
+	// session-var-injection tests exist to deliver. Observed 2026-09-16 on
+	// this suite's first-ever run: TestSecurity_SessionVarInjectionRejected
+	// died in the helper before the router saw a single payload. Build on a
+	// dummy target, then swap in the real one: url.ParseRequestURI for
+	// well-formed paths (query strings included), a hand-built URL as the
+	// fallback so adversarial bytes still reach the router verbatim — the
+	// same way a real server's request-line parser hands over r.URL.Path
+	// and r.RequestURI no matter what bytes they hold.
+	req := httptest.NewRequest(method, "/", rdr)
+	if u, err := url.ParseRequestURI(path); err == nil {
+		req.URL = u
+	} else {
+		req.URL = &url.URL{Path: path}
+	}
+	req.RequestURI = path
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
