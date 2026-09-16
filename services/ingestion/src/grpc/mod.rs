@@ -87,14 +87,9 @@ impl IngestionServiceImpl {
         }
     }
 
-    fn backend_key(format: DetectedFormat) -> Option<&'static str> {
-        match format {
-            DetectedFormat::Csv => Some("csv"),
-            DetectedFormat::Xlsx => Some("xlsx"),
-            DetectedFormat::Ofx => Some("ofx"),
-            DetectedFormat::Ocr => None,
-        }
-    }
+    // backend_key was deleted 2026-09-17: zero call sites — process_document
+    // routes by constructing the per-request backend directly in its match
+    // arms, so this format->string map was a parallel taxonomy nothing read.
 
     fn convert_entity(e: &ExtractedEntity) -> GrpcExtractedEntity {
         GrpcExtractedEntity {

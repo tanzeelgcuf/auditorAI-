@@ -757,38 +757,10 @@ impl OcrBackend for OfxParser {
     }
 }
 
-// ── Helper to create structured entities ──
-
-pub fn create_structured_entity(
-    entity_type: &str,
-    amount_cents: i64,
-    currency: &str,
-    date: Option<NaiveDate>,
-    counterparty: Option<String>,
-    description: Option<String>,
-    gl_account_code: Option<String>,
-    page_number: i32,
-) -> ExtractedEntity {
-    ExtractedEntity {
-        entity_type: entity_type.to_string(),
-        amount_cents,
-        currency: currency.to_string(),
-        transaction_date: date,
-        counterparty,
-        description,
-        gl_account_code,
-        transaction_ref: None,
-        page_number,
-        bbox: BoundingBox {
-            x: 0.0,
-            y: 0.0,
-            width: 0.0,
-            height: 0.0,
-        },
-        confidence: 1.0,
-        source_format: "structured".to_string(),
-    }
-}
+// create_structured_entity was deleted 2026-09-17: a pub helper with zero
+// call sites in the whole crate (grep), predating the per-format parsers that
+// construct ExtractedEntity directly. Dead code is deleted, not annotated —
+// see CLAUDE.md's guard rules.
 
 #[cfg(test)]
 mod tests {

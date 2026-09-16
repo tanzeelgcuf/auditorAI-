@@ -3,6 +3,14 @@
 mod bbox;
 mod grpc;
 mod ocr;
+// Cargo.toml has always SAID the preprocessing stages are "compiled only
+// under the feature", but `mod preprocess;` was unconditional, so the no-op
+// placeholder pipeline compiled as dead code into every default build —
+// 8+ of the 21 warnings observed 2026-09-17. Gating the mod makes the
+// documented intent real: default builds contain no preprocessing code at
+// all. Remove the gate the day a real implementation is wired into the OCR
+// path.
+#[cfg(feature = "enhance")]
 mod preprocess;
 mod telemetry;
 use clap::Parser;
