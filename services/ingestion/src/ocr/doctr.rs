@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct DoctrRequest {
@@ -27,11 +26,14 @@ struct DoctrPage {
     blocks: Vec<DoctrBlock>,
 }
 
+// The sidecar's wire contract carries per-block geometry and confidence; this
+// consumer reads only the lines. Unread fields are DELETED from the DTOs
+// rather than kept as dead struct weight: serde ignores extra JSON keys, so
+// the response still parses, and the struct now states exactly what this
+// code consumes.
 #[derive(Debug, Deserialize)]
 struct DoctrBlock {
-    geometry: [[f32; 2]; 4],
     lines: Vec<DoctrLine>,
-    confidence: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,41 +43,30 @@ struct DoctrLine {
     confidence: f32,
 }
 
+// Same contract note: line_text joins the word VALUES; the sidecar's per-word
+// geometry/confidence are left unmodelled.
 #[derive(Debug, Deserialize)]
 struct DoctrWord {
     value: String,
-    confidence: f32,
-    geometry: [[f32; 2]; 4],
 }
 
 pub struct DoctrBackend {
     client: Client,
     base_url: String,
-    s3_client: Arc<aws_sdk_s3::Client>,
-    bucket: String,
 }
 
 impl DoctrBackend {
-    pub async fn new(sidecar_url: &str) -> Result<Self, OcrError> {
+    // Sync since 2026-09-17: the s3_client/bucket fields were deleted — never
+    // read, because the SIDECAR downloads from S3 itself keyed by
+    // storage_key; the backend only needs an HTTP client and its URL. With
+    // them went the only await in the constructor.
+    pub fn new(sidecar_url: &str) -> Result<Self, OcrError> {
         let client = Client::new();
-
-        let s3_client = Arc::new(crate::ocr::structured::build_s3_client().await);
-        let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
 
         Ok(Self {
             client,
             base_url: sidecar_url.trim_end_matches('/').to_string(),
-            s3_client,
-            bucket,
         })
-    }
-
-    fn generate_presigned_url(&self, key: &str) -> Result<String, OcrError> {
-        Ok(format!(
-            "{}/{}",
-            self.base_url.replace("ocr-sidecar:8000", "minio:9000"),
-            key
-        ))
     }
 
     fn normalize_bbox(
@@ -100,7 +91,10 @@ impl DoctrBackend {
         }
     }
 
-    fn classify_entity_type(&self, text: &str, doc_type: &str) -> String {
+    // The unused `text` parameter is gone (first real clippy run, 2026-09-17):
+    // classification never read it — the sidecar already filtered what
+    // reaches this call, and the type depends only on the document kind.
+    fn classify_entity_type(&self, doc_type: &str) -> String {
         match doc_type {
             "invoice" => "invoice_line_item",
             "bank_statement" => "bank_transaction",
@@ -398,7 +392,7 @@ impl OcrBackend for DoctrBackend {
                         let counterparty = DoctrBackend::attach_counterparty(&text, &block_lines);
 
                         entities.push(ExtractedEntity {
-                            entity_type: self.classify_entity_type(&text, &request.doc_type),
+                            entity_type: self.classify_entity_type(&request.doc_type),
                             amount_cents: amount,
                             currency: "USD".to_string(),
                             transaction_date: date,
@@ -417,10 +411,6 @@ impl OcrBackend for DoctrBackend {
         }
 
         Ok(ProcessDocumentResponse { entities })
-    }
-
-    fn name(&self) -> &'static str {
-        "docTR"
     }
 }
 

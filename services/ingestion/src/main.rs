@@ -1,6 +1,8 @@
 // services/ingestion/src/main.rs
 #![deny(clippy::unwrap_used)]
-mod bbox;
+// mod bbox was deleted 2026-09-17 along with src/bbox/: a parallel
+// BoundingBox implementation with zero references — the parsers use
+// ocr::BoundingBox — dead since the day it was written.
 mod grpc;
 mod ocr;
 // Cargo.toml has always SAID the preprocessing stages are "compiled only
@@ -54,9 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting ingestion service on {}", args.grpc_addr);
 
-    // Initialize OCR backend (docTR sidecar)
+    // Initialize OCR backend (docTR sidecar). new() is sync since 2026-09-17 —
+    // its only await went away with the dead S3 fields.
     let ocr_backend: Arc<dyn OcrBackend> =
-        Arc::new(crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url).await?);
+        Arc::new(crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url)?);
 
     // Initialize NATS connection (async-nats, the maintained successor client)
     let nc = async_nats::connect(&args.nats_url).await?;

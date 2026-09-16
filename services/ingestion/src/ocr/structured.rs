@@ -20,7 +20,10 @@ use std::sync::Arc;
 /// Build an S3 client that works against both MinIO (path-style, custom endpoint)
 /// and AWS. Reads AWS_ENDPOINT_URL / AWS_REGION / credentials from env.
 pub(crate) async fn build_s3_client() -> S3Client {
-    let config = aws_config::load_from_env().await;
+    // load_defaults + explicit behavior version: load_from_env is deprecated
+    // in aws-config and warned on the first real clippy run (2026-09-17).
+    // latest() matches load_from_env's documented semantics.
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let mut b = S3ConfigBuilder::from(&config);
     b.set_force_path_style(Some(true));
     b.set_region(Some(Region::new("us-east-1")));
@@ -447,9 +450,7 @@ impl OcrBackend for CsvParser {
         Ok(ProcessDocumentResponse { entities })
     }
 
-    fn name(&self) -> &'static str {
-        "csv"
-    }
+    // fn name() was deleted 2026-09-17 with the trait method: zero callers.
 }
 
 /// Collapse debit/credit pairs in a GL export to one entity per journal entry.
@@ -607,9 +608,7 @@ impl OcrBackend for XlsxParser {
         Ok(ProcessDocumentResponse { entities })
     }
 
-    fn name(&self) -> &'static str {
-        "xlsx"
-    }
+    // fn name() was deleted 2026-09-17 with the trait method: zero callers.
 }
 
 fn cell_string(cell: &DataType) -> String {
@@ -752,9 +751,7 @@ impl OcrBackend for OfxParser {
         Ok(ProcessDocumentResponse { entities })
     }
 
-    fn name(&self) -> &'static str {
-        "ofx"
-    }
+    // fn name() was deleted 2026-09-17 with the trait method: zero callers.
 }
 
 // create_structured_entity was deleted 2026-09-17: a pub helper with zero

@@ -32,6 +32,11 @@ impl VerificationServiceImpl {
         Self { rule_engine }
     }
 
+    // tonic::Status exceeds clippy's 128-byte result_large_err threshold, and
+    // it is the error type this whole file returns — the trait impls are
+    // exempt only because tonic fixes their signatures. Boxing it would change
+    // every caller for zero benefit; allowed with that reason stated.
+    #[allow(clippy::result_large_err)]
     fn evaluate_single_group(
         &self,
         group: &GrpcGroupReconciliation,

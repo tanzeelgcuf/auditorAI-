@@ -48,10 +48,10 @@ pub struct ProcessDocumentResponse {
 
 #[derive(Debug, Error)]
 pub enum OcrError {
-    #[error("document not found: {0}")]
-    NotFound(String),
-    #[error("unsupported format: {0}")]
-    UnsupportedFormat(String),
+    // NotFound and UnsupportedFormat were deleted 2026-09-17: never
+    // constructed anywhere in the crate — the sidecar path reports
+    // ProcessingFailed, and unknown extensions route to OCR by design.
+    // Variants nothing can produce are dead enum arms.
     #[error("OCR processing failed: {0}")]
     ProcessingFailed(String),
     #[error("S3 error: {0}")]
@@ -64,7 +64,8 @@ pub enum OcrError {
 
 #[async_trait]
 pub trait OcrBackend: Send + Sync {
-    fn name(&self) -> &'static str;
+    // The `name()` method was deleted 2026-09-17: zero callers crate-wide.
+    // An identifier with no consumer is a label nobody reads.
     async fn process(
         &self,
         request: &ProcessDocumentRequest,
@@ -109,11 +110,9 @@ impl FormatDetector {
         DetectedFormat::Ocr
     }
 
-    pub fn detect(path: &str, content: &[u8]) -> DetectedFormat {
-        let ext = Self::from_extension(path);
-        if ext != DetectedFormat::Ocr {
-            return ext;
-        }
-        Self::from_content(content)
-    }
+    // detect() was deleted 2026-09-17: zero callers — process_document calls
+    // from_extension/from_content separately precisely BECAUSE it must skip
+    // content-sniffing for definitive OCR media types (is_image_or_pdf); this
+    // convenience wrapper would have sniffed a stray comma in a PDF binary
+    // into CSV had anything ever called it.
 }

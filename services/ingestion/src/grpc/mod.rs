@@ -31,8 +31,6 @@ fn is_image_or_pdf(path: &str) -> bool {
 
 fn ocr_error_to_status(e: OcrError) -> Status {
     match e {
-        OcrError::NotFound(msg) => Status::not_found(msg),
-        OcrError::UnsupportedFormat(msg) => Status::invalid_argument(msg),
         OcrError::ProcessingFailed(msg) => Status::internal(msg),
         OcrError::S3Error(msg) => Status::internal(format!("storage error: {msg}")),
         OcrError::SidecarError(msg) => Status::unavailable(format!("sidecar unavailable: {msg}")),
@@ -42,7 +40,6 @@ fn ocr_error_to_status(e: OcrError) -> Status {
 
 pub struct IngestionServiceImpl {
     ocr_backend: Arc<dyn OcrBackend>,
-    structured_backends: std::collections::HashMap<String, Arc<dyn OcrBackend>>,
     js: JetStream,
     s3_client: Arc<aws_sdk_s3::Client>,
     bucket: String,
@@ -53,34 +50,12 @@ impl IngestionServiceImpl {
         let s3_client = Arc::new(crate::ocr::structured::build_s3_client().await);
         let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
 
-        let mut structured = std::collections::HashMap::new();
-        structured.insert(
-            "csv".to_string(),
-            Arc::new(crate::ocr::structured::CsvParser::new(
-                std::collections::HashMap::new(),
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-        structured.insert(
-            "xlsx".to_string(),
-            Arc::new(crate::ocr::structured::XlsxParser::new(
-                std::collections::HashMap::new(),
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-        structured.insert(
-            "ofx".to_string(),
-            Arc::new(crate::ocr::structured::OfxParser::new(
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-
+        // structured_backends was deleted 2026-09-17: never read —
+        // process_document constructs a PER-REQUEST parser so the book's
+        // column_map applies, so this prebuilt empty-map trio was dead weight
+        // built on every boot.
         Self {
             ocr_backend,
-            structured_backends: structured,
             js,
             s3_client,
             bucket,
@@ -289,12 +264,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_error_to_status_not_found() {
-        let e = OcrError::NotFound("doc missing".into());
-        let s = ocr_error_to_status(e);
-        assert_eq!(s.code(), tonic::Code::NotFound);
-    }
+    // test_error_to_status_not_found was deleted 2026-09-17 with the variant
+    // it pinned: OcrError::NotFound was never constructed anywhere, so the
+    // test asserted a mapping nothing could ever exercise.
 
     #[test]
     fn test_error_to_status_sidecar() {
