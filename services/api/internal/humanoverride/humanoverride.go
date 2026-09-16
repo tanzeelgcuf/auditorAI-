@@ -426,10 +426,12 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// source_ip is cast to text in SQL, matching the changed_by::text idiom on the
-	// line below rather than introducing a pgx inet codec question, and COALESCEd
-	// so the Scan target stays a plain string: rows written before 2026-09-05, and
-	// any row whose request never passed middleware.SourceIP, hold NULL.
+	// source_ip is read with host() — observed live 2026-09-16 (postgres:16),
+	// '203.0.113.9'::inet::text renders "203.0.113.9/32", so ::text would hand
+	// every client a CIDR-shaped address for what is a host address; host()
+	// extracts the bare address on inet and cidr alike. COALESCE keeps the Scan
+	// target a plain string: rows written before 2026-09-05, and any row whose
+	// request never passed middleware.SourceIP, hold NULL.
 	//
 	// Column order here is load-bearing. rows.Scan binds BY POSITION and the loop
 	// below `continue`s on a Scan error, so appending a column to the SELECT
@@ -438,7 +440,7 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 	// lists against each other.
 	rows, err := c.Query(r.Context(),
 		`SELECT field_name, COALESCE(old_value,''), COALESCE(new_value,''), changed_by::text, changed_at,
-		        COALESCE(source_ip::text,'')
+		        COALESCE(host(source_ip),'')
 		 FROM config_change_log WHERE client_book_id = $1 ORDER BY changed_at DESC LIMIT 100`, bookID)
 	if err != nil {
 		slog.Error("config history query failed", "error", err)

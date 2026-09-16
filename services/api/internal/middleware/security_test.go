@@ -423,8 +423,15 @@ func (e *securityEnv) doFrom(t *testing.T, router http.Handler, method, path, to
 func (e *securityEnv) lastSourceIP(t *testing.T, userID, action string) *string {
 	t.Helper()
 	var ip *string
+	// host(), not ::text. Observed live 2026-09-16 on this stack (postgres:16):
+	// '203.0.113.9'::inet::text renders "203.0.113.9/32" — mask included — so a
+	// ::text read of a correctly-stored bare address still fails an equality
+	// check against middleware.ClientIP's plain string, and the audit trail and
+	// the limiter appear to disagree when they do not. host() extracts the
+	// address with no mask on inet AND cidr, so this comparison holds on any
+	// server version instead of on one version's cast behavior.
 	if err := e.setupPool.QueryRow(context.Background(),
-		`SELECT source_ip::text FROM access_log
+		`SELECT host(source_ip) FROM access_log
 		  WHERE user_id = $1 AND action = $2 ORDER BY id DESC LIMIT 1`,
 		userID, action).Scan(&ip); err != nil {
 		t.Fatalf("failed to read access_log.source_ip for %s/%s: %v", userID, action, err)
@@ -443,7 +450,7 @@ type configChangeRow struct {
 func (e *securityEnv) configChanges(t *testing.T, bookID string) []configChangeRow {
 	t.Helper()
 	rows, err := e.setupPool.Query(context.Background(),
-		`SELECT field_name, old_value, new_value, source_ip::text
+		`SELECT field_name, old_value, new_value, host(source_ip)
 		   FROM config_change_log WHERE client_book_id = $1 ORDER BY id`, bookID)
 	if err != nil {
 		t.Fatalf("failed to read config_change_log: %v", err)

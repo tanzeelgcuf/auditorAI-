@@ -179,7 +179,10 @@ Session reports live at the workspace root next to the repo:
     background worker, a CLI, a unit test or an unparseable `RemoteAddr`, and
     that is stored as SQL NULL via `NULLIF($n,'')::inet` — mirroring the proven
     in-repo `NULLIF($n,'')::uuid` idiom, which also sidesteps any pgx `inet`
-    codec question; the read side is `COALESCE(source_ip::text,'')`. NOT NULL
+    codec question; the read side is `COALESCE(host(source_ip),'')` — NOT
+    `::text`, which on this stack (postgres:16, observed 2026-09-16) renders a
+    stored bare address as `203.0.113.9/32`; `host()` returns the address
+    alone on both inet and cidr. NOT NULL
     would mean discarding an entire audit row to protect one field, and a row
     that admits it does not know beats one asserting a bogus address.
 
@@ -680,7 +683,10 @@ The three audit tables (`access_log`, `config_change_log`, `period_reopen_log`)
 each carry `source_ip INET`, **nullable**, plus a partial index
 `idx_access_log_source_ip ON access_log(source_ip, occurred_at DESC) WHERE
 source_ip IS NOT NULL`. Written as `NULLIF($n,'')::inet`, read as
-`COALESCE(source_ip::text,'')`. Rule 13 has the reasoning; the short version is
+`COALESCE(host(source_ip),'')` — not `::text`, which on this stack (postgres:16,
+observed 2026-09-16) renders a stored bare address as `203.0.113.9/32`;
+`host()` returns the address alone on both inet and cidr. Rule 13 has the
+reasoning; the short version is
 that an audit row admitting it does not know where a request came from is worth
 more than one asserting a bogus address, and NOT NULL would have thrown away the
 whole row to protect that one field.
