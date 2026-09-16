@@ -215,13 +215,22 @@ func ReleaseRLSConn(reqCtx context.Context, conn *pgxpool.Conn) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), 5*time.Second)
 	defer cancel()
 
-	if _, err := conn.Exec(ctx, "RESET app.current_firm, app.assigned_books"); err != nil {
-		slog.Error("failed to reset RLS session vars — closing connection instead of pooling it",
-			"error", err)
-		// pgxpool.Conn.Release() destroys the underlying resource rather than
-		// returning it when the connection is already closed, so this is the
-		// supported way to take a suspect connection out of circulation.
-		_ = conn.Conn().Close(ctx)
+	// RESET takes ONE parameter per statement. "RESET a, b" is a syntax error
+	// (SQLSTATE 42601, at the comma) — observed live 2026-09-16 on the security
+	// suite's first-ever run: every released connection failed the reset and was
+	// destroyed instead of pooled, so the app ran connection-per-request and
+	// every pool release logged an error. The failure was fail-closed (the GUCs
+	// never leaked into a reused connection) but made pooling a no-op.
+	for _, guc := range []string{"app.current_firm", "app.assigned_books"} {
+		if _, err := conn.Exec(ctx, "RESET "+guc); err != nil {
+			slog.Error("failed to reset RLS session var — closing connection instead of pooling it",
+				"guc", guc, "error", err)
+			// pgxpool.Conn.Release() destroys the underlying resource rather than
+			// returning it when the connection is already closed, so this is the
+			// supported way to take a suspect connection out of circulation.
+			_ = conn.Conn().Close(ctx)
+			break
+		}
 	}
 	conn.Release()
 }
