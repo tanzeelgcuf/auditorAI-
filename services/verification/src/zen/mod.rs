@@ -596,8 +596,12 @@ impl RuleEngine {
         )))
     }
 
-    /// Number of compiled bands. Lets a test assert the table was actually
-    /// compiled, rather than only that loading returned Ok.
+    /// Number of compiled bands. Asserted by tests so "loaded" means
+    /// "compiled into bands" and not merely Ok, and logged at startup by
+    /// main.rs so an operator sees the count without decoding describe().
+    /// (2026-09-17: wiring it into the boot log also ended the bin-target
+    /// dead_code warning — per this module's header, by wiring, not by
+    /// silencing.)
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
