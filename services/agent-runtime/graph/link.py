@@ -575,6 +575,17 @@ def score_and_route(
         # into a reclassification of candidates this change has no evidence about.
         group.sign_conflict = is_exact and not sign_ok
         if group.sign_conflict:
+            # DECISION 2026-09-17 — Deliberately NOT promoted to a Rust finding.
+            # This detection is new, unproven against real books, and has no
+            # measured incidence rate; services/verification is the tier this
+            # product markets as authoritative and provably correct, and
+            # putting a week-old, unvalidated heuristic there would risk the
+            # core trust claim for a completeness gain that isn't needed —
+            # every sign-conflict is already caught HERE and routed to review
+            # either way. Re-evaluate for v1.1 once the second-book run and
+            # any pilot data give real signal on the false-positive rate.
+            # Tracked in KNOWN_GAPS.md; codified as CLAUDE.md rule 18.
+            #
             # The reason reaches the LOG and nothing else. reconciliation_groups
             # has no column for it (infra/init.sql:220-241 — confidence, status,
             # group_scope, no downgrade reason) and the only INSERT path from this

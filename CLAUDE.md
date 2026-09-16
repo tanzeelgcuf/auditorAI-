@@ -355,6 +355,21 @@ Session reports live at the workspace root next to the repo:
     the app rendered with no fill. Swept: the only `<alpha-value>` outside
     `tailwind.config.ts`.
 
+18. **Sign-conflict detection stays in the Python tier — deliberately, by
+    decision, not by omission.** The detector in `link.py` flags a group whose
+    magnitudes reconcile but whose sign pattern contradicts the book's
+    convention and downgrades it to needs_review. It is NOT a Rust finding
+    and nothing under `services/verification` evaluates it. Decided
+    2026-09-17: the detection is new, unproven against real books, and has no
+    measured incidence rate, while the verification tier is the thing this
+    product markets as authoritative and provably correct — an unvalidated
+    heuristic there would risk the core trust claim for a completeness gain
+    that isn't needed, since every sign-conflict is already caught in Python
+    and routed to review either way. Re-evaluate for v1.1 once a second book
+    and pilot data give a real false-positive rate. Tracked in
+    `KNOWN_GAPS.md`; the set-site comment in `link.py` carries the same
+    statement.
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
