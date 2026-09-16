@@ -948,7 +948,7 @@ mod tests {
         let mapped = map_columns(&data, &col_map);
         assert_eq!(mapped.get("date").unwrap(), "2024-01-15");
         assert_eq!(mapped.get("amount").unwrap(), "150.00");
-        assert!(mapped.get("description").is_none());
+        assert!(!mapped.contains_key("description"));
     }
 
     // Real Riverside GL headers (Debit/Credit) require the per-book

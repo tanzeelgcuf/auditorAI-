@@ -346,7 +346,7 @@ impl OcrBackend for DoctrBackend {
         // The sidecar downloads the object itself via storage_key (S3-compatible).
         let resp = self
             .client
-            .post(&format!("{}/ocr/process", self.base_url))
+            .post(format!("{}/ocr/process", self.base_url))
             .json(&DoctrRequest {
                 storage_key: request.storage_key.clone(),
                 doc_type: request.doc_type.clone(),

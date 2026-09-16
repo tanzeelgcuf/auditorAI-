@@ -7,6 +7,11 @@ use crate::ocr::{
     DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError, ProcessDocumentRequest,
 };
 
+// The generated proto code contains unwrap()s (prost/tonic emit them for
+// well-known-type handling); main.rs's #![deny(clippy::unwrap_used)] reaches
+// into includes, so the deny is lifted for exactly this block — the same
+// precedent as services/verification/src/grpc/mod.rs:11.
+#[allow(clippy::unwrap_used)]
 pub mod ingestion_service {
     tonic::include_proto!("ingestion");
 }
