@@ -143,10 +143,14 @@ func main() {
 		os.Exit(1)
 	}
 	demoUserID := uuid.MustParse("00000000-0000-0000-0000-00000000d3b0")
+	// email_verified = true, and re-seeds UPDATE it too: HandleLogin refuses
+	// unverified accounts with 403 (a real gate — observed live 2026-09-18,
+	// the first login attempt failed on exactly this), and the demo account
+	// is a verified account by construction.
 	_, err = pool.Exec(ctx, `
-		INSERT INTO users (id, firm_id, email, password_hash, role)
-		VALUES ($1, $2, 'demo@ai-auditor.dev', $3, 'firm_admin')
-		ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
+		INSERT INTO users (id, firm_id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'demo@ai-auditor.dev', $3, 'firm_admin', true)
+		ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, email_verified = true`,
 		demoUserID, firmID, hash)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seed-demo: demo user: %v\n", err)
