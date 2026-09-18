@@ -145,6 +145,14 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		}
 		msg, err := cons.Next()
 		if err != nil {
+			// Same class as verify_worker.go's loop, fixed the same way: an
+			// empty-stream fetch timeout is the normal steady state and must
+			// not warn every cycle (observed live 2026-09-18: the WARN wall
+			// was indistinguishable from a failure and got the server killed).
+			// Only a non-timeout error is abnormal.
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, jetstream.ErrNoMessages) {
+				continue
+			}
 			slog.Warn("coordinator consumer error", "error", err)
 			time.Sleep(1 * time.Second)
 			continue
