@@ -211,8 +211,21 @@ async def run_consumer():
     # The EXTRACTION/LINK streams are owned/created by services/api. Creating a
     # competing stream would fail with "subjects overlap"; bind consumers to the
     # existing streams instead (each is a WorkQueue with its single consumer).
-    ext_sub = await js.subscribe("entity.extraction.requested")
-    link_sub = await js.subscribe("link.requested")
+    # AckWait MUST cover the slowest handler. The LLM round trip took 66s
+    # (observed live 2026-09-19: glm-5.3-flash over NIM, one 10-entity batch);
+    # the default 30s expired mid-call and the event was REDELIVERED while the
+    # first attempt was still running — a duplicate LLM call burned quota on
+    # the same batch. 120s covers the 90s adapter timeout plus margin, and
+    # max_deliver makes the SERVER enforce the same bound _retry_or_drop
+    # applies. Same config on both subscriptions: the link pass is subject to
+    # the same latency. This mirrors the Go consumers' AckWait 2min sizing
+    # (services/api/internal/pipeline/coordinator.go) — same reason, both
+    # halves.
+    from nats.js.api import ConsumerConfig
+
+    sub_config = ConsumerConfig(ack_wait=120, max_deliver=MAX_DELIVERY_ATTEMPTS)
+    ext_sub = await js.subscribe("entity.extraction.requested", config=sub_config)
+    link_sub = await js.subscribe("link.requested", config=sub_config)
     logger.info("nats consumer ready", url=NATS_URL)
 
     from ollama_adapter import make_llm_client
