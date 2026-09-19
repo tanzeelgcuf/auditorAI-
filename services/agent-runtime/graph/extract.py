@@ -82,6 +82,20 @@ CRITICAL RULES:
 
 Return ONLY a JSON array of objects, no prose.
 
+EXAMPLES of what each type looks like in real exports:
+- invoice_line_item: rows from an INVOICE (client billing): descriptions
+  like "Consulting services Jan"; counterparties are customers.
+- bank_transaction: rows from a BANK export (OFX STMTTRN blocks, "ACH
+  DEBIT" memos): the bank's own record of money moving. A bank's record
+  of its own transactions is bank_transaction even when the rows name
+  customers.
+- gl_entry: rows from a GENERAL LEDGER export, INCLUDING double-entry
+  exports with Debit AND Credit columns (one row per side, account codes
+  like "4000-Consulting Income").
+
+Classify by what the ROW is, not by which document type you guess the
+file is.
+
 OCR/Data:
 {context}
 """
@@ -203,10 +217,6 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
                           f"would fail the extracted_entity_id foreign key")
             continue
         rows[i] = e
-        # The model sees text only. Amounts are deliberately NOT rendered into
-        # the context: it has no reason to read them and no way to return them.
-        text = _row_str(e, "description") or _row_str(e, "text") or ""
-        context_lines.append(f"[{i}] {text}")
 
     if errors:
         logger.error("rejected source rows", count=len(errors))
@@ -215,11 +225,36 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
         state["classified_entities"] = []
         return state
 
+    # OFX/QFX entities are bank_transaction BY CONSTRUCTION — the STMTTRN
+    # format is a bank statement by definition, so the parser's typing is
+    # content-derived and authoritative. The LLM must not re-type it:
+    # observed live 2026-09-19, the model re-typed correctly-parsed bank
+    # rows as invoices and the 3-way trio never assembled. A content-derived
+    # type is not a guess for the model to confirm.
+    bank_rows: Dict[int, Dict[str, Any]] = {
+        i: e for i, e in rows.items()
+        if e.get("entity_type") == "bank_transaction"
+        and (e.get("source_format") or "") == "structured"
+    }
+    llm_rows: Dict[int, Dict[str, Any]] = {
+        i: e for i, e in rows.items() if i not in bank_rows
+    }
+
+    # The model sees text only. Amounts are deliberately NOT rendered into
+    # the context: it has no reason to read them and no way to return them.
+    context_lines = []
+    for i, e in llm_rows.items():
+        text = _row_str(e, "description") or _row_str(e, "text") or ""
+        context_lines.append(f"[{i}] {text}")
+
     context = "\n".join(context_lines)
 
     try:
+        # No model kwarg here: the adapter (or a real Anthropic client) owns
+        # the model name — a hardcoded literal here was ignored by the
+        # adapter and would have silently pinned a wrong model for a real
+        # Anthropic client.
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
             max_tokens=4000,
             temperature=0,
             system=EXTRACTION_SYSTEM,
@@ -230,6 +265,26 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
 
         entities: List[ExtractedEntity] = []
         seen: set = set()
+        # Content-derived bank entities pass through with the parser's type —
+        # no model round trip, nothing for the model to get wrong.
+        for i, e in bank_rows.items():
+            entities.append(ExtractedEntity(
+                id=UUID(str(e["id"])),
+                client_book_id=UUID(str(e.get("client_book_id") or state.get("client_book_id"))),
+                source_document_id=UUID(str(e["source_document_id"])),
+                entity_type=e.get("entity_type") or "bank_transaction",
+                entity_subtype=e.get("entity_subtype") or "standard",
+                amount_cents=_row_cents(e),
+                currency=e.get("currency") or "USD",
+                transaction_date=_parse_date(e.get("transaction_date")),
+                counterparty=_row_str(e, "counterparty"),
+                description=_row_str(e, "description"),
+                gl_account_code=_row_str(e, "gl_account_code"),
+                page_number=int(e.get("page_number") or 1),
+                bbox=e.get("bbox") or {},
+                extraction_confidence=float(e.get("extraction_confidence") or 1.0),
+                source_format=e.get("source_format") or "structured",
+            ))
         for item in parsed:
             if not isinstance(item, dict):
                 continue
@@ -241,7 +296,10 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
                     f"classification dropped: source_index missing/not an int ({item.get('source_index')!r})"
                 ]
                 continue
-            row = rows.get(idx)
+            # Scoped to llm_rows, not rows: the model was only SHOWN llm_rows'
+            # indexes, so an index pointing at a content-derived bank row is a
+            # hallucination and must be rejected, never resolved and re-typed.
+            row = llm_rows.get(idx)
             if row is None:
                 state["errors"] = state.get("errors", []) + [
                     f"classification dropped: source_index {idx} was never shown to the model"
@@ -257,7 +315,12 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
                 id=UUID(str(row["id"])),
                 client_book_id=UUID(str(row.get("client_book_id") or state.get("client_book_id"))),
                 source_document_id=UUID(str(row["source_document_id"])),
-                entity_type=item.get("entity_type", "invoice_line_item"),
+                # A row the model did not type KEEPS the parser's type — the
+                # parser's classification is evidence; defaulting to
+                # invoice_line_item FABRICATES a type for rows the model went
+                # silent on (observed 2026-09-19: the GL rows' unclassified
+                # batch would have come back as ten invoices).
+                entity_type=item.get("entity_type") or row.get("entity_type") or "invoice_line_item",
                 # The model may emit entity_subtype: null — coerce to the default
                 # so the pydantic schema (which rejects None for str) accepts it.
                 entity_subtype=item.get("entity_subtype") or "standard",
@@ -273,7 +336,7 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
                 source_format=row.get("source_format") or "ocr",
             ))
 
-        unclassified = sorted(set(rows) - seen)
+        unclassified = sorted(set(llm_rows) - seen)
         if unclassified:
             state["errors"] = state.get("errors", []) + [
                 f"rows {unclassified} were shown to the model but never classified"
