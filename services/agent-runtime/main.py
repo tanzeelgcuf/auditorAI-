@@ -56,7 +56,15 @@ async def process_batch(client, graph, mcp, batch_event: dict):
         "entities": pending,
     }
 
-    result = await graph.arun(state)
+    # ainvoke, not arun: the COMPILED LangGraph graph exposes ainvoke/invoke;
+    # arun exists only on the _SequentialPipeline fallback (graph_def.py).
+    # Wherever langgraph is importable — i.e., every real deployment — arun
+    # raised AttributeError and every batch failed permanently (observed live
+    # 2026-09-19, the first real pipeline run: 5 retries, then the event died).
+    # The 88 passing tests never saw this because they exercised the fallback,
+    # not the compiled graph — the exact "green suite that never ran the real
+    # path" pattern.
+    result = await graph.ainvoke(state)
     groups = result.get("groups", [])
     logger.info(
         "batch complete",
