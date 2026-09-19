@@ -35,7 +35,13 @@ import (
 func InternalAuth(db, sysDB *pgxpool.Pool) func(http.Handler) http.Handler {
 	expected := os.Getenv("API_INTERNAL_KEY")
 	if expected == "" {
-		slog.Warn("API_INTERNAL_KEY not set — internal MCP auth disabled")
+		// The text must match the code's behavior: UNSET is fail-CLOSED (every
+		// request is rejected below, per TestInternalAuthDisabledWhenNoKey
+		// Configured), not "disabled". The old text said "disabled" — a log
+		// line asserting the opposite of the code, observed live 2026-09-19:
+		// the agent-runtime's MCP calls 401ed on every attempt while boot
+		// claimed auth was off.
+		slog.Warn("API_INTERNAL_KEY not set — internal MCP auth FAILS CLOSED: all /mcp/tools/* requests are rejected")
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
