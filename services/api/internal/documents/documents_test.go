@@ -30,7 +30,13 @@ import (
 
 func fixture(t *testing.T, name string) []byte {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "ingestion", "test_fixtures", name))
+	// THREE levels up: Go tests run with the CWD set to the package directory
+	// (services/api/internal/documents), so ../.. is services/api and
+	// ../../ingestion resolves to services/api/ingestion — which does not
+	// exist. The first version of this test had exactly that bug and failed on
+	// the user's Mac with "fixture unreadable" while the other three tests
+	// passed.
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "ingestion", "test_fixtures", name))
 	if err != nil {
 		t.Fatalf("%s: fixture unreadable: %v", name, err)
 	}
