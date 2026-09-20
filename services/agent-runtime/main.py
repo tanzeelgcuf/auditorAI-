@@ -235,7 +235,7 @@ async def run_consumer():
     from mcp_client import MCPClient
     mcp = MCPClient(API_MCP_URL)
 
-    async def consume(sub, handler):
+    async def consume(sub, handler, publish_link_after=False):
         try:
             async for msg in sub.messages:
                 try:
@@ -269,11 +269,28 @@ async def run_consumer():
                     await _retry_or_drop(msg, attempt)
                 else:
                     await msg.ack()
+                    # A book-wide link pass must run AFTER each extraction batch.
+                    # The Go coordinator publishes link.requested only after
+                    # entity persistence — seconds after upload, BEFORE any LLM
+                    # classification completes (observed live 2026-09-19/20: the
+                    # LLM takes 40-70s per batch, so every book-wide pass ran on
+                    # unclassified types and the correctly-typed trio sat in the
+                    # database with nothing to link it). This batch just updated
+                    # the types; the pass that assembles the trio must follow it.
+                    # The book-wide pass is deterministic (no LLM) and runs on
+                    # unmatched entities, so re-running it is cheap. Only on
+                    # EXTRACTION events — link.requested -> process_link -> ack
+                    # -> publish again would be an infinite loop.
+                    if publish_link_after and event.get("client_book_id"):
+                        await js.publish(
+                            "link.requested",
+                            json.dumps({"client_book_id": event["client_book_id"]}).encode(),
+                        )
         finally:
             await nc.drain()
 
     await asyncio.gather(
-        consume(ext_sub, process_batch),
+        consume(ext_sub, process_batch, publish_link_after=True),
         consume(link_sub, process_link),
     )
 
