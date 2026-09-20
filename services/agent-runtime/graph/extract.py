@@ -236,8 +236,21 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
         if e.get("entity_type") == "bank_transaction"
         and (e.get("source_format") or "") == "structured"
     }
+    # gl_account_code is the same class of content-derived signal: an account
+    # code exists ONLY in a general-ledger export, so a structured entity
+    # carrying one is a gl_entry by construction. Observed 2026-09-19: the GL
+    # fixture's rows carry the SAME descriptions as the invoice fixture (the
+    # GL is the ledger OF those invoices), so no content-only classifier can
+    # tell them apart — the model typed them all as invoices and the GL leg
+    # never existed. The account code is the evidence the model does not have.
+    gl_rows: Dict[int, Dict[str, Any]] = {
+        i: e for i, e in rows.items()
+        if i not in bank_rows
+        and _row_str(e, "gl_account_code")
+    }
     llm_rows: Dict[int, Dict[str, Any]] = {
-        i: e for i, e in rows.items() if i not in bank_rows
+        i: e for i, e in rows.items()
+        if i not in bank_rows and i not in gl_rows
     }
 
     # The model sees text only. Amounts are deliberately NOT rendered into
@@ -265,14 +278,16 @@ def extract_entities(state: GraphState, client: Any) -> GraphState:
 
         entities: List[ExtractedEntity] = []
         seen: set = set()
-        # Content-derived bank entities pass through with the parser's type —
-        # no model round trip, nothing for the model to get wrong.
-        for i, e in bank_rows.items():
+        # Content-derived entities (bank from OFX, GL from the account code)
+        # pass through with the parser's type — no model round trip, nothing
+        # for the model to get wrong.
+        for i, e in list(bank_rows.items()) + list(gl_rows.items()):
+            fallback = "bank_transaction" if i in bank_rows else "gl_entry"
             entities.append(ExtractedEntity(
                 id=UUID(str(e["id"])),
                 client_book_id=UUID(str(e.get("client_book_id") or state.get("client_book_id"))),
                 source_document_id=UUID(str(e["source_document_id"])),
-                entity_type=e.get("entity_type") or "bank_transaction",
+                entity_type=e.get("entity_type") or fallback,
                 entity_subtype=e.get("entity_subtype") or "standard",
                 amount_cents=_row_cents(e),
                 currency=e.get("currency") or "USD",
