@@ -1,6 +1,7 @@
 package documents
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -36,6 +37,58 @@ var allowedDocTypes = map[string]string{
 	".xlsx": "gl_export",
 	".ofx":  "bank_statement",
 	".qfx":  "bank_statement",
+}
+
+// refineDocTypeFromHeader classifies a CSV's header row into a doc type and
+// returns "" when the header carries no signal, in which case the caller
+// keeps the extension default. The signals are the ones the repo's own
+// fixtures carry: an account column is the GL signal (both shipped GL
+// headers have it — QuickBooks "Account", Xero "Account Code"), and
+// counterparty/customer/invoice is the invoice signal (the shipped invoice
+// header is "date,amount,description,counterparty,currency" — no account
+// column). The header extraction mirrors fetchColumnMap's idiom
+// (internal/pipeline/coordinator.go) so the two read a header the same way.
+// Guarded against the fixture files themselves in documents_test.go — a
+// re-headed fixture that changes the answer goes red instead of this rule
+// quietly rotting.
+//
+// NOT decided here, named so it is not mistaken for covered: a bank export
+// delivered as CSV (banks arrive as .ofx/.qfx, so this is outside the
+// supported set today) with an "Account Number" column would refine to
+// gl_export — wrong, but the same answer the extension gives today. A bank
+// signal (balance-style columns) would be a guess about exports this repo
+// has no fixture for, so it is not encoded.
+func refineDocTypeFromHeader(data []byte) string {
+	var header []string
+	if i := bytes.IndexByte(data, '\n'); i > 0 {
+		first := string(data[:i])
+		header = strings.Split(first, ",")
+		for j := range header {
+			header[j] = strings.TrimSpace(strings.Trim(header[j], `"'`))
+		}
+	}
+	if len(header) == 0 {
+		return ""
+	}
+	hasAccount := false
+	hasInvoiceSignal := false
+	for _, h := range header {
+		lower := strings.ToLower(h)
+		if strings.Contains(lower, "account") {
+			hasAccount = true
+		}
+		if strings.Contains(lower, "counterparty") || strings.Contains(lower, "customer") ||
+			strings.Contains(lower, "invoice") {
+			hasInvoiceSignal = true
+		}
+	}
+	switch {
+	case hasAccount:
+		return "gl_export"
+	case hasInvoiceSignal:
+		return "invoice"
+	}
+	return ""
 }
 
 type Service struct {
@@ -122,6 +175,31 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "read failed")
 		return
+	}
+
+	// The extension is a DEFAULT for the structured formats, and for .csv it
+	// is wrong as often as it is right: an invoice delivered as CSV is
+	// recorded gl_export, ingested as GL, and its rows land as gl_entry —
+	// invoice_line_item is 0 for any book whose invoices arrive this way and
+	// the 3-way reconciliation never assembles, with ocr_status='done'
+	// everywhere and no error anywhere. OBSERVED live 2026-09-20:
+	// sample_invoice.csv uploaded twice to the demo book, recorded gl_export
+	// both times; the book's extracted_entities held 50 gl_entry and 20
+	// bank_transaction and 0 invoice_line_item; every link pass refused to
+	// assemble. Refine from the header row — the bytes are in hand HERE,
+	// before the row is written, so the recorded doc_type is correct from
+	// birth rather than corrected after the fact. Mirrors the .pdf line's
+	// documented intent ("refined at extraction by content") and the
+	// ingestion's own FormatDetector (extension first, content to refine).
+	// .xlsx keeps the extension default: a real workbook is a zip binary the
+	// header extraction cannot read (the shipped sample_gl.xlsx fixture is
+	// ASCII text, so it rides the CSV path via the FormatDetector's content
+	// sniff — a real invoice .xlsx is a named gap). OFX/QFX are definitive
+	// bank_statement.
+	if ext == ".csv" {
+		if refined := refineDocTypeFromHeader(data); refined != "" {
+			docType = refined
+		}
 	}
 
 	// Malware scan (ClamAV) before the file enters the pipeline.

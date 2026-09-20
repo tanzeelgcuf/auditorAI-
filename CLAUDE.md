@@ -398,6 +398,37 @@ Session reports live at the workspace root next to the repo:
     because `requirements.txt` bounds `nats-py>=2.7.0` and the auto-set
     behavior is proven only for the installed version.
 
+20. **An extension does not determine the document type for the formats it
+    does not uniquely map, and the refinement belongs where the bytes are in
+    hand.** `allowedDocTypes` mapped every `.csv` and `.xlsx` to
+    `gl_export`, so an invoice delivered as CSV — the common case for
+    e-mailed AR exports — was recorded `gl_export`, ingested as GL, and its
+    rows landed as `gl_entry` with CORRECT amounts (a matching column
+    mapping existed): `invoice_line_item` was 0 for any book whose invoices
+    arrive this way, every link pass refused to assemble, and
+    `reconciliation_groups` stayed empty with `ocr_status='done'` everywhere
+    and no error anywhere. OBSERVED live 2026-09-20: `sample_invoice.csv`
+    uploaded twice to the demo book, recorded `gl_export` both times; the
+    book's `extracted_entities` held 50 `gl_entry` and 20
+    `bank_transaction` and 0 `invoice_line_item`. The entity type is
+    assigned at ingestion by `classify_entity_type(&request.doc_type)`
+    (`structured.rs:329`) — from the event, never from content — so a wrong
+    doc_type rides the whole pipeline. Fixed in `HandleUpload`
+    (`documents.go`): for `.csv`, refine from the header row before the
+    source_documents row is written, so the recorded doc_type is correct
+    from birth — mirroring the `.pdf` line's own documented intent
+    ("refined at extraction by content") and the ingestion's FormatDetector
+    (extension first, content to refine). The signals are the ones the
+    repo's own fixtures carry (an account column → GL; counterparty/customer/
+    invoice → invoice), guarded against the fixture FILES themselves in
+    `documents_test.go`. Same class, NOT fixed, named so it is not mistaken
+    for covered: `HandlePresignUpload` records a caller-specified doc_type
+    that reaches ingestion unrefined — at confirm the bytes are streamed
+    only for hashing, so sniffing there means reading the first chunk of a
+    storage object and correcting the row afterwards; also `.xlsx` keeps the
+    extension default (a real workbook is a zip binary the header extraction
+    cannot read).
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at
