@@ -370,6 +370,31 @@ Session reports live at the workspace root next to the repo:
     `KNOWN_GAPS.md`; the set-site comment in `link.py` carries the same
     statement.
 
+19. **A JetStream consumer's filter_subject is REQUIRED, not cosmetic.** With
+    no filter, a consumer takes every subject on the stream it binds to — and
+    the stream it binds to is whatever the server's subject lookup finds,
+    which on a stale deployment can carry more subjects than the current code
+    declares (`CreateStream` does not rewrite an existing stream's config;
+    see the migration note in `pipeline.go`). OBSERVED live 2026-09-20, the
+    first full pipeline run: agent-runtime's two
+    `ConsumerConfig(ack_wait=120, max_deliver=5)` configs carried no
+    filter_subject, and the `link.requested` event the consumer publishes
+    itself after each extraction batch (`publish_link_after`,
+    `{"client_book_id": ...}` — no batch_id) was delivered to the EXTRACTION
+    consumer — logged as "batch event missing required fields" and acked,
+    one spurious error per batch completion, and the same event handled twice
+    (process_link ran it as intended). The Go coordinator's consumer made the
+    same mistake and destroyed `document.uploaded` events meant for nobody's
+    benefit — on a WorkQueue stream, acking is deleting — see
+    `coordinator.go:99-106`. Fixed in both Python consumers: filter_subject
+    pinned to the subscribed subject, one ConsumerConfig per subscription (a
+    shared instance lets one subscribe's filter leak into the other if the
+    library mutates the config it is handed — unverified, no nats-py in the
+    environment that wrote this, and sharing costs nothing to avoid). Pinned
+    by `services/agent-runtime/tests/test_consumer_filter.py`. The Go
+    consumers set `FilterSubject` (`coordinator.go:106`,
+    `verify_worker.go:84`).
+
 ## Group disposition
 
 Until 2026-09-04 the Rust verdict was computed, recorded, and then thrown away at

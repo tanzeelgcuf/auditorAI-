@@ -217,15 +217,40 @@ async def run_consumer():
     # first attempt was still running — a duplicate LLM call burned quota on
     # the same batch. 120s covers the 90s adapter timeout plus margin, and
     # max_deliver makes the SERVER enforce the same bound _retry_or_drop
-    # applies. Same config on both subscriptions: the link pass is subject to
-    # the same latency. This mirrors the Go consumers' AckWait 2min sizing
+    # applies. Both subscriptions get the same latency profile and the same
+    # AckWait. This mirrors the Go consumers' AckWait 2min sizing
     # (services/api/internal/pipeline/coordinator.go) — same reason, both
     # halves.
+    #
+    # FilterSubject is REQUIRED, not cosmetic — the same lesson the Go
+    # coordinator's consumer learned (coordinator.go:99-106). OBSERVED live
+    # 2026-09-20, the first full pipeline run: the link.requested event THIS
+    # consumer publishes after each extraction batch (publish_link_after —
+    # {"client_book_id": ...}, no batch_id) was delivered to the EXTRACTION
+    # consumer, which logged "batch event missing required fields" against it
+    # and acked it — one spurious error per batch completion, and the same
+    # event handled twice (process_link also ran it as intended). With no
+    # filter, a JetStream consumer takes every subject on the stream it binds
+    # to, and that stream is not guaranteed to carry only the subscribed
+    # subject: a stale stream left by the pre-split agent-runtime can still
+    # exist (commit 36c8bc99 created ENTITY_EXTRACTION via js.add_stream; the
+    # current code no longer does, and CreateStream does not rewrite an
+    # existing stream's config — see the migration note in pipeline.go). One
+    # config per subscription, not a shared instance, so the two filters
+    # cannot share state if nats-py mutates the config it is handed —
+    # unverified here (no nats-py in this environment), and sharing costs
+    # nothing to avoid. Pinned by tests/test_consumer_filter.py.
     from nats.js.api import ConsumerConfig
 
-    sub_config = ConsumerConfig(ack_wait=120, max_deliver=MAX_DELIVERY_ATTEMPTS)
-    ext_sub = await js.subscribe("entity.extraction.requested", config=sub_config)
-    link_sub = await js.subscribe("link.requested", config=sub_config)
+    def _consumer_config(filter_subject: str) -> ConsumerConfig:
+        return ConsumerConfig(
+            ack_wait=120,
+            max_deliver=MAX_DELIVERY_ATTEMPTS,
+            filter_subject=filter_subject,
+        )
+
+    ext_sub = await js.subscribe("entity.extraction.requested", config=_consumer_config("entity.extraction.requested"))
+    link_sub = await js.subscribe("link.requested", config=_consumer_config("link.requested"))
     logger.info("nats consumer ready", url=NATS_URL)
 
     from ollama_adapter import make_llm_client
