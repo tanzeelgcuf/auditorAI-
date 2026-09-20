@@ -370,30 +370,33 @@ Session reports live at the workspace root next to the repo:
     `KNOWN_GAPS.md`; the set-site comment in `link.py` carries the same
     statement.
 
-19. **A JetStream consumer's filter_subject is REQUIRED, not cosmetic.** With
-    no filter, a consumer takes every subject on the stream it binds to — and
-    the stream it binds to is whatever the server's subject lookup finds,
-    which on a stale deployment can carry more subjects than the current code
-    declares (`CreateStream` does not rewrite an existing stream's config;
-    see the migration note in `pipeline.go`). OBSERVED live 2026-09-20, the
-    first full pipeline run: agent-runtime's two
-    `ConsumerConfig(ack_wait=120, max_deliver=5)` configs carried no
-    filter_subject, and the `link.requested` event the consumer publishes
-    itself after each extraction batch (`publish_link_after`,
-    `{"client_book_id": ...}` — no batch_id) was delivered to the EXTRACTION
-    consumer — logged as "batch event missing required fields" and acked,
-    one spurious error per batch completion, and the same event handled twice
-    (process_link ran it as intended). The Go coordinator's consumer made the
-    same mistake and destroyed `document.uploaded` events meant for nobody's
-    benefit — on a WorkQueue stream, acking is deleting — see
-    `coordinator.go:99-106`. Fixed in both Python consumers: filter_subject
-    pinned to the subscribed subject, one ConsumerConfig per subscription (a
-    shared instance lets one subscribe's filter leak into the other if the
-    library mutates the config it is handed — unverified, no nats-py in the
-    environment that wrote this, and sharing costs nothing to avoid). Pinned
-    by `services/agent-runtime/tests/test_consumer_filter.py`. The Go
-    consumers set `FilterSubject` (`coordinator.go:106`,
-    `verify_worker.go:84`).
+19. **A JetStream consumer's filter_subject is either load-bearing or pinned
+    explicitly — know which, and never let a misread log line manufacture the
+    bug.** The Go coordinator's consumer NEEDS its `FilterSubject`
+    (`coordinator.go:99-106`): without it the consumer took every subject on
+    the DOCUMENTS stream and acked — deleted — events meant for nobody's
+    benefit. The Python consumers' filter_subject is an explicit PIN, not a
+    fix: nats-py's `subscribe()` sets filter_subject from the subject when
+    the config omits it, verified live 2026-09-20 (a consumer created with a
+    config that omitted it was stored by the server as
+    `filter='entity.extraction.requested'`, and a `link.requested` marker
+    published afterwards was NOT received by it). An earlier reading of the
+    same day's logs claimed the opposite — that the missing filter caused
+    `link.requested` events to be delivered to the EXTRACTION consumer — and
+    that claim was falsified twice: by the reproduction test, and by the
+    topology (no stream covers both subjects; `ENTITY_EXTRACTION` 404s —
+    `err_code=10059`). The "batch event missing required fields" lines in
+    the 2026-09-20 logs were the extraction handler correctly rejecting
+    malformed events published to `entity.extraction.requested` itself — a
+    payload (`client_book_id` present, `batch_id` absent) that NO version of
+    this repo's Go code publishes (verified across every coordinator
+    version, `a1e40da` through HEAD) — almost certainly manual test
+    publishes. Both Python subscriptions now set filter_subject explicitly
+    (one ConsumerConfig each — a shared instance lets one subscribe's filter
+    leak into the other if nats-py mutates the config it is handed,
+    unverified), pinned by `services/agent-runtime/tests/test_consumer_filter.py`,
+    because `requirements.txt` bounds `nats-py>=2.7.0` and the auto-set
+    behavior is proven only for the installed version.
 
 ## Group disposition
 

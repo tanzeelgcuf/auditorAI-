@@ -6,17 +6,22 @@
 # TEXT of main.py, the same trade internal/pipeline/verify_worker_test.go makes
 # (a jetstream.Msg cannot be built outside a live connection).
 #
-# The bug it pins, observed live 2026-09-20 (the first full pipeline run):
-# ConsumerConfig(ack_wait=120, max_deliver=MAX_DELIVERY_ATTEMPTS) carried NO
-# filter_subject. With no filter, a JetStream consumer takes every subject on
-# the stream it binds to, and the link.requested event this consumer's own
-# publish_link_after path publishes after each extraction batch was delivered
-# to the EXTRACTION consumer — logged as "processing batch batch_id=None" /
-# "batch event missing required fields", then acked. One spurious error per
-# batch completion, and the same event handled twice (process_link also ran
-# it). Same lesson the Go coordinator's consumer learned
-# (services/api/internal/pipeline/coordinator.go:99-106: "FilterSubject is
-# REQUIRED, not cosmetic").
+# What this pins: filter_subject set EXPLICITLY on both subscriptions — a
+# contract pin, not a bug fix. nats-py's subscribe() sets filter_subject from
+# the subject when the config omits it, verified live 2026-09-20 (a consumer
+# created with a config that omitted it was stored by the server as
+# filter='entity.extraction.requested', and a link.requested marker published
+# afterwards was NOT received). An earlier draft of this header claimed the
+# missing filter caused link.requested events to be delivered to the
+# EXTRACTION consumer — that claim was FALSIFIED by the same reproduction
+# test and by the topology (no stream covers both subjects; ENTITY_EXTRACTION
+# 404s). The "batch event missing required fields" lines in the 2026-09-20
+# logs were the extraction handler correctly rejecting malformed events
+# published to entity.extraction.requested itself — client_book_id present,
+# batch_id absent, a payload no version of this repo's Go code publishes.
+# The explicit pin is kept because requirements.txt bounds nats-py>=2.7.0 and
+# the auto-set behavior is proven only for the installed version. The Go
+# coordinator's FilterSubject IS load-bearing (coordinator.go:99-106).
 #
 # Non-vacuity, run via git archive HEAD into a scratch tree with this file
 # copied in: the two filter-matching assertions and the ConsumerConfig
