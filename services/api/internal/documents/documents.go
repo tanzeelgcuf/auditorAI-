@@ -1,17 +1,20 @@
 package documents
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,18 +61,11 @@ var allowedDocTypes = map[string]string{
 // gl_export — wrong, but the same answer the extension gives today. A bank
 // signal (balance-style columns) would be a guess about exports this repo
 // has no fixture for, so it is not encoded.
-func refineDocTypeFromHeader(data []byte) string {
-	var header []string
-	if i := bytes.IndexByte(data, '\n'); i > 0 {
-		first := string(data[:i])
-		header = strings.Split(first, ",")
-		for j := range header {
-			header[j] = strings.TrimSpace(strings.Trim(header[j], `"'`))
-		}
-	}
-	if len(header) == 0 {
-		return ""
-	}
+// classifyHeader maps a header row to a doc type; "" means no signal, in
+// which case the caller keeps the extension default. ONE implementation, two
+// extraction paths (CSV text and xlsx workbooks) feed it — so the two paths
+// cannot drift the way two implementations would.
+func classifyHeader(header []string) string {
 	hasAccount := false
 	hasInvoiceSignal := false
 	for _, h := range header {
@@ -89,6 +85,156 @@ func refineDocTypeFromHeader(data []byte) string {
 		return "invoice"
 	}
 	return ""
+}
+
+func refineDocTypeFromHeader(data []byte) string {
+	var header []string
+	if i := bytes.IndexByte(data, '\n'); i > 0 {
+		first := string(data[:i])
+		header = strings.Split(first, ",")
+		for j := range header {
+			header[j] = strings.TrimSpace(strings.Trim(header[j], `"'`))
+		}
+	}
+	if len(header) == 0 {
+		return ""
+	}
+	return classifyHeader(header)
+}
+
+// xlsxHeaderRow reads the first worksheet's header row from an xlsx (a zip
+// binary) — the "open and validate" the extension-only default skipped. Cell
+// values with t="s" resolve through xl/sharedStrings.xml by index; inline
+// strings carry their text in <is><t>; numeric cells are taken as-is.
+// Returns nil when the workbook cannot be opened or the first sheet has no
+// row, in which case the caller falls back to the CSV text extraction (a
+// .xlsx that is actually CSV text — the shipped sample_gl.xlsx fixture is
+// ASCII, not a zip).
+func xlsxHeaderRow(data []byte) []string {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil
+	}
+	var shared []string
+	for _, f := range zr.File {
+		if f.Name != "xl/sharedStrings.xml" {
+			continue
+		}
+		rc, openErr := f.Open()
+		if openErr != nil {
+			return nil
+		}
+		dec := xml.NewDecoder(rc)
+		inT := false
+		var cur strings.Builder
+		for {
+			tok, terr := dec.Token()
+			if terr != nil {
+				break
+			}
+			switch t := tok.(type) {
+			case xml.StartElement:
+				if t.Name.Local == "t" {
+					inT = true
+					cur.Reset()
+				}
+			case xml.CharData:
+				if inT {
+					cur.Write(t)
+				}
+			case xml.EndElement:
+				if t.Name.Local == "t" {
+					shared = append(shared, cur.String())
+					inT = false
+				}
+			}
+		}
+		rc.Close()
+		break
+	}
+	for _, f := range zr.File {
+		if f.Name != "xl/worksheets/sheet1.xml" {
+			continue
+		}
+		rc, openErr := f.Open()
+		if openErr != nil {
+			return nil
+		}
+		dec := xml.NewDecoder(rc)
+		var header []string
+		rowCount := 0
+		cellIsShared := false
+		inV := false
+		inInlineT := false
+		var cur strings.Builder
+		for {
+			tok, terr := dec.Token()
+			if terr != nil {
+				break
+			}
+			switch t := tok.(type) {
+			case xml.StartElement:
+				switch t.Name.Local {
+				case "row":
+					rowCount++
+					if rowCount > 1 {
+						rc.Close()
+						if len(header) > 0 {
+							return header
+						}
+						return nil
+					}
+				case "c":
+					cellIsShared = false
+					for _, a := range t.Attr {
+						if a.Name.Local == "t" && a.Value == "s" {
+							cellIsShared = true
+						}
+					}
+				case "v":
+					inV = true
+					cur.Reset()
+				case "t":
+					// the inline <t> inside <is>; sharedStrings has its own loop
+					inInlineT = true
+					cur.Reset()
+				}
+			case xml.CharData:
+				if inV || inInlineT {
+					cur.Write(t)
+				}
+			case xml.EndElement:
+				switch t.Name.Local {
+				case "v":
+					inV = false
+					if rowCount == 1 {
+						val := cur.String()
+						if cellIsShared {
+							idx, perr := strconv.Atoi(val)
+							if perr == nil && idx >= 0 && idx < len(shared) {
+								header = append(header, shared[idx])
+							}
+						} else {
+							header = append(header, val)
+						}
+					}
+				case "t":
+					if inInlineT {
+						inInlineT = false
+						if rowCount == 1 {
+							header = append(header, cur.String())
+						}
+					}
+				}
+			}
+		}
+		rc.Close()
+		if len(header) > 0 {
+			return header
+		}
+		return nil
+	}
+	return nil
 }
 
 type Service struct {
@@ -196,8 +342,28 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	// ASCII text, so it rides the CSV path via the FormatDetector's content
 	// sniff — a real invoice .xlsx is a named gap). OFX/QFX are definitive
 	// bank_statement.
-	if ext == ".csv" {
+	switch ext {
+	case ".csv":
 		if refined := refineDocTypeFromHeader(data); refined != "" {
+			if refined != docType {
+				slog.Info("doc_type refined from header", "filename", header.Filename, "was", docType, "now", refined)
+			}
+			docType = refined
+		}
+	case ".xlsx":
+		// A real workbook is a zip binary: open it and read the first
+		// worksheet's header rather than trusting the extension (rule 20). A
+		// .xlsx that is actually CSV text (the shipped sample_gl.xlsx fixture
+		// is ASCII) fails the zip open, so the CSV extraction applies instead —
+		// the same sniff either way, one classifyHeader implementation.
+		refined := ""
+		if workbookHeader := xlsxHeaderRow(data); workbookHeader != nil {
+			refined = classifyHeader(workbookHeader)
+		} else {
+			refined = refineDocTypeFromHeader(data)
+		}
+		if refined != "" && refined != docType {
+			slog.Info("doc_type refined from header", "filename", header.Filename, "was", docType, "now", refined)
 			docType = refined
 		}
 	}
@@ -463,9 +629,27 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// rule 20's class, second instance: HandlePresignUpload records a
+	// caller-specified doc_type that reaches ingestion unrefined — at confirm
+	// the bytes ARE in hand (StreamObject buffers them for hashing), so the
+	// same header-sniff applies HERE. The content is authoritative over the
+	// caller's presign label: classify_entity_type derives the entity type
+	// from doc_type (structured.rs:329), so a wrong label rides the whole
+	// pipeline exactly as the direct path's extension-only default did. The
+	// correction lands in the same UPDATE as the content hash, before the
+	// ingestion trigger carries doc_type onward.
+	if ext := strings.ToLower(path.Ext(storageKey)); ext == ".csv" {
+		if refined := refineDocTypeFromHeader(data); refined != "" {
+			if refined != docType {
+				slog.Info("doc_type refined at confirm", "doc_id", docID, "was", docType, "now", refined)
+			}
+			docType = refined
+		}
+	}
+
 	_, err = c.Exec(r.Context(),
-		`UPDATE source_documents SET content_hash = $1, ocr_status = 'pending' WHERE id = $2`,
-		contentHash, docID)
+		`UPDATE source_documents SET content_hash = $1, ocr_status = 'pending', doc_type = $2 WHERE id = $3`,
+		contentHash, docType, docID)
 	if err != nil {
 		slog.Error("failed to update doc hash", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "update failed")
