@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import structlog
+import sys
 import sentry_sdk
 from typing import Optional
 
@@ -195,6 +196,27 @@ async def _retry_or_drop(msg, attempt: int) -> None:
         await msg.ack()
 
 
+async def _ack_with_retry(msg, what: str = "ack") -> None:
+    """Ack failures used to kill the consumer silently: the exception
+    propagated out of the async-for, gather failed, and main() waited on the
+    stop event forever — a zombie process with a dead pipeline whose only
+    trace was a GC-time "Task exception was never retrieved". Retry transient
+    transport failures with a short backoff; if the connection is truly gone
+    the retries fail fast and the exception re-raises, which main() turns into
+    a loud exit so a supervisor or the operator sees it and restarts.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            return await msg.ack()
+        except Exception as e:  # noqa: BLE001 - retry any transport error
+            last_exc = e
+            logger.warning(what + " failed, retrying", attempt=attempt, error=str(e))
+            await asyncio.sleep(0.5 * attempt)
+    assert last_exc is not None, "raise is only reachable after a failed attempt"
+    raise RuntimeError(f"{what} failed after 3 attempts") from last_exc
+
+
 async def run_consumer():
     """Subscribe to NATS JetStream and process batches."""
     try:
@@ -272,7 +294,7 @@ async def run_consumer():
                     # pointless and a nak would loop forever.
                     logger.error("undecodable event, dropping", error=str(e))
                     sentry_sdk.capture_exception(e)
-                    await msg.ack()
+                    await _ack_with_retry(msg)
                     continue
 
                 try:
@@ -295,24 +317,29 @@ async def run_consumer():
                     sentry_sdk.capture_exception(e)  # GlitchTip (no-op when DSN unset)
                     await _retry_or_drop(msg, attempt)
                 else:
-                    await msg.ack()
-                    # A book-wide link pass must run AFTER each extraction batch.
-                    # The Go coordinator publishes link.requested only after
-                    # entity persistence — seconds after upload, BEFORE any LLM
-                    # classification completes (observed live 2026-09-19/20: the
-                    # LLM takes 40-70s per batch, so every book-wide pass ran on
-                    # unclassified types and the correctly-typed trio sat in the
-                    # database with nothing to link it). This batch just updated
-                    # the types; the pass that assembles the trio must follow it.
-                    # The book-wide pass is deterministic (no LLM) and runs on
-                    # unmatched entities, so re-running it is cheap. Only on
-                    # EXTRACTION events — link.requested -> process_link -> ack
-                    # -> publish again would be an infinite loop.
+                    # rule 5: the follow-up publish is part of THIS event's
+                    # work, and the previous order (ack, then publish) lost it —
+                    # a publish failure left the event already acked, so nothing
+                    # retried the book-wide link pass, which is the exact
+                    # unlinked-trio state publish_link_after exists to fix (the
+                    # coordinator's own link.requested fires BEFORE LLM
+                    # classification — observed live 2026-09-19/20: the LLM
+                    # takes 40-70s per batch, so that trigger always ran on
+                    # unclassified types — making this post-classification
+                    # trigger the only one). Publish FIRST: a failure leaves the
+                    # event unacked and redelivering, and a redelivery is safe —
+                    # a fully-successful prior attempt leaves the re-run's
+                    # pending-entity set empty (HandleGetPendingEntities filters
+                    # entities already in groups), so no duplicates. The
+                    # book-wide pass is deterministic (no LLM) and cheap to
+                    # re-run. Only on EXTRACTION events — link.requested ->
+                    # process_link -> publish again would be an infinite loop.
                     if publish_link_after and event.get("client_book_id"):
                         await js.publish(
                             "link.requested",
                             json.dumps({"client_book_id": event["client_book_id"]}).encode(),
                         )
+                    await _ack_with_retry(msg)
         finally:
             await nc.drain()
 
@@ -352,8 +379,22 @@ async def main():
         loop.add_signal_handler(sig, _on_signal)
 
     consumer = asyncio.create_task(run_consumer())
-    await stop.wait()
-    consumer.cancel()
+    stop_wait = asyncio.create_task(stop.wait())
+    # Wait on EITHER the stop event or the consumer task. The previous
+    # `await stop.wait()` turned a consumer crash into a zombie process:
+    # the pipeline was dead, main() kept running, and the only trace of the
+    # death was a GC-time "Task exception was never retrieved" — the
+    # fail-silent outcome the ack-before-work class exists to prevent, one
+    # layer up.
+    done, _ = await asyncio.wait({consumer, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+    stop_wait.cancel()
+    if consumer in done and not consumer.cancelled():
+        exc = consumer.exception()
+        if exc is not None:
+            logger.error("consumer task crashed - exiting so the failure is visible", error=str(exc))
+            sys.exit(1)
+    if stop_wait in done:
+        consumer.cancel()
     logger.info("agent-runtime stopped")
 
 
