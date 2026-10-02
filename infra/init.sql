@@ -208,6 +208,7 @@ CREATE TABLE extracted_entities (
     counterparty TEXT,
     description TEXT,
     gl_account_code TEXT,
+    external_ref TEXT,
     page_number INTEGER NOT NULL,
     bbox JSONB NOT NULL,
     extraction_confidence NUMERIC(4,3) NOT NULL,
@@ -224,6 +225,19 @@ CREATE TABLE extracted_entities (
     extracted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_extracted_entities_ref ON extracted_entities (client_book_id, transaction_ref);
+-- The connector sync's idempotency: a re-synced provider entity carries the
+-- same external_ref, and this UNIQUE partial index makes the re-insert a
+-- no-op (ON CONFLICT DO NOTHING) — the first pull wins. extracted_entities
+-- has NO other unique constraint (only the non-unique indexes above), so
+-- without this a re-sync would duplicate every entity, and duplicated legs
+-- change a group's totals — the confidently-wrong trade the ack-before-work
+-- class warns about. The ingestion's entities carry external_ref NULL and
+-- are not covered by this index (their dedupe is the document-level content
+-- hash). KNOWN GAP, named: a MODIFIED provider entity (an amount change) is
+-- not re-synced — the first pull wins until v1.1 adds a supersede path.
+CREATE UNIQUE INDEX idx_extracted_entities_external_ref
+    ON extracted_entities (client_book_id, external_ref)
+    WHERE external_ref IS NOT NULL;
 
 -- ===== CROSS-LINKING & REVIEW =====
 CREATE TABLE reconciliation_groups (
@@ -427,6 +441,89 @@ CREATE TABLE idempotency_keys (
 );
 CREATE INDEX idx_idempotency_keys_created ON idempotency_keys (created_at);
 CREATE INDEX idx_idempotency_keys_firm ON idempotency_keys (firm_id);
+
+-- denied_tokens: the JWT denylist, shared across replicas and restarts. Until
+-- 2026-09-28 it was an in-memory sync.Map — and no token was ever issued with
+-- a jti claim, so HandleLogout's denyToken(claims.ID) denied the EMPTY string
+-- and HandleRefresh's isTokenDenied("") returned true for every refresh token
+-- in the deployment: one logout, anywhere, denied every refresh until the
+-- process restarted. Tokens now carry a unique jti at every issuance site and
+-- the list is this table.
+--
+-- NO RLS, deliberately, like idempotency_keys: both are auth infrastructure
+-- reached pre-auth on the sys pool (the logout and refresh routes are public,
+-- so no app.current_firm exists yet and BYPASSRLS is correct there, not a
+-- gap).
+--
+-- expires_at is TTL-aligned on purpose: it carries the token's own exp, so a
+-- denial row self-destructs in meaning exactly when the token would have
+-- expired anyway, and denyToken's lazy cleanup (DELETE ... WHERE expires_at <
+-- now() on every INSERT) keeps the table holding only still-valid denials.
+-- The refresh's own signature check rejects an expired token before the
+-- denylist is consulted, so a stale row is harmless, not a lockout.
+CREATE TABLE denied_tokens (
+    jti TEXT PRIMARY KEY,
+    user_id UUID NOT NULL,
+    denied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX idx_denied_tokens_expires ON denied_tokens (expires_at);
+-- TRAP, observed live 2026-10-01: the blanket GRANT below covers only tables
+-- that exist when it runs. Applying a NEW table to an ALREADY-INITIALIZED
+-- database (this one, via up.sh) therefore needs its own GRANT, or every
+-- sys-role query against it fails with "permission denied" — the denylist's
+-- check failed CLOSED (401 "revoked" for everything) and its INSERT failed to
+-- 500, while the owner's count query worked, which is what made the state
+-- look contradictory. A fresh init.sql run is covered (this table precedes
+-- the GRANT block). THE TRAP HAS A SECOND HEAD, hit the same day: a
+-- BIGSERIAL column's underlying SEQUENCE is granted only by the blanket
+-- sequence GRANT below, so a later-added BIGSERIAL table needs its sequence
+-- granted too — recovery_codes' INSERT failed with "permission denied for
+-- sequence recovery_codes_id_seq (SQLSTATE 42501)" exactly as the comment
+-- above the sequence GRANT documents.
+
+-- recovery_codes: TOTP backup codes. SHA-256 hashes only — the plaintext is
+-- shown once at generation and never retrievable afterward. Single-use is
+-- enforced by consumeRecoveryCode's `UPDATE ... AND used = false` inside the
+-- login's own transaction (the users row lock is held), so two simultaneous
+-- logins cannot spend the same code and a failed login rolls the consumption
+-- back. Regenerating deletes the old batch in the same transaction that
+-- stores the new one.
+CREATE TABLE recovery_codes (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used BOOLEAN NOT NULL DEFAULT false,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, code_hash)
+);
+CREATE INDEX idx_recovery_codes_user ON recovery_codes (user_id);
+
+-- connector_connections: per-book OAuth connections to accounting providers.
+-- The tokens are encrypted at rest (AES-256-GCM under CONNECTOR_ENC_KEY) —
+-- refresh tokens are long-lived (Intuit expires them after 100 days of
+-- inactivity) and must not sit in plaintext. The connector READS from the
+-- provider and writes entities into the same tables ingestion does — it is
+-- another ingestion source, NOT the system of record and NOT a parallel
+-- pipeline. UNIQUE (client_book_id, provider): one connection per provider
+-- per book.
+CREATE TABLE connector_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_book_id UUID NOT NULL REFERENCES client_books(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider IN ('quickbooks','xero')),
+    provider_account_id TEXT NOT NULL,
+    encrypted_access_token TEXT NOT NULL,
+    encrypted_refresh_token TEXT NOT NULL,
+    token_expires_at TIMESTAMPTZ,
+    last_synced_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (client_book_id, provider)
+);
+CREATE INDEX idx_connector_connections_book ON connector_connections (client_book_id);
+ALTER TABLE connector_connections ENABLE ROW LEVEL SECURITY;
+CREATE POLICY connector_connections_book_isolation ON connector_connections
+    USING (client_book_id = ANY(string_to_array(current_setting('app.assigned_books'), ',')::uuid[]));
 
 CREATE TABLE webhook_subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

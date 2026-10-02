@@ -60,6 +60,13 @@ NOT_TABLES = {
     "unnest", "generate_series", "jsonb_array_elements", "json_array_elements",
     "jsonb_to_recordset", "string_to_array", "regexp_split_to_table", "values",
     "lateral", "only", "dual",
+    # QuickBooks' query endpoint takes "SELECT * FROM <Entity>" as an
+    # ARGUMENT — the names below are QBO's entity names, parsed as relations
+    # this schema does not define (observed 2026-10-02: deposit, invoice,
+    # journalentry, purchase reported as drift from
+    # providers_pull.go's query strings). They are not SQL against OUR
+    # database.
+    "deposit", "invoice", "journalentry", "purchase",
 }
 
 

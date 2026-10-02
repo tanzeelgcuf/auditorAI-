@@ -33,6 +33,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Files permitted to write a storage_key without writing bytes, each with the
 # reason it is safe. An entry here is a claim that must stay true.
 ALLOWLIST = {
+    "services/api/internal/connectors/sync.go": (
+        "Connector sync writes synthetic source documents whose storage_key is "
+        "a connector:// POINTER to the provider's data, not local storage — "
+        "the bytes live on QuickBooks/Xero and are fetched at sync time. "
+        "ocr_status='done' and no document.uploaded event is published for "
+        "these rows, so nothing ever streams the keys. Documented at "
+        "ensureSyncDoc in that file."
+    ),
     "services/api/cmd/seed-demo/main.go": (
         "Demo seeder. Writes ocr_status='done' and publishes no document.uploaded "
         "event, so nothing ever streams these keys. Bytes are deliberately absent: "

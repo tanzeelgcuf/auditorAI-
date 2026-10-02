@@ -23,8 +23,10 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auditlog"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/billing"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/connectors"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/documents"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/email"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
@@ -127,6 +129,9 @@ func main() {
 	// Proactive stale document-request reminder loop. Sweeps every
 	// firm, so it cannot be scoped to one — sysPool.
 	go notify.Run(ctx, sysPool, notify.DefaultInterval)
+	// The audit-log IP retention sweep: sysPool (cross-firm by design — the
+	// sweep is global, and it runs at startup with no request behind it).
+	go auditlog.RunRetention(ctx, sysPool, auditlog.DefaultInterval)
 
 	// Initialize pipeline event client (NATS JetStream)
 	var pipelineClient *pipeline.EventClient
@@ -264,6 +269,26 @@ func main() {
 	portalSvc.SetSysDB(sysPool)
 	portalSvc.SetAuth(authSvc)
 
+	// auditlog reads the access audit trail back to the product (it was
+	// write-only — stored and surfaced to nobody) and sweeps it for retention.
+	// pool: the handler reads through middleware.GetConn (the request's
+	// RLS-primed connection, rule 14).
+	auditlogSvc := auditlog.NewService()
+	auditlogSvc.SetDB(pool)
+
+	// connectors: the accounting-provider integrations (QuickBooks, Xero). The
+	// callback's write runs on sysPool (public, no JWT — the signed state is
+	// its authentication); the authenticated reads run on the request's
+	// RLS-primed connection. The state secret is the JWT secret (the same
+	// trust domain).
+	connectorsSvc := connectors.NewService()
+	connectorsSvc.SetDB(pool)
+	connectorsSvc.SetSysDB(sysPool)
+	connectorsSvc.SetStateSecret([]byte(os.Getenv("JWT_SECRET")))
+	if pipelineClient != nil {
+		connectorsSvc.SetPipeline(pipelineClient)
+	}
+
 	// push takes no pool either, for the same reason, and for a second one: its
 	// background fan-out (push.SendFindingAlert) needs sysPool while its handler
 	// needs the primed request connection. One field could only ever have been right
@@ -354,6 +379,12 @@ func main() {
 	// request body is an abuse surface; the handler also caps the body it will read.
 	// Stripe's own delivery volume is far below 5 req/s.
 	r.With(middleware.RateLimit(authLimiter)).Post("/v1/webhooks/stripe", billingSvc.HandleStripeWebhook)
+	// The OAuth callback is deliberately PUBLIC — the provider's redirect
+	// carries no JWT; the signed `state` parameter is its authentication (the
+	// same posture as the Stripe webhook, which is not in the auth group for
+	// the same reason). Rate-limited: an unauthenticated route is an abuse
+	// surface.
+	r.With(middleware.RateLimit(authLimiter)).Get("/v1/connectors/{provider}/callback", connectorsSvc.HandleCallback)
 
 	// Auth routes (public) — rate-limited against brute force.
 	r.Route("/v1/auth", func(r chi.Router) {
@@ -389,6 +420,7 @@ func main() {
 		r.Use(middleware.RateLimit(authLimiter))
 		r.Post("/v1/totp/enable", authSvc.HandleEnableTOTP)
 		r.Post("/v1/totp/verify", authSvc.HandleVerifyTOTP)
+		r.Post("/v1/totp/recovery", authSvc.HandleGenerateRecoveryCodes)
 	})
 
 	// Protected routes
@@ -469,6 +501,15 @@ func main() {
 		r.Post("/v1/entity-links/{linkId}/confirm", reviewSvc.HandleConfirm)
 		r.Post("/v1/entity-links/{linkId}/reject", reviewSvc.HandleReject)
 		r.Post("/v1/books/{bookId}/review-queue/bulk-confirm", reviewSvc.HandleBulkConfirm)
+
+		// Audit trail: the book's access_log, read back to the product for
+		// the first time (it was stored and surfaced to nobody).
+		r.Get("/v1/books/{bookId}/access-log", auditlogSvc.HandleBookAccessLog)
+
+		// Connectors: the accounting-provider integrations.
+		r.Get("/v1/books/{bookId}/connectors", connectorsSvc.HandleList)
+		r.Get("/v1/books/{bookId}/connectors/{provider}/authorize", connectorsSvc.HandleAuthorize)
+		r.Post("/v1/books/{bookId}/connectors/{provider}/sync", connectorsSvc.HandleSync)
 
 		// Findings
 		r.Get("/v1/books/{bookId}/findings", findingSvc.HandleList)

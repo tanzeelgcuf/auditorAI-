@@ -130,6 +130,15 @@ ALLOWLIST = {
     "internal/notify/notify.go": {"db":
         "notify.Run(ctx, sysPool, …) main.go:129 — a sweep across all firms "
         "cannot be scoped to one."},
+    "internal/auditlog/retention.go": {"db":
+        "auditlog.RunRetention(ctx, sysPool, …) main.go:133 — a sweep across "
+        "all firms cannot be scoped to one; same pattern as notify.Run."},
+    "internal/connectors/service.go": {"s.sysDB":
+        "connectorsSvc.SetSysDB(sysPool) main.go:286 — the OAuth callback is "
+        "PUBLIC (no JWT; the signed state is its authentication), so no RLS "
+        "priming exists and BYPASSRLS is correct there. The row is scoped to "
+        "the state's book. s.db in this same file is the APP pool and is NOT "
+        "excused."},
     "internal/middleware/internal_auth.go": {"sysDB":
         "middleware.InternalAuth(pool, sysPool) main.go:511 — the sysDB parameter "
         "is sysPool; it resolves book -> firm, the step that ESTABLISHES scope, so "
