@@ -7,6 +7,7 @@ mod telemetry;
 mod zen;
 
 use clap::Parser;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -72,7 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svc = VerificationServiceImpl::new(rule_engine);
 
     // Start gRPC server
-    let addr = args.grpc_addr.parse()?;
+    // SocketAddr::from_str rejects "localhost:50051" with AddrParseError(Socket)
+    // — observed live 2026-09-22 on both Rust services: a natural env value,
+    // and the same value the API's Go side resolves without complaint. Parse
+    // via ToSocketAddrs instead, which resolves the hostname; the first
+    // resolved address is taken, and an unresolvable value still fails loudly.
+    let addr = args
+        .grpc_addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or("GRPC_ADDR resolved to no addresses")?;
     Server::builder()
         .add_service(VerificationServiceServer::new(svc))
         .serve(addr)
