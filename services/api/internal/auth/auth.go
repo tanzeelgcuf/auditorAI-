@@ -13,10 +13,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pquerna/otp"
@@ -27,12 +27,11 @@ import (
 )
 
 type Service struct {
-	db           *pgxpool.Pool
-	jwtSecret    []byte
-	accessTTL    time.Duration
-	refreshTTL   time.Duration
-	deniedTokens sync.Map
-	emailSender  email.EmailSender
+	db          *pgxpool.Pool
+	jwtSecret   []byte
+	accessTTL   time.Duration
+	refreshTTL  time.Duration
+	emailSender email.EmailSender
 }
 
 type Claims struct {
@@ -111,6 +110,12 @@ func (s *Service) GenerateTokens(userID, firmID, role string) (*TokenPair, error
 		FirmID: firmID,
 		Role:   role,
 		RegisteredClaims: jwt.RegisteredClaims{
+			// ID is the jti, and it is REQUIRED: without it every token shares
+			// the empty jti and HandleLogout's denyToken("") denied EVERY
+			// refresh in the deployment after one logout (read from the code
+			// 2026-09-28, the denylist build's first finding — the 09-05
+			// status doc's framing had it backwards).
+			ID:        uuid.NewString(),
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.accessTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
@@ -123,6 +128,7 @@ func (s *Service) GenerateTokens(userID, firmID, role string) (*TokenPair, error
 		FirmID: firmID,
 		Role:   role,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.NewString(), // the jti — see accessClaims above
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.refreshTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
@@ -158,6 +164,7 @@ func (s *Service) GeneratePortalTokens(portalUserID, bookID string) (*TokenPair,
 		Role:         "portal_user",
 		PortalBookID: bookID,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.NewString(), // the jti — required, see GenerateTokens
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.accessTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
@@ -169,6 +176,7 @@ func (s *Service) GeneratePortalTokens(portalUserID, bookID string) (*TokenPair,
 		Role:         "portal_user",
 		PortalBookID: bookID,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.NewString(), // the jti — required, see GenerateTokens
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.refreshTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
@@ -207,13 +215,160 @@ func (s *Service) ValidateAccessToken(tokenStr string) (*Claims, error) {
 	return nil, errors.New("invalid token")
 }
 
+// isTokenDenied consults the DB-backed denylist. Until 2026-09-28 this was an
+// in-memory sync.Map, and no token was EVER issued with a jti claim — so
+// HandleLogout's denyToken(claims.ID) denied the EMPTY string and this check
+// returned true for every refresh token in the deployment: one logout,
+// anywhere, denied every refresh until the process restarted. Tokens now
+// carry a unique jti at every issuance site, and the list is the
+// denied_tokens table (s.db IS the sys pool for this service — main.go:155 —
+// correct for a public pre-auth route, cross-firm by design).
+//
+// An empty jti returns false, deliberately: it means "issued without a jti
+// claim" (pre-fix tokens, or a forged token — which already failed the
+// signature check before this lookup), and denying them all would be the
+// lockout bug. A check that cannot run fails CLOSED (the project's
+// asymmetry): a DB error denies, and the outage is visible.
 func (s *Service) isTokenDenied(jti string) bool {
-	_, denied := s.deniedTokens.Load(jti)
+	if jti == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var denied bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM denied_tokens WHERE jti = $1 AND expires_at > now())`,
+		jti).Scan(&denied)
+	if err != nil {
+		slog.Error("failed to check token denial — failing closed", "error", err)
+		return true
+	}
 	return denied
 }
 
-func (s *Service) denyToken(jti string) {
-	s.deniedTokens.Store(jti, true)
+// denyToken persists a refresh token's revocation. The in-memory sync.Map
+// this replaces was never revoked on another replica and died with the
+// process. expires_at is TTL-aligned: it carries the token's own exp, so the
+// row self-destructs in meaning exactly when the token would have expired
+// anyway, and the lazy cleanup on every INSERT keeps the table holding only
+// still-valid denials. The refresh's own signature check rejects an expired
+// token before this list is consulted, so a stale row is harmless, not a
+// lockout. context.Background(), not r.Context(): the denylist write must
+// outlive a client who hangs up mid-logout (rule 12) — a lost denial leaves a
+// long-lived token the user believes is revoked.
+//
+// The INSERT's error is RETURNED, not logged: the denial is the only record
+// of the revocation, so a swallowed failure would leave that long-lived token
+// valid with nothing anywhere saying so — the caller's 500 and retry is the
+// visible failure. The lazy cleanup's error IS logged and continue: it is
+// hygiene (expired rows), and allowlisted in
+// scripts/check_cancellable_audit_writes.py for exactly that reason.
+func (s *Service) denyToken(jti string, expiresAt time.Time, userID string) error {
+	if jti == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.db.Exec(ctx,
+		`INSERT INTO denied_tokens (jti, user_id, denied_at, expires_at)
+		 VALUES ($1, $2, now(), $3)
+		 ON CONFLICT (jti) DO UPDATE SET denied_at = now()
+		 WHERE denied_tokens.expires_at < now()`,
+		jti, userID, expiresAt); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(ctx,
+		`DELETE FROM denied_tokens WHERE expires_at < now()`); err != nil {
+		slog.Warn("denylist cleanup failed", "error", err)
+	}
+	return nil
+}
+
+// consumeRecoveryCode atomically spends one recovery code inside the login's
+// transaction. Single-use is enforced by the UPDATE's `AND used = false` in
+// the same statement that marks it used — two simultaneous logins cannot both
+// consume the same code — and the transaction holds the users row lock, so a
+// login that fails later rolls the consumption back and the code survives.
+// Returns false when no matching unused code exists (a wrong code, or one
+// already spent), which the caller treats as a failed second factor.
+func (s *Service) consumeRecoveryCode(ctx context.Context, tx pgx.Tx, userID string, submitted string) (bool, error) {
+	hash := HashRecoveryCode(submitted)
+	tag, err := tx.Exec(ctx,
+		`UPDATE recovery_codes SET used = true, used_at = now()
+		  WHERE user_id = $1 AND code_hash = $2 AND used = false`,
+		userID, hash)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// HandleGenerateRecoveryCodes issues a fresh batch of recovery codes for the
+// authenticated user. Enrollment in 2FA is required first — the codes are the
+// alternative to a TOTP code, meaningless without the factor. The old batch
+// is deleted in the same transaction that stores the new one (regenerating
+// invalidates it immediately), and the plaintext is returned ONCE — the
+// database holds SHA-256 hashes only. Must be mounted behind
+// middleware.Authenticator, like the other /v1/totp routes.
+func (s *Service) HandleGenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
+	userID := UserIDFrom(r.Context())
+	if userID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	var alreadyEnabled bool
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT totp_secret IS NOT NULL FROM users WHERE id = $1`, userID).
+		Scan(&alreadyEnabled); err != nil {
+		slog.Error("recovery: enrollment check failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !alreadyEnabled {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "enroll in two-factor authentication before generating recovery codes",
+		})
+		return
+	}
+
+	codes, err := GenerateRecoveryCodes(recoveryCodeCount)
+	if err != nil {
+		slog.Error("recovery: generation failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		slog.Error("recovery: begin failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
+		`DELETE FROM recovery_codes WHERE user_id = $1`, userID); err != nil {
+		_ = tx.Rollback(r.Context())
+		slog.Error("recovery: old batch delete failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	for _, code := range codes {
+		if _, err := tx.Exec(r.Context(),
+			`INSERT INTO recovery_codes (user_id, code_hash) VALUES ($1, $2)`,
+			userID, HashRecoveryCode(code)); err != nil {
+			_ = tx.Rollback(r.Context())
+			slog.Error("recovery: code insert failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Error("recovery: commit failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"codes": codes})
 }
 
 // signupRequest is the JSON body for HandleSignup
@@ -323,6 +478,10 @@ type loginRequest struct {
 	// server had no field to decode it into, so it was silently discarded and a
 	// user with 2FA "enabled" could log in with a password alone.
 	TOTPCode string `json:"totp_code"`
+	// RecoveryCode is the ALTERNATIVE second factor, submitted in place of a
+	// TOTP code by a user who lost their authenticator. When present it
+	// replaces the TOTP check entirely; see consumeRecoveryCode.
+	RecoveryCode string `json:"recovery_code"`
 }
 
 // invalidCredentials is the ONE response every rejected login gets: unknown
@@ -440,7 +599,33 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if totpLastUsedAt != nil {
 		sf.LastUsedAt = *totpLastUsedAt
 	}
-	if err := CheckSecondFactor(sf, req.TOTPCode, now); err != nil {
+
+	// A recovery code, when submitted, REPLACES the TOTP check: it is the
+	// account's alternative second factor (the research's model, applied —
+	// GitHub's: a backup code works in place of the factor). Validated inside
+	// THIS transaction: the consumption is atomic with the login (the tx holds
+	// the users row lock), so a failure before the commit leaves the code
+	// unconsumed, and two simultaneous logins cannot both spend the same code.
+	// A WRONG code is a guess and counts — the same lockout counter as a bad
+	// password or a bad TOTP code, so switching factors buys an attacker
+	// nothing.
+	if req.RecoveryCode != "" {
+		consumed, rcErr := s.consumeRecoveryCode(r.Context(), tx, id, req.RecoveryCode)
+		if rcErr != nil {
+			slog.Error("recovery code check failed", "error", rcErr, "user_id", id)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if !consumed {
+			s.persistLoginFailure(r.Context(), tx, id, lock, now, "bad_recovery_code")
+			slog.Warn("login blocked by second factor", "user_id", id, "reason", "invalid recovery code")
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error":         "invalid recovery code",
+				"totp_required": true,
+			})
+			return
+		}
+	} else if err := CheckSecondFactor(sf, req.TOTPCode, now); err != nil {
 		// A WRONG or REPLAYED code is a guess and counts. A MISSING code does not:
 		// no candidate secret was tested, and both shipped clients render the code
 		// as one optional field on the same form as the password, so an enrolled
@@ -572,7 +757,22 @@ func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	token, _, err := new(jwt.Parser).ParseUnverified(req.RefreshToken, &Claims{})
 	if err == nil {
 		if claims, ok := token.Claims.(*Claims); ok {
-			s.denyToken(claims.ID)
+			exp := time.Now().Add(24 * time.Hour)
+			if claims.ExpiresAt != nil {
+				exp = claims.ExpiresAt.Time
+			}
+			// The denial write's failure fails the request: the write IS the
+			// logout's only work, and returning "Logged out" on a failed
+			// revocation would leave the token valid while the user believes
+			// otherwise. The retry is idempotent (ON CONFLICT guards the
+			// re-INSERT).
+			if denyErr := s.denyToken(claims.ID, exp, claims.UserID); denyErr != nil {
+				slog.Error("logout: failed to persist token denial", "error", denyErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "logout failed: the session could not be revoked — retry",
+				})
+				return
+			}
 		}
 	}
 
@@ -613,6 +813,7 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		FirmID: c.FirmID,
 		Role:   c.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.NewString(), // the jti — required, see GenerateTokens
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.accessTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			NotBefore: jwt.NewNumericDate(time.Now()),
@@ -917,7 +1118,7 @@ func (s *Service) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("TOTP enabled", "user_id", userID)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "2FA enabled",
-		"note":    "Recovery codes are not implemented; losing this device requires an operator to reset the factor.",
+		"note":    "Generate recovery codes at POST /v1/totp/recovery — the plaintext is shown once; store them offline.",
 	})
 }
 
