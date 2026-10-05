@@ -27,6 +27,10 @@ type qboRecord struct {
 	Id          string `json:"Id"`
 	TotalAmt    string `json:"TotalAmt"`
 	TxnDate     string `json:"TxnDate"`
+	MetaData    struct {
+		CreateTime      string `json:"CreateTime"`
+		LastUpdatedTime string `json:"LastUpdatedTime"`
+	} `json:"MetaData"`
 	CustomerRef struct {
 		Name string `json:"name"`
 	} `json:"CustomerRef"`
@@ -60,12 +64,13 @@ func (s *Service) pullQuickBooks(ctx context.Context, cfg ProviderConfig, accoun
 			return nil, fmt.Errorf("invoice %s: %w", rec.Id, cerr)
 		}
 		out = append(out, entityRecord{
-			ExternalRef:     "qbo-invoice-" + rec.Id,
-			EntityType:      "invoice_line_item",
-			AmountCents:     cents,
-			TransactionDate: rec.TxnDate,
-			Counterparty:    rec.CustomerRef.Name,
-			Description:     "QBO Invoice " + rec.Id,
+			ExternalRef:       "qbo-invoice-" + rec.Id,
+			EntityType:        "invoice_line_item",
+			AmountCents:       cents,
+			TransactionDate:   rec.TxnDate,
+			Counterparty:      rec.CustomerRef.Name,
+			Description:       "QBO Invoice " + rec.Id,
+			ProviderUpdatedAt: rec.MetaData.LastUpdatedTime,
 		})
 	}
 
@@ -80,13 +85,14 @@ func (s *Service) pullQuickBooks(ctx context.Context, cfg ProviderConfig, accoun
 				return nil, fmt.Errorf("journal entry %s line %d: %w", rec.Id, i, cerr)
 			}
 			out = append(out, entityRecord{
-				ExternalRef:     fmt.Sprintf("qbo-je-%s-line-%d", rec.Id, i),
-				EntityType:      "gl_entry",
-				AmountCents:     cents,
-				TransactionDate: rec.TxnDate,
-				Description:     line.Description,
-				AccountCode:     line.JournalEntryLineDetail.AccountRef.Name,
-				DebitOrCredit:   strings.ToLower(line.JournalEntryLineDetail.PostingType),
+				ExternalRef:       fmt.Sprintf("qbo-je-%s-line-%d", rec.Id, i),
+				EntityType:        "gl_entry",
+				AmountCents:       cents,
+				TransactionDate:   rec.TxnDate,
+				Description:       line.Description,
+				AccountCode:       line.JournalEntryLineDetail.AccountRef.Name,
+				DebitOrCredit:     strings.ToLower(line.JournalEntryLineDetail.PostingType),
+				ProviderUpdatedAt: rec.MetaData.LastUpdatedTime,
 			})
 		}
 	}
@@ -103,12 +109,13 @@ func (s *Service) pullQuickBooks(ctx context.Context, cfg ProviderConfig, accoun
 					return nil, fmt.Errorf("%s %s: %w", key, rec.Id, cerr)
 				}
 				out = append(out, entityRecord{
-					ExternalRef:     "qbo-" + strings.ToLower(key) + "-" + rec.Id,
-					EntityType:      "bank_transaction",
-					AmountCents:     cents,
-					TransactionDate: rec.TxnDate,
-					Counterparty:    firstNonEmpty(rec.CustomerRef.Name, rec.VendorRef.Name),
-					Description:     "QBO " + key + " " + rec.Id,
+					ExternalRef:       "qbo-" + strings.ToLower(key) + "-" + rec.Id,
+					EntityType:        "bank_transaction",
+					AmountCents:       cents,
+					TransactionDate:   rec.TxnDate,
+					Counterparty:      firstNonEmpty(rec.CustomerRef.Name, rec.VendorRef.Name),
+					Description:       "QBO " + key + " " + rec.Id,
+					ProviderUpdatedAt: rec.MetaData.LastUpdatedTime,
 				})
 			}
 		}
@@ -154,10 +161,11 @@ func (s *Service) pullXero(ctx context.Context, cfg ProviderConfig, accessToken 
 	var out []entityRecord
 
 	var invoices []struct {
-		InvoiceID string `json:"InvoiceID"`
-		Total     string `json:"Total"`
-		Date      string `json:"Date"`
-		Contact   struct {
+		InvoiceID      string `json:"InvoiceID"`
+		Total          string `json:"Total"`
+		Date           string `json:"Date"`
+		UpdatedDateUTC string `json:"UpdatedDateUTC"`
+		Contact        struct {
 			Name string `json:"Name"`
 		} `json:"Contact"`
 	}
@@ -170,12 +178,13 @@ func (s *Service) pullXero(ctx context.Context, cfg ProviderConfig, accessToken 
 			return nil, fmt.Errorf("invoice %s: %w", inv.InvoiceID, cerr)
 		}
 		out = append(out, entityRecord{
-			ExternalRef:     "xero-invoice-" + inv.InvoiceID,
-			EntityType:      "invoice_line_item",
-			AmountCents:     cents,
-			TransactionDate: xeroDate(inv.Date),
-			Counterparty:    inv.Contact.Name,
-			Description:     "Xero Invoice " + inv.InvoiceID,
+			ExternalRef:       "xero-invoice-" + inv.InvoiceID,
+			EntityType:        "invoice_line_item",
+			AmountCents:       cents,
+			TransactionDate:   xeroDate(inv.Date),
+			Counterparty:      inv.Contact.Name,
+			Description:       "Xero Invoice " + inv.InvoiceID,
+			ProviderUpdatedAt: inv.UpdatedDateUTC,
 		})
 	}
 
@@ -183,6 +192,7 @@ func (s *Service) pullXero(ctx context.Context, cfg ProviderConfig, accessToken 
 		BankTransactionID string `json:"BankTransactionID"`
 		Total             string `json:"Total"`
 		Date              string `json:"Date"`
+		UpdatedDateUTC    string `json:"UpdatedDateUTC"`
 		BankAccount       struct {
 			Name string `json:"Name"`
 		} `json:"BankAccount"`
@@ -196,17 +206,19 @@ func (s *Service) pullXero(ctx context.Context, cfg ProviderConfig, accessToken 
 			return nil, fmt.Errorf("bank transaction %s: %w", bt.BankTransactionID, cerr)
 		}
 		out = append(out, entityRecord{
-			ExternalRef:     "xero-bank-" + bt.BankTransactionID,
-			EntityType:      "bank_transaction",
-			AmountCents:     cents,
-			TransactionDate: xeroDate(bt.Date),
-			Description:     "Xero Bank " + bt.BankAccount.Name,
+			ExternalRef:       "xero-bank-" + bt.BankTransactionID,
+			EntityType:        "bank_transaction",
+			AmountCents:       cents,
+			TransactionDate:   xeroDate(bt.Date),
+			Description:       "Xero Bank " + bt.BankAccount.Name,
+			ProviderUpdatedAt: bt.UpdatedDateUTC,
 		})
 	}
 
 	var journals []struct {
 		ManualJournalID string `json:"ManualJournalID"`
 		Date            string `json:"Date"`
+		UpdatedDateUTC  string `json:"UpdatedDateUTC"`
 		Narration       string `json:"Narration"`
 		JournalLines    []struct {
 			LineAmount  string `json:"LineAmount"`
@@ -224,12 +236,13 @@ func (s *Service) pullXero(ctx context.Context, cfg ProviderConfig, accessToken 
 				return nil, fmt.Errorf("manual journal %s line %d: %w", j.ManualJournalID, i, cerr)
 			}
 			out = append(out, entityRecord{
-				ExternalRef:     fmt.Sprintf("xero-mj-%s-line-%d", j.ManualJournalID, i),
-				EntityType:      "gl_entry",
-				AmountCents:     cents,
-				TransactionDate: xeroDate(j.Date),
-				Description:     firstNonEmpty(line.Description, j.Narration),
-				AccountCode:     line.AccountCode,
+				ExternalRef:       fmt.Sprintf("xero-mj-%s-line-%d", j.ManualJournalID, i),
+				EntityType:        "gl_entry",
+				AmountCents:       cents,
+				TransactionDate:   xeroDate(j.Date),
+				Description:       firstNonEmpty(line.Description, j.Narration),
+				AccountCode:       line.AccountCode,
+				ProviderUpdatedAt: j.UpdatedDateUTC,
 			})
 		}
 	}

@@ -29,15 +29,16 @@ import (
 // entityRecord is one provider record mapped into the pipeline's entity
 // shape — the same fields extracted_entities holds.
 type entityRecord struct {
-	ExternalRef     string
-	EntityType      string
-	AmountCents     int64
-	Currency        string
-	TransactionDate string // YYYY-MM-DD or ""
-	Counterparty    string
-	Description     string
-	AccountCode     string
-	DebitOrCredit   string
+	ExternalRef       string
+	EntityType        string
+	AmountCents       int64
+	Currency          string
+	TransactionDate   string // YYYY-MM-DD or ""
+	Counterparty      string
+	Description       string
+	AccountCode       string
+	DebitOrCredit     string
+	ProviderUpdatedAt string // the provider's last-modified timestamp (ISO 8601) or ""
 }
 
 // decimalToCents converts a provider's decimal amount string to integer
@@ -384,24 +385,48 @@ func (s *Service) writeEntities(ctx context.Context, c *pgxpool.Conn, bookID str
 			skipped++ // no provider id: the dedupe would be meaningless
 			continue
 		}
+		// Update-detection (prompt Part 1.4): a later sync CORRECTS a modified
+		// provider entity rather than the first pull winning forever. Both
+		// providers expose a reliable last-modified signal (QBO
+		// MetaData.LastUpdatedTime, Xero UpdatedDateUTC), stored in
+		// provider_updated_at; the conflict clause applies the update only
+		// when the incoming timestamp is NEWER, so a re-sync of unchanged
+		// data is a no-op. The source_document_id is deliberately NOT
+		// re-pointed: the citation's source stays the document the entity was
+		// first traced to, and the update's provenance is the provider's own
+		// timestamp.
 		tag, err := tx.Exec(ctx,
 			`INSERT INTO extracted_entities
 				(client_book_id, source_document_id, entity_type, amount_cents, currency,
 				 transaction_date, counterparty, description, gl_account_code,
-				 external_ref, page_number, bbox, extraction_confidence, source_format)
+				 external_ref, page_number, bbox, extraction_confidence, source_format,
+				 provider_updated_at)
 			 VALUES ($1, $2, $3, $4, $5, NULLIF($6,'')::date, NULLIF($7,''), NULLIF($8,''), NULLIF($9,''),
-				$10, 1, $11, 1.0, 'structured')
-			 ON CONFLICT (client_book_id, external_ref) DO NOTHING`,
+				$10, 1, NULLIF($11,'')::jsonb, 1.0, 'structured', NULLIF($12,'')::timestamptz)
+			 ON CONFLICT (client_book_id, external_ref) DO UPDATE
+			   SET amount_cents = EXCLUDED.amount_cents,
+			       currency = EXCLUDED.currency,
+			       transaction_date = EXCLUDED.transaction_date,
+			       counterparty = EXCLUDED.counterparty,
+			       description = EXCLUDED.description,
+			       gl_account_code = EXCLUDED.gl_account_code,
+			       provider_updated_at = EXCLUDED.provider_updated_at
+			 WHERE extracted_entities.provider_updated_at IS NULL
+			    OR extracted_entities.provider_updated_at < EXCLUDED.provider_updated_at`,
 			bookID, docID, rec.EntityType, rec.AmountCents, rec.Currency,
 			rec.TransactionDate, rec.Counterparty, rec.Description, rec.AccountCode,
-			rec.ExternalRef, `{"x":0,"y":0,"width":0,"height":0}`)
+			rec.ExternalRef, "", rec.ProviderUpdatedAt)
 		if err != nil {
 			return 0, 0, err
 		}
+		// RowsAffected == 1 for BOTH an insert and a conditional update; both
+		// count as written (the response's entities_written is the inserts
+		// plus the corrections). RowsAffected == 0 is the no-op: already
+		// synced and unchanged.
 		if tag.RowsAffected() == 1 {
 			written++
 		} else {
-			skipped++ // already synced: the first pull wins
+			skipped++
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
