@@ -89,6 +89,11 @@ pub struct ReconciliationOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionGraph {
+    /// The rule's stable identity, REQUIRED — a graph without one fails at
+    /// load, the same strictness as the bands: no fallback fabricates the id
+    /// from the filename (the fallback is the anti-pattern that kept the
+    /// unused-graph bug invisible, rule 15).
+    rule_id: String,
     nodes: Vec<GraphNode>,
     // `edges` is deliberately NOT modelled. serde ignores unknown keys, so the
     // JSON keeps its edges and Zen tooling keeps working; this evaluator resolves
@@ -520,10 +525,12 @@ fn validate_coverage(rules: &[CompiledRule]) -> Result<(), ZenError> {
 // ---------------------------------------------------------------------------
 
 pub struct RuleEngine {
-    /// Recorded on every gRPC result alongside `rule_version`. Currently the
-    /// graph FILE PATH (main.rs passes --decision-graph-path straight through),
-    /// which is a known weakness tracked separately: a path is not a stable
-    /// rule identity across deployments.
+    /// Recorded on every gRPC result alongside `rule_version`. Read FROM the
+    /// graph's own `rule_id` field — a deliberately chosen stable identity, NOT
+    /// derived from the filename: renaming the file used to change the recorded
+    /// id on every historical finding that cited it. The two are different
+    /// axes: rule_id is identity (stable across renames and redeployments),
+    /// rule_version is content (a hash that changes when the policy changes).
     pub rule_id: String,
     /// SHA-256 prefix of the graph JSON. Now an honest provenance claim: the
     /// bands compiled from that exact byte sequence are the bands that produced
@@ -554,7 +561,10 @@ impl RuleEngine {
             .map_err(|e| ZenError::LoadError(format!("parse error: {}", e)))?;
         let rules = compile(&graph)?;
         Ok(RuleEngine {
-            rule_id: name.to_string(),
+            // FROM THE GRAPH, not the `name` argument: the name is the file
+            // path, and a path is not a stable rule identity across
+            // deployments or renames.
+            rule_id: graph.rule_id,
             rule_version,
             rules,
         })
@@ -647,7 +657,7 @@ mod tests {
 
     fn graph_with(rules: &[String]) -> String {
         format!(
-            r#"{{"nodes":[
+            r#"{{"rule_id":"test_graph","nodes":[
                 {{"id":"in","type":"inputNode","name":"request"}},
                 {{"id":"t","type":"decisionTableNode","name":"Tolerance Evaluation",
                   "content":{{"rules":[{}]}}}},
@@ -747,9 +757,31 @@ mod tests {
     /// variance 5 / tolerance 1. That test passed. It could only pass because
     /// the graph was never consulted, and it is the clearest single piece of
     /// evidence the bug existed.
+    /// A graph with no rule_id fails at load — the strictness added 2026-10-03:
+    /// rule_id is REQUIRED, read from the graph rather than derived from the
+    /// filename, and no fallback fabricates it (the fallback is the anti-pattern
+    /// that kept the unused-graph bug invisible). A rename of the graph file
+    /// must not change the recorded identity of any historical finding.
+    #[test]
+    fn test_graph_without_rule_id_must_not_load() {
+        let result = RuleEngine::from_json(r#"{"nodes":[],"edges":[]}"#, "empty");
+        match result {
+            Err(ZenError::LoadError(m)) => assert!(
+                m.contains("rule_id"),
+                "error should name the missing rule_id, got: {}",
+                m
+            ),
+            Err(other) => panic!("expected LoadError, got {:?}", other),
+            Ok(_) => panic!("a graph without rule_id must not load"),
+        }
+    }
+
     #[test]
     fn test_empty_graph_must_not_load() {
-        let result = RuleEngine::from_json(r#"{"nodes":[],"edges":[]}"#, "empty");
+        // The graph carries rule_id so this test tests the MISSING DECISION
+        // TABLE, not the missing rule_id — that is its own test below.
+        let result =
+            RuleEngine::from_json(r#"{"rule_id":"empty-test","nodes":[],"edges":[]}"#, "empty");
         match result {
             Err(ZenError::LoadError(m)) => assert!(
                 m.contains("decisionTableNode"),
