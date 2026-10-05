@@ -129,6 +129,12 @@ CREATE TABLE users (
     totp_enabled_at TIMESTAMPTZ,
     totp_last_code TEXT,
     totp_last_used_at TIMESTAMPTZ,
+    -- TOTP mandatory for firm_admin (added 2026-10-04): a firm_admin with no
+    -- enrolled factor gets ONE grace login to complete enrollment, then is
+    -- blocked until they do. The grace is consumed ONLY in the same
+    -- transaction that issues tokens — the same ordering rule as the
+    -- lockout counter's clear — so a login that fails later never spends it.
+    totp_grace_used BOOLEAN NOT NULL DEFAULT false,
     -- Per-account brute-force ceiling (added 2026-09-04). Until this existed the
     -- ONLY brute-force control was the per-IP token bucket in
     -- internal/middleware/ratelimit.go, which is keyed on the source address — so
@@ -209,8 +215,20 @@ CREATE TABLE extracted_entities (
     description TEXT,
     gl_account_code TEXT,
     external_ref TEXT,
+    -- The provider's own last-modified timestamp (QBO MetaData.LastUpdatedTime,
+    -- Xero UpdatedDateUTC) — the connector sync's update-detection signal: a
+    -- later sync corrects the entity only when the incoming timestamp is
+    -- NEWER, so a re-sync of unchanged data is a no-op and provider-side
+    -- edits are not permanently ignored (the first pull no longer wins
+    -- forever). NULL for file-upload entities.
+    provider_updated_at TIMESTAMPTZ,
     page_number INTEGER NOT NULL,
-    bbox JSONB NOT NULL,
+    -- Nullable on purpose: structured sources (CSV/OFX/XLSX) have no page
+    -- geometry, and a zero box asserted a region that does not exist — an
+    -- admission of "no geometry" beats a confident wrong value, the same
+    -- reasoning as the source_ip NULL pattern (rule 13). The OCR path writes
+    -- the real coordinates; NULL here means "no region to highlight".
+    bbox JSONB,
     extraction_confidence NUMERIC(4,3) NOT NULL,
     source_format TEXT NOT NULL DEFAULT 'ocr' CHECK (source_format IN ('ocr', 'structured')),
     transaction_ref TEXT,
