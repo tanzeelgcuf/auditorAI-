@@ -60,7 +60,10 @@ export interface Report {
 export interface Citation {
   source_document_id: string;
   page_number: number;
-  bbox: { x: number; y: number; width: number; height: number };
+  // null for structured sources (CSV/OFX/XLSX): no page geometry exists.
+  // The API stores SQL NULL and the viewer degrades to a clear message
+  // rather than rendering a meaningless (0,0,0,0) box.
+  bbox: { x: number; y: number; width: number; height: number } | null;
 }
 
 // ---- auth ----
@@ -341,5 +344,47 @@ export function useUpdateFirmSettings() {
     mutationFn: (body: { brand_primary_color?: string; report_footer_text?: string; logo_storage_key?: string }) =>
       api.patch("/v1/admin/settings", body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["firm-settings"] }),
+  });
+}
+
+// ---- TOTP / two-factor ----
+export interface TOTPStatus {
+  enabled: boolean;
+}
+
+export function useTOTPStatus() {
+  return useQuery({
+    queryKey: ["totp-status"],
+    queryFn: () => api.get<TOTPStatus>("/v1/totp/status"),
+  });
+}
+
+export interface EnableTOTPResponse {
+  secret: string;
+  qr_code: string;
+  already_enabled: boolean;
+  confirm_endpoint: string;
+}
+
+export function useEnableTOTP() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<EnableTOTPResponse>("/v1/totp/enable", {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["totp-status"] }),
+  });
+}
+
+export function useVerifyTOTP() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ code }: { code: string }) =>
+      api.post<{ message: string }>("/v1/totp/verify", { code }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["totp-status"] }),
+  });
+}
+
+export function useGenerateRecoveryCodes() {
+  return useMutation({
+    mutationFn: () => api.post<{ codes: string[] }>("/v1/totp/recovery", {}),
   });
 }

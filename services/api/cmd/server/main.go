@@ -421,6 +421,7 @@ func main() {
 		r.Post("/v1/totp/enable", authSvc.HandleEnableTOTP)
 		r.Post("/v1/totp/verify", authSvc.HandleVerifyTOTP)
 		r.Post("/v1/totp/recovery", authSvc.HandleGenerateRecoveryCodes)
+		r.Get("/v1/totp/status", authSvc.HandleTOTPStatus)
 	})
 
 	// Protected routes
