@@ -54,9 +54,27 @@ func NewService() *Service {
 		secret = "dev-secret-change-in-production"
 	}
 
+	// DECIDED 2026-10-03 (prompt Part 1.3): the denylist covers the
+	// refresh-token path only, and the access-token residual window after a
+	// logout is bounded by THIS TTL. 15 minutes is the standard's tight end
+	// (short-lived access tokens minimize the attack window); a logout kills
+	// the session's future because the refresh is denied; adding a per-request
+	// DB lookup in the auth middleware would trade a hot-path cost on every
+	// request for a marginal gain on a window that is already short. So the
+	// mitigation is the TTL itself, made env-configurable so an operator can
+	// tighten it without a redeploy. An unset/invalid value keeps 15m.
+	accessTTL := 15 * time.Minute
+	if v := os.Getenv("ACCESS_TOKEN_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= time.Hour {
+			accessTTL = d
+		} else {
+			slog.Warn("ACCESS_TOKEN_TTL invalid or over 1h; keeping 15m", "value", v)
+		}
+	}
+
 	return &Service{
 		jwtSecret:  []byte(secret),
-		accessTTL:  15 * time.Minute,
+		accessTTL:  accessTTL,
 		refreshTTL: 7 * 24 * time.Hour,
 	}
 }
@@ -310,8 +328,7 @@ func (s *Service) consumeRecoveryCode(ctx context.Context, tx pgx.Tx, userID str
 // invalidates it immediately), and the plaintext is returned ONCE — the
 // database holds SHA-256 hashes only. Must be mounted behind
 // middleware.Authenticator, like the other /v1/totp routes.
-func (s *Service) HandleGenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
-	userID := UserIDFrom(r.Context())
+func (s *Service) HandleGenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {	userID := UserIDFrom(r.Context())
 	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
@@ -529,16 +546,18 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var totpSecret, totpLastCode *string
 	var totpLastUsedAt *time.Time
 	var failedAttempts int
+	var totpGraceUsed bool
 	var lockedUntil, lastFailedAt *time.Time
 	err = tx.QueryRow(r.Context(),
 		`SELECT id, firm_id, password_hash, role, email_verified,
 		        totp_secret, totp_last_code, totp_last_used_at,
-		        failed_login_attempts, locked_until, last_failed_login_at
+		        failed_login_attempts, locked_until, last_failed_login_at,
+		        totp_grace_used
 		   FROM users WHERE email = $1
 		   FOR UPDATE`,
 		req.Email).Scan(&id, &firmID, &passwordHash, &role, &emailVerified,
 		&totpSecret, &totpLastCode, &totpLastUsedAt,
-		&failedAttempts, &lockedUntil, &lastFailedAt)
+		&failedAttempts, &lockedUntil, &lastFailedAt, &totpGraceUsed)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			invalidCredentials(w)
@@ -600,6 +619,33 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		sf.LastUsedAt = *totpLastUsedAt
 	}
 
+	// TOTP mandatory for firm_admin (added 2026-10-04): a firm_admin with no
+	// enrolled factor is gated BEFORE tokens issue, and the gate is a hard
+	// one — not a dismissible prompt. Rule-11-grade ordering: the grace login
+	// is consumed ONLY in the same transaction that issues tokens (the burn
+	// UPDATE below), so a login that fails later never spends the grace, and
+	// an attacker who cannot present the password learns nothing about it.
+	// The grace flag is false by default, so a NEW firm_admin account also
+	// gets one grace login — the gate's other half: after the grace is spent
+	// and the factor is still absent, the login is refused with
+	// enrollment_required, which the client turns into a redirect to the
+	// enrollment flow.
+	requireEnrollment := false
+	if role == "firm_admin" && sf.Secret == "" {
+		if !totpGraceUsed {
+			requireEnrollment = true // the grace login: allowed; consumed at token issuance
+		} else {
+			slog.Warn("login blocked: firm_admin without 2FA after grace", "user_id", id)
+			// A problem-shaped response: the client's error wrapper parses the
+			// detail, so the gate's purpose ("complete enrollment") travels in
+			// the message the user sees, and the type names the condition for
+			// a programmatic redirect.
+			writeProblem(w, http.StatusForbidden, "https://ai-auditor.dev/errors/enrollment-required",
+				"two-factor authentication is required for your role — complete enrollment to continue")
+			return
+		}
+	}
+
 	// A recovery code, when submitted, REPLACES the TOTP check: it is the
 	// account's alternative second factor (the research's model, applied —
 	// GitHub's: a backup code works in place of the factor). Validated inside
@@ -654,15 +700,21 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if sf.Secret != "" {
 		burn = NormalizeTOTPCode(req.TOTPCode)
 	}
+	// The grace login's consumption lives HERE, in the same transaction that
+	// issues tokens — the rule-11 ordering: a login that fails before this
+	// commit never spends the grace, and the counter-clear + the grace
+	// consumption + the token issuance are all true of the same commit.
+	graceApplies := requireEnrollment
 	if _, err := tx.Exec(r.Context(),
 		`UPDATE users
 		    SET failed_login_attempts = 0,
 		        locked_until          = NULL,
 		        last_failed_login_at  = NULL,
 		        totp_last_code    = CASE WHEN $1 = '' THEN totp_last_code    ELSE $1    END,
-		        totp_last_used_at = CASE WHEN $1 = '' THEN totp_last_used_at ELSE now() END
+		        totp_last_used_at = CASE WHEN $1 = '' THEN totp_last_used_at ELSE now() END,
+		        totp_grace_used   = CASE WHEN $3 THEN true ELSE totp_grace_used END
 		  WHERE id = $2`,
-		burn, id); err != nil {
+		burn, id, graceApplies); err != nil {
 		slog.Error("failed to record successful login", "error", err, "user_id", id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
@@ -1120,6 +1172,26 @@ func (s *Service) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
 		"message": "2FA enabled",
 		"note":    "Generate recovery codes at POST /v1/totp/recovery — the plaintext is shown once; store them offline.",
 	})
+}
+
+// HandleTOTPStatus reports whether the authenticated user has 2FA enrolled.
+// Behind the authenticator; the sysPool read scoped to the JWT's own user —
+// the settings page's status display, which the enrollment UI needs before
+// deciding whether to show the enroll flow or the current state.
+func (s *Service) HandleTOTPStatus(w http.ResponseWriter, r *http.Request) {
+	userID := UserIDFrom(r.Context())
+	if userID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var enabled bool
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT totp_secret IS NOT NULL FROM users WHERE id = $1`, userID).Scan(&enabled); err != nil {
+		slog.Error("totp status check failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": enabled})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
