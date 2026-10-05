@@ -19,7 +19,11 @@ pub struct ExtractedEntity {
     pub gl_account_code: Option<String>,
     pub transaction_ref: Option<String>, // source ref (e.g. GL "Num", OFX "FITID")
     pub page_number: i32,
-    pub bbox: BoundingBox,
+    // None for structured sources (CSV/OFX/XLSX): there is no page geometry,
+    // and a zero box asserted a region that does not exist — an admission of
+    // "no geometry" beats a confident wrong value, the same reasoning as the
+    // source_ip NULL pattern (rule 13).
+    pub bbox: Option<BoundingBox>,
     pub confidence: f32,       // 0.0 - 1.0
     pub source_format: String, // "ocr" or "structured"
 }

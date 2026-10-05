@@ -431,12 +431,9 @@ impl OcrBackend for CsvParser {
                 gl_account_code: account_code,
                 transaction_ref: tx_ref,
                 page_number: 1,
-                bbox: BoundingBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                },
+                // A structured source has no page geometry: None, not a zero
+                // box asserting a region that does not exist.
+                bbox: None,
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -594,12 +591,9 @@ impl OcrBackend for XlsxParser {
                 gl_account_code: account_code,
                 transaction_ref: tx_ref,
                 page_number: 1,
-                bbox: BoundingBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                },
+                // A structured source has no page geometry: None, not a zero
+                // box asserting a region that does not exist.
+                bbox: None,
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -737,12 +731,9 @@ impl OcrBackend for OfxParser {
                 gl_account_code: None,
                 transaction_ref: fitid.clone(),
                 page_number: 1,
-                bbox: BoundingBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                },
+                // A structured source has no page geometry: None, not a zero
+                // box asserting a region that does not exist.
+                bbox: None,
                 confidence: 1.0,
                 source_format: "structured".to_string(),
             });
@@ -1015,12 +1006,12 @@ mod tests {
             transaction_ref: None,
             currency: "USD".into(),
             page_number: 1,
-            bbox: BoundingBox {
+            bbox: Some(BoundingBox {
                 x: 0.0,
                 y: 0.0,
                 width: 0.0,
                 height: 0.0,
-            },
+            }),
             confidence: 1.0,
             source_format: "structured".into(),
         };
@@ -1044,12 +1035,12 @@ mod tests {
             transaction_ref: Some(rf.to_string()),
             currency: "USD".into(),
             page_number: 1,
-            bbox: BoundingBox {
+            bbox: Some(BoundingBox {
                 x: 0.0,
                 y: 0.0,
                 width: 0.0,
                 height: 0.0,
-            },
+            }),
             confidence: 1.0,
             source_format: "structured".into(),
         };

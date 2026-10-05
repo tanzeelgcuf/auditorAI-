@@ -143,6 +143,12 @@ export default function ReportViewerPage() {
                   Select a finding to highlight its source region in the PDF.
                 </p>
               )}
+              {citation && !citation.bbox && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  No page region to highlight — this finding's source is a
+                  structured export, so the data itself is the citation.
+                </p>
+              )}
             </div>
           </MotionDiv>
         </div>

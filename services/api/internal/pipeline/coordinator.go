@@ -430,17 +430,20 @@ func nullableDate(s string) *time.Time {
 }
 
 // bboxJSON renders an entity's OCR geometry as the JSON stored in the bbox
-// column, or "{}" when absent. The column was previously hardcoded '{}' — the
-// sidecar produces real coordinates but they were dropped here, so citations
-// pointed at nothing (traceability gap, Round 7).
+// column, or "" when absent — bound as NULLIF($n,'')::jsonb, so an absent
+// message stores SQL NULL, not "{}". A zero box (or an empty object) asserted
+// a region that does not exist; NULL admits "no geometry", the source_ip
+// pattern (rule 13). The column was previously hardcoded '{}' — the sidecar
+// produces real coordinates but they were dropped here, so citations pointed
+// at nothing (traceability gap, Round 7).
 func bboxJSON(e *ingestionpb.ExtractedEntity) string {
 	if e.Bbox == nil {
-		return "{}"
+		return ""
 	}
 	if b, err := json.Marshal(e.Bbox); err == nil {
 		return string(b)
 	}
-	return "{}"
+	return ""
 }
 
 // persistEntities writes a document's parsed entities in ONE transaction, and is
@@ -510,7 +513,7 @@ func (c *Coordinator) persistEntities(ctx context.Context, bookID, docID string,
 				(client_book_id, source_document_id, entity_type, amount_cents, transaction_date,
 				 counterparty, description, gl_account_code, transaction_ref, page_number, bbox, extraction_confidence, source_format)
 			 VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), NULLIF($9,''),
-			 	$10, $13, $11, $12)`,
+			 	$10, NULLIF($13,'')::jsonb, $11, $12)`,
 			bookID, docID, e.EntityType, e.AmountCents, txnDate,
 			e.Counterparty, e.Description, e.GlAccountCode, e.TransactionRef,
 			e.PageNumber, e.Confidence, e.SourceFormat, bboxJSON(e))

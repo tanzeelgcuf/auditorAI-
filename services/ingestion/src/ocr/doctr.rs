@@ -401,7 +401,7 @@ impl OcrBackend for DoctrBackend {
                             gl_account_code: None,
                             transaction_ref: None,
                             page_number: page.page_number,
-                            bbox,
+                            bbox: Some(bbox),
                             confidence: line.confidence,
                             source_format: "ocr".to_string(),
                         });

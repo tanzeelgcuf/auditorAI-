@@ -84,11 +84,15 @@ impl IngestionServiceImpl {
             description: e.description.clone().unwrap_or_default(),
             gl_account_code: e.gl_account_code.clone().unwrap_or_default(),
             page_number: e.page_number,
-            bbox: Some(GrpcBoundingBox {
-                x: e.bbox.x as f64,
-                y: e.bbox.y as f64,
-                width: e.bbox.width as f64,
-                height: e.bbox.height as f64,
+            // None passes through as an absent message: a structured source
+            // has no geometry, and the API stores SQL NULL (the source_ip
+            // pattern) instead of a zero box asserting a region that doesn't
+            // exist.
+            bbox: e.bbox.map(|b| GrpcBoundingBox {
+                x: b.x as f64,
+                y: b.y as f64,
+                width: b.width as f64,
+                height: b.height as f64,
             }),
             confidence: e.confidence as f64,
             source_format: e.source_format.clone(),
