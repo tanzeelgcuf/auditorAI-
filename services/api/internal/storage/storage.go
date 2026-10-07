@@ -22,9 +22,9 @@ import (
 )
 
 type Client struct {
-	s3        *s3.Client
-	bucket    string
-	presign   *s3.PresignClient
+	s3      *s3.Client
+	bucket  string
+	presign *s3.PresignClient
 }
 
 // New builds an S3-compatible client from env. Endpoint may be MinIO (local) or AWS.

@@ -97,7 +97,7 @@ var ErrNoPrimedConn = errors.New("settings: no RLS-primed connection in request 
 // string_to_array(...)::uuid[] — the only 2-argument calls are the bootstrap
 // password lookups at :868-869. So an unprimed statement raises: 42704
 // undefined_object when the GUC was never set on that physical connection, or
-// 22P02 invalid_text_representation on ''::uuid when ReleaseRLSConn
+// 22P02 invalid_text_representation on ”::uuid when ReleaseRLSConn
 // (middleware.go:218) has RESET it. Both are errors, not empty result sets. The
 // fallback is still a bug — a 500 whose log line blames the query — but it is a
 // loud one, and overstating it as a silent wrong answer is the kind of rounding-up

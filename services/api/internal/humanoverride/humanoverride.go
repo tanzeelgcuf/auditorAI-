@@ -316,7 +316,7 @@ func (s *Service) HandleMergeGroups(w http.ResponseWriter, r *http.Request) {
 // current_setting('app.assigned_books') with no missing_ok, and this codebase
 // sets no database-level or role-level default for that GUC — so on an unprimed
 // pool connection the predicate raises on the unset parameter, and on a recycled
-// one that has been RESET it evaluates against '' and the INSERT violates the
+// one that has been RESET it evaluates against ” and the INSERT violates the
 // policy. Either way the statement errors, the error degrades to slog.Warn, and
 // GET /v1/books/{bookId}/config-history returns an empty list forever. The only
 // call site (tenant.go:318, inside HandleUpdateBookSettings) runs under

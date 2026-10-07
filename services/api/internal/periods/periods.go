@@ -67,16 +67,16 @@ func parseDate(s string) (time.Time, bool) {
 }
 
 type period struct {
-	ID                      string    `json:"id"`
-	ClientBookID            string    `json:"client_book_id"`
-	PeriodStart             string    `json:"period_start"`
-	PeriodEnd               string    `json:"period_end"`
-	Status                  string    `json:"status"`
-	TrialBalanceDebitsCents *int64    `json:"trial_balance_debits_cents"`
-	TrialBalanceCreditsCents *int64   `json:"trial_balance_credits_cents"`
-	TrialBalanceIsBalanced  *bool     `json:"trial_balance_is_balanced"`
-	ClosedBy                *string   `json:"closed_by"`
-	ClosedAt                *string   `json:"closed_at"`
+	ID                       string  `json:"id"`
+	ClientBookID             string  `json:"client_book_id"`
+	PeriodStart              string  `json:"period_start"`
+	PeriodEnd                string  `json:"period_end"`
+	Status                   string  `json:"status"`
+	TrialBalanceDebitsCents  *int64  `json:"trial_balance_debits_cents"`
+	TrialBalanceCreditsCents *int64  `json:"trial_balance_credits_cents"`
+	TrialBalanceIsBalanced   *bool   `json:"trial_balance_is_balanced"`
+	ClosedBy                 *string `json:"closed_by"`
+	ClosedAt                 *string `json:"closed_at"`
 }
 
 const periodSelect = `SELECT id::text, client_book_id::text,
@@ -450,15 +450,15 @@ func (s *Service) HandleReopenPeriod(w http.ResponseWriter, r *http.Request) {
 // ---- Document requests ----
 
 type docRequest struct {
-	ID                   string `json:"id"`
-	ClientBookID         string `json:"client_book_id"`
+	ID                     string  `json:"id"`
+	ClientBookID           string  `json:"client_book_id"`
 	ReconciliationPeriodID *string `json:"reconciliation_period_id"`
-	RequestedDocType     string `json:"requested_doc_type"`
-	Description          *string `json:"description"`
-	RequestedBy          string `json:"requested_by"`
-	Status               string `json:"status"`
-	RequestedAt          string `json:"requested_at"`
-	ReminderSentCount    int    `json:"reminder_sent_count"`
+	RequestedDocType       string  `json:"requested_doc_type"`
+	Description            *string `json:"description"`
+	RequestedBy            string  `json:"requested_by"`
+	Status                 string  `json:"status"`
+	RequestedAt            string  `json:"requested_at"`
+	ReminderSentCount      int     `json:"reminder_sent_count"`
 }
 
 func scanDocRequest(row pgx.Row) (docRequest, error) {
@@ -721,11 +721,11 @@ func (s *Service) HandleFirmDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total_open_findings":   totalOpen,
-		"open_by_severity":      bySeverity,
-		"past_due_findings":     pastDue,
-		"avg_resolution_time":   avgResolution,
-		"stale_requests":        staleRequests,
-		"books":                 booksOut,
+		"total_open_findings": totalOpen,
+		"open_by_severity":    bySeverity,
+		"past_due_findings":   pastDue,
+		"avg_resolution_time": avgResolution,
+		"stale_requests":      staleRequests,
+		"books":               booksOut,
 	})
 }

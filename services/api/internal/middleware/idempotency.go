@@ -88,7 +88,7 @@ func hashKey(s string) string {
 // context — not on the raw pool. idempotency_keys carries RLS as of 2026-09-05, and
 // every policy in this schema calls current_setting('app.…') with no missing_ok and
 // there is no GUC default, so a raw-pool statement against this table cannot
-// succeed: it either raises or tests against '' and fails the policy. Adding RLS
+// succeed: it either raises or tests against ” and fails the policy. Adding RLS
 // while these statements were still on the raw pool would have converted a working
 // feature into a silently broken one, which is why the pool fix landed first.
 func Idempotency(db *pgxpool.Pool) func(http.Handler) http.Handler {

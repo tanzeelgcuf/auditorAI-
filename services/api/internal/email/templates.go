@@ -7,9 +7,9 @@ import (
 
 // Template names
 const (
-	VerifyEmailTemplate = "verify_email"
+	VerifyEmailTemplate   = "verify_email"
 	ResetPasswordTemplate = "reset_password"
-	StaffInviteTemplate = "staff_invite"
+	StaffInviteTemplate   = "staff_invite"
 )
 
 // Data holds the dynamic fields for a given template.

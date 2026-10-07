@@ -35,11 +35,11 @@ type limiterEntry struct {
 
 // IPRateLimiter holds per-IP buckets with a background sweep.
 type IPRateLimiter struct {
-	mu       sync.Mutex
-	entries  map[string]*limiterEntry
-	rate     rate.Limit
-	burst    int
-	ttl      time.Duration // idle IPs evicted after this
+	mu      sync.Mutex
+	entries map[string]*limiterEntry
+	rate    rate.Limit
+	burst   int
+	ttl     time.Duration // idle IPs evicted after this
 }
 
 // NewIPRateLimiter builds a limiter: `r` tokens/sec, `burst` max burst per IP.

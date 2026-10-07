@@ -245,9 +245,9 @@ type Service struct {
 
 func NewService() *Service { return &Service{} }
 
-func (s *Service) SetDB(db *pgxpool.Pool)             { s.db = db }
+func (s *Service) SetDB(db *pgxpool.Pool)              { s.db = db }
 func (s *Service) SetPipeline(p *pipeline.EventClient) { s.pipeline = p }
-func (s *Service) SetStorage(st *storage.Client)        { s.storage = st }
+func (s *Service) SetStorage(st *storage.Client)       { s.storage = st }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

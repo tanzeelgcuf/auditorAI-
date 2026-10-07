@@ -37,12 +37,12 @@ var ErrNoIngestion = errors.New("no ingestion connection")
 const maxDeliveryAttempts = 5
 
 type Coordinator struct {
-	nc          *nats.Conn
-	db          *pgxpool.Pool
-	storage     *storage.Client
+	nc           *nats.Conn
+	db           *pgxpool.Pool
+	storage      *storage.Client
 	ingestionURL string
-	ingestion   ingestionpb.IngestionServiceClient
-	js          jetstream.JetStream
+	ingestion    ingestionpb.IngestionServiceClient
+	js           jetstream.JetStream
 }
 
 func NewCoordinator(natsURL, ingestionURL string, db *pgxpool.Pool, st *storage.Client) (*Coordinator, error) {
@@ -274,11 +274,11 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 
 	// Call ingestion gRPC: it parses the bytes into structured entities.
 	resp, err := c.ingestion.ProcessDocument(ctx, &ingestionpb.ProcessDocumentRequest{
-		DocumentId:    ev.DocumentID,
-		ClientBookId:  ev.ClientBookID,
-		StorageKey:    ev.StorageKey,
-		DocType:       ev.DocType,
-		ColumnMap:     columnMap,
+		DocumentId:   ev.DocumentID,
+		ClientBookId: ev.ClientBookID,
+		StorageKey:   ev.StorageKey,
+		DocType:      ev.DocType,
+		ColumnMap:    columnMap,
 	})
 	if err != nil {
 		c.fail(ctx, msg, ev.DocumentID, "ingestion_grpc", err)
@@ -430,7 +430,7 @@ func nullableDate(s string) *time.Time {
 }
 
 // bboxJSON renders an entity's OCR geometry as the JSON stored in the bbox
-// column, or "" when absent — bound as NULLIF($n,'')::jsonb, so an absent
+// column, or "" when absent — bound as NULLIF($n,”)::jsonb, so an absent
 // message stores SQL NULL, not "{}". A zero box (or an empty object) asserted
 // a region that does not exist; NULL admits "no geometry", the source_ip
 // pattern (rule 13). The column was previously hardcoded '{}' — the sidecar

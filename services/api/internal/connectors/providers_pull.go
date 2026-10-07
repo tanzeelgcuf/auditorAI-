@@ -24,10 +24,10 @@ import (
 // JournalEntry, Purchase and Deposit records; JSON unmarshal ignores what a
 // given record doesn't carry.
 type qboRecord struct {
-	Id          string `json:"Id"`
-	TotalAmt    string `json:"TotalAmt"`
-	TxnDate     string `json:"TxnDate"`
-	MetaData    struct {
+	Id       string `json:"Id"`
+	TotalAmt string `json:"TotalAmt"`
+	TxnDate  string `json:"TxnDate"`
+	MetaData struct {
 		CreateTime      string `json:"CreateTime"`
 		LastUpdatedTime string `json:"LastUpdatedTime"`
 	} `json:"MetaData"`
@@ -38,8 +38,8 @@ type qboRecord struct {
 		Name string `json:"name"`
 	} `json:"VendorRef"`
 	Line []struct {
-		Amount      string `json:"Amount"`
-		Description string `json:"Description"`
+		Amount                 string `json:"Amount"`
+		Description            string `json:"Description"`
 		JournalEntryLineDetail struct {
 			PostingType string `json:"PostingType"`
 			AccountRef  struct {
@@ -275,7 +275,7 @@ func (s *Service) xeroGet(ctx context.Context, cfg ProviderConfig, accessToken, 
 
 // xeroDate normalises Xero's date forms ("/Date(1705276800000+0000)/" or
 // "2024-01-15T00:00:00") to the bare YYYY-MM-DD the entity's transaction_date
-// DATE column and NULLIF($n,'')::date expect.
+// DATE column and NULLIF($n,”)::date expect.
 func xeroDate(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {

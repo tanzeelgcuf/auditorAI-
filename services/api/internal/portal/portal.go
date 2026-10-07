@@ -232,11 +232,11 @@ func (s *Service) HandleListReports(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type report struct {
-		ID            string `json:"id"`
-		PeriodStart   string `json:"period_start"`
-		PeriodEnd     string `json:"period_end"`
-		GeneratedAt   string `json:"generated_at"`
-		FindingCount  int    `json:"finding_count"`
+		ID           string `json:"id"`
+		PeriodStart  string `json:"period_start"`
+		PeriodEnd    string `json:"period_end"`
+		GeneratedAt  string `json:"generated_at"`
+		FindingCount int    `json:"finding_count"`
 	}
 	var out []report
 	for rows.Next() {
@@ -308,12 +308,12 @@ func (s *Service) HandleListFindings(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type finding struct {
-		ID            string    `json:"id"`
-		Severity      string    `json:"severity"`
-		Status        string    `json:"status"`
-		RuleID        string    `json:"rule_id"`
-		Formula       string    `json:"calculation_formula"`
-		CreatedAt     time.Time `json:"created_at"`
+		ID        string    `json:"id"`
+		Severity  string    `json:"severity"`
+		Status    string    `json:"status"`
+		RuleID    string    `json:"rule_id"`
+		Formula   string    `json:"calculation_formula"`
+		CreatedAt time.Time `json:"created_at"`
 	}
 	var out []finding
 	for rows.Next() {

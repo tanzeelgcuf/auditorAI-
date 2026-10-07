@@ -46,7 +46,7 @@ func (s *Service) SetVerificationPublisher(p VerificationPublisher) { s.verifyPu
 // reconciliation_groups, reconciliation_group_members, client_books — has
 // ENABLE ROW LEVEL SECURITY, and init.sql's policies cast current_setting(...)
 // straight to uuid with no missing_ok, so such a statement raises (42704, or
-// 22P02 on ''::uuid after ReleaseRLSConn RESETs it). The fallback could never
+// 22P02 on ”::uuid after ReleaseRLSConn RESETs it). The fallback could never
 // have produced a working query; it only moved the failure to a place that
 // could not explain it.
 //
@@ -70,7 +70,6 @@ func (s *Service) primed(w http.ResponseWriter, r *http.Request) (middleware.Que
 		"https://ai-auditor.dev/errors/internal", "no db conn")
 	return nil, false
 }
-
 
 func writeProblem(w http.ResponseWriter, status int, typ, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
@@ -132,21 +131,21 @@ func (s *Service) HandleGetPendingEntities(w http.ResponseWriter, r *http.Reques
 	defer rows.Close()
 
 	type entity struct {
-		ID                  string    `json:"id"`
-		ClientBookID        string    `json:"client_book_id"`
-		SourceDocumentID    string    `json:"source_document_id"`
-		EntityType          string    `json:"entity_type"`
-		EntitySubtype       string    `json:"entity_subtype"`
-		AmountCents         int64     `json:"amount_cents"`
-		Currency            string    `json:"currency"`
-		TransactionDate     string    `json:"transaction_date"`
-		Counterparty        string    `json:"counterparty"`
-		Description         string    `json:"description"`
-		GLAccountCode       string    `json:"gl_account_code"`
-		PageNumber          int       `json:"page_number"`
-		BBox                map[string]float64 `json:"bbox"`
-		ExtractionConfidence float64  `json:"extraction_confidence"`
-		SourceFormat        string    `json:"source_format"`
+		ID                   string             `json:"id"`
+		ClientBookID         string             `json:"client_book_id"`
+		SourceDocumentID     string             `json:"source_document_id"`
+		EntityType           string             `json:"entity_type"`
+		EntitySubtype        string             `json:"entity_subtype"`
+		AmountCents          int64              `json:"amount_cents"`
+		Currency             string             `json:"currency"`
+		TransactionDate      string             `json:"transaction_date"`
+		Counterparty         string             `json:"counterparty"`
+		Description          string             `json:"description"`
+		GLAccountCode        string             `json:"gl_account_code"`
+		PageNumber           int                `json:"page_number"`
+		BBox                 map[string]float64 `json:"bbox"`
+		ExtractionConfidence float64            `json:"extraction_confidence"`
+		SourceFormat         string             `json:"source_format"`
 	}
 
 	var out []entity
@@ -389,9 +388,9 @@ func (s *Service) HandleGetBookTolerance(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"tolerance_cents":        tolerance,
-		"tolerance_mode":         toleranceMode,
-		"auto_link_threshold":    autoLink,
-		"review_floor":           reviewFloor,
+		"tolerance_cents":     tolerance,
+		"tolerance_mode":      toleranceMode,
+		"auto_link_threshold": autoLink,
+		"review_floor":        reviewFloor,
 	})
 }

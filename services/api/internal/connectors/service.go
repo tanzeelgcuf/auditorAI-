@@ -35,9 +35,9 @@ func NewService() *Service {
 	return &Service{http: &http.Client{Timeout: 30 * time.Second}}
 }
 
-func (s *Service) SetDB(db *pgxpool.Pool)            { s.db = db }
-func (s *Service) SetSysDB(db *pgxpool.Pool)         { s.sysDB = db }
-func (s *Service) SetStateSecret(secret []byte)      { s.stateSecret = secret }
+func (s *Service) SetDB(db *pgxpool.Pool)              { s.db = db }
+func (s *Service) SetSysDB(db *pgxpool.Pool)           { s.sysDB = db }
+func (s *Service) SetStateSecret(secret []byte)        { s.stateSecret = secret }
 func (s *Service) SetPipeline(p *pipeline.EventClient) { s.pipeline = p }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

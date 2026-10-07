@@ -17,7 +17,7 @@ func TestStrVal(t *testing.T) {
 		in   interface{}
 		want string
 	}{
-		{nil, ""}, // nil -> nil pointer handled separately; strVal(nil) == nil
+		{nil, ""},        // nil -> nil pointer handled separately; strVal(nil) == nil
 		{"0.85", "0.85"}, // string passthrough
 		{int(50), "50"},
 		{int64(100), "100"},

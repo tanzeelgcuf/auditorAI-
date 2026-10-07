@@ -29,7 +29,6 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/connectors"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/documents"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/email"
-	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/entities"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/findings"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/humanoverride"
@@ -37,13 +36,14 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/middleware"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/notify"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/periods"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/pipeline"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/portal"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/push"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/review"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/settings"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
-	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/webhooks"
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/tenant"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/webhooks"
 )
 
 func main() {

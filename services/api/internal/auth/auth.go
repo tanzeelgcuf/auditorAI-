@@ -328,7 +328,8 @@ func (s *Service) consumeRecoveryCode(ctx context.Context, tx pgx.Tx, userID str
 // invalidates it immediately), and the plaintext is returned ONCE — the
 // database holds SHA-256 hashes only. Must be mounted behind
 // middleware.Authenticator, like the other /v1/totp routes.
-func (s *Service) HandleGenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {	userID := UserIDFrom(r.Context())
+func (s *Service) HandleGenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
+	userID := UserIDFrom(r.Context())
 	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
@@ -1192,6 +1193,14 @@ func (s *Service) HandleTOTPStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": enabled})
+}
+
+func writeProblem(w http.ResponseWriter, status int, typ, detail string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"type": typ, "title": http.StatusText(status), "status": status, "detail": detail,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

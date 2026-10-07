@@ -39,7 +39,7 @@ func (s *Service) SetDB(db *pgxpool.Pool) {
 // string_to_array(...)::uuid[]; the only 2-argument calls are the two bootstrap
 // password lookups at :868-869. So on a connection this middleware never primed,
 // a policy predicate cannot evaluate to false — it raises, either 42704 for a GUC
-// that was never set in that session or 22P02 on ''::uuid for one that was RESET
+// that was never set in that session or 22P02 on ”::uuid for one that was RESET
 // by ReleaseRLSConn (middleware.go:218).
 //
 // That is a narrower and less dramatic claim than "the read silently returns zero
@@ -246,11 +246,11 @@ func (s *Service) HandleUpdateBookSettings(w http.ResponseWriter, r *http.Reques
 	}
 
 	var settings struct {
-		ClientName                   *string  `json:"client_name"`
-		BaseCurrency                 *string  `json:"base_currency"`
-		FiscalYearStartMonth         *int     `json:"fiscal_year_start_month"`
-		AutoLinkConfidenceThreshold  *float64 `json:"auto_link_confidence_threshold"`
-		ReviewConfidenceFloor        *float64 `json:"review_confidence_floor"`
+		ClientName                  *string  `json:"client_name"`
+		BaseCurrency                *string  `json:"base_currency"`
+		FiscalYearStartMonth        *int     `json:"fiscal_year_start_month"`
+		AutoLinkConfidenceThreshold *float64 `json:"auto_link_confidence_threshold"`
+		ReviewConfidenceFloor       *float64 `json:"review_confidence_floor"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -571,7 +571,7 @@ func (s *Service) HandleGetFirmSettings(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"name": name,
+		"name":                name,
 		"brand_primary_color": brandColor,
 		"report_footer_text":  reportFooter,
 	})
@@ -585,9 +585,9 @@ func (s *Service) HandleUpdateFirmSettings(w http.ResponseWriter, r *http.Reques
 	}
 
 	var settings struct {
-		Name               *string `json:"name"`
-		BrandPrimaryColor  *string `json:"brand_primary_color"`
-		ReportFooterText   *string `json:"report_footer_text"`
+		Name              *string `json:"name"`
+		BrandPrimaryColor *string `json:"brand_primary_color"`
+		ReportFooterText  *string `json:"report_footer_text"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})

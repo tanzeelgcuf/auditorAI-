@@ -103,21 +103,21 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type findingRow struct {
-		ID                     string    `json:"id"`
-		ClientBookID           string    `json:"client_book_id"`
-		ReconciliationGroupID  string    `json:"reconciliation_group_id"`
-		RuleID                 string    `json:"rule_id"`
-		RuleVersion            string    `json:"rule_version"`
-		CalculatedVarianceCents int64    `json:"calculated_variance_cents"`
-		ToleranceCents         int64     `json:"tolerance_cents"`
-		ExceedsTolerance       bool      `json:"exceeds_tolerance"`
-		CalculationFormula     string    `json:"calculation_formula"`
-		Severity               string    `json:"severity"`
-		Status                 string    `json:"status"`
-		PreparedBy             *string   `json:"prepared_by"`
-		ReviewedBy             *string   `json:"reviewed_by"`
-		ReviewedAt             time.Time `json:"reviewed_at"`
-		CreatedAt              time.Time `json:"created_at"`
+		ID                      string    `json:"id"`
+		ClientBookID            string    `json:"client_book_id"`
+		ReconciliationGroupID   string    `json:"reconciliation_group_id"`
+		RuleID                  string    `json:"rule_id"`
+		RuleVersion             string    `json:"rule_version"`
+		CalculatedVarianceCents int64     `json:"calculated_variance_cents"`
+		ToleranceCents          int64     `json:"tolerance_cents"`
+		ExceedsTolerance        bool      `json:"exceeds_tolerance"`
+		CalculationFormula      string    `json:"calculation_formula"`
+		Severity                string    `json:"severity"`
+		Status                  string    `json:"status"`
+		PreparedBy              *string   `json:"prepared_by"`
+		ReviewedBy              *string   `json:"reviewed_by"`
+		ReviewedAt              time.Time `json:"reviewed_at"`
+		CreatedAt               time.Time `json:"created_at"`
 	}
 
 	var out []findingRow
@@ -441,7 +441,7 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		"id": reportID, "client_book_id": bookID,
 		"period_start": req.PeriodStart, "period_end": req.PeriodEnd,
 		"generated_at": time.Now().Format(time.RFC3339),
-		"finding_ids": findingIDs, "pdf_storage_key": pdfKey,
+		"finding_ids":  findingIDs, "pdf_storage_key": pdfKey,
 	})
 	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
 		// The response below is already decided; this only means a retry of this

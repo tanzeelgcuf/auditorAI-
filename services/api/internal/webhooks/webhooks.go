@@ -30,13 +30,13 @@ func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
 
 // Subscription mirrors a row of webhook_subscriptions (fields needed for delivery).
 type Subscription struct {
-	ID                 string
-	FirmID             string
-	TargetURL          string
-	EventTypes         []string
-	SigningSecret      string
+	ID                  string
+	FirmID              string
+	TargetURL           string
+	EventTypes          []string
+	SigningSecret       string
 	ConsecutiveFailures int
-	Enabled            bool
+	Enabled             bool
 }
 
 // NotifyFindingCreated delivers the finding.created event to matching subscriptions.
