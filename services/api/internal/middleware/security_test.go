@@ -37,6 +37,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1169,13 +1170,15 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 		}
 	})
 
-	// ---- DB-backed lockout ordering test ----
-	// Case #1 from CLAUDE.md: a locked account must be refused without its
-	// password being checked, and a wrong TOTP with a correct password must still
-	// increment the counter (the counter is spent on the failed TOTP check, not
-	// the password). This guards against the per-account lockout being bypassed
-	// or made irrelevant by side-channel responses.
-	func TestSecurity_LockoutSkipsPasswordCheck(t *testing.T) {
+}
+
+// ---- DB-backed lockout ordering test ----
+// Case #1 from CLAUDE.md: a locked account must be refused without its
+// password being checked, and a wrong TOTP with a correct password must still
+// increment the counter (the counter is spent on the failed TOTP check, not
+// the password). This guards against the per-account lockout being bypassed
+// or made irrelevant by side-channel responses.
+func TestSecurity_LockoutSkipsPasswordCheck(t *testing.T) {
 		env := setupEnv(t)
 		// Seed a user with LockoutThreshold-1 attempts so they are NOT locked yet,
 		// then add one more to lock them, and set a correct password so the TOTP
@@ -1187,7 +1190,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 			setupPool := env.setupPool
 			_, err := setupPool.Exec(context.Background(),
 				`UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE email = $3`,
-				LockoutThreshold-1, time.Now().Add(5*time.Minute), env.staffA)
+				auth.LockoutThreshold-1, time.Now().Add(5*time.Minute), env.staffA)
 			if err != nil {
 				t.Fatalf("failed to lock account: %v", err)
 			}
@@ -1215,7 +1218,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 			setupPool := env.setupPool
 			_, err := setupPool.Exec(context.Background(),
 				`UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE email = $3`,
-				LockoutThreshold-2, time.Now().Add(5*time.Minute), env.staffA)
+				auth.LockoutThreshold-2, time.Now().Add(5*time.Minute), env.staffA)
 			if err != nil {
 				t.Fatalf("failed to set boundary state: %v", err)
 			}
@@ -1257,7 +1260,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 			env.bookA)
 
 		// Insert a finding with exceeds_tolerance = true for this group.
-		findingID := mustQueryRow(t, env.pool,
+		_ = mustQueryRow(t, env.pool,
 			`INSERT INTO audit_findings (client_book_id, reconciliation_group_id, rule_id, rule_version,
 				calculated_variance_cents, tolerance_cents, exceeds_tolerance, calculation_formula, severity, status)
 			 VALUES ($1, $2, 'gl_reconciliation', 'abc123', 1000, $3, true, 'v = a - b', 'medium', 'open')
@@ -1267,8 +1270,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 		// via gRPC. Since we can't easily spin up the Rust gRPC server in this
 		// test, we test the disposition logic directly by checking that the
 		// downgrade UPDATE is guarded on auto_linked.
-		chain := env.newRouter(t)
-		token := env.token(t, "testuser", env.firmA, "staff")
+		_, _ = env.newRouter(t), env.token(t, "testuser", env.firmA, "staff")
 
 		// Read the group status before any action.
 		var beforeStatus string
@@ -1289,7 +1291,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed downgrade UPDATE: %v", err)
 		}
-		rowsAffected, _ := result.RowsAffected()
+		rowsAffected := result.RowsAffected()
 
 		// Read back the status.
 		var afterStatus string
@@ -1310,7 +1312,7 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 		// Second downgrade should be idempotent (0 rows affected).
 		result2, _ := env.pool.Exec(context.Background(),
 			`UPDATE reconciliation_groups SET status = 'needs_review' WHERE id = $1 AND status = 'auto_linked'`, groupID)
-		rowsAffected2, _ := result2.RowsAffected()
+		rowsAffected2 := result2.RowsAffected()
 		if rowsAffected2 != 0 {
 			t.Fatal("second downgrade affected rows — should be idempotent with AND guard")
 		}
@@ -1322,11 +1324,11 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 	func TestSecurity_AccessLogSourceIPMatchesLimiter(t *testing.T) {
 		env := setupEnv(t)
 		// Set up trusted proxies so SourceIP and ClientIP agree on the resolved IP.
-		chain, tp := env.withClientIP(t, env.newRouter(t), "")
+		chain, _ := env.withClientIP(t, env.newRouter(t), "")
 		token := env.token(t, env.staffA, env.firmA, "staff")
 
 		// Make a request that will be logged.
-		rec, served := env.doFrom(t, chain, "GET",
+		rec, _ := env.doFrom(t, chain, "GET",
 			"/v1/books/"+env.bookA+"/documents/"+env.docA, token, "",
 			"198.51.100.5:12345", map[string]string{})
 		if rec.Code != http.StatusOK {
@@ -1350,10 +1352,10 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 		if pre := env.configChanges(t, env.bookA); len(pre) != 0 {
 			t.Fatalf("expected config_change_log empty after setup, got %d rows", len(pre))
 		}
-		chain, tp := env.withClientIP(t, env.newRouter(t), "")
+		chain, _ := env.withClientIP(t, env.newRouter(t), "")
 		token := env.token(t, env.staffA, env.firmA, "staff")
 
-		rec, served := env.doFrom(t, chain, "PATCH", "/v1/books/"+env.bookA+"/settings",
+		rec, _ := env.doFrom(t, chain, "PATCH", "/v1/books/"+env.bookA+"/settings",
 			token, `{"auto_link_confidence_threshold":0.97}`, "198.51.100.9:33000", nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 patching book settings, got %d", rec.Code)
@@ -1377,4 +1379,3 @@ func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
 			t.Fatalf("expected new value 0.97, got %v", rows[0].NewValue)
 		}
 	}
-}
