@@ -15,8 +15,18 @@ export function Skeleton({
   style,
   ...props
 }: SkeletonProps) {
+  // The fill colour is the Tailwind class `bg-muted`, NOT an inline style.
+  //
+  // This object used to carry `backgroundColor: "rgb(var(--color-muted) /
+  // <alpha-value>)"`, copied out of tailwind.config.ts:36. `<alpha-value>` is a
+  // Tailwind *config* placeholder that the compiler substitutes when it emits a
+  // utility class; nothing substitutes it inside a React `style` prop. The
+  // browser therefore received `rgb(226 232 240 / <alpha-value>)`, which is not
+  // valid CSS, and dropped the declaration — so every skeleton in the app
+  // rendered with no fill, leaving only the faint shimmer overlay on a
+  // transparent box. Swept 2026-09-06: this was the only `<alpha-value>` outside
+  // tailwind.config.ts. Line 34's `/ 0.1` is a real alpha and is left alone.
   const baseStyles = {
-    backgroundColor: "rgb(var(--color-muted) / <alpha-value>)",
     borderRadius: variant === "circular" ? "9999px" : variant === "text" ? "4px" : "0.5rem",
   };
 
@@ -42,7 +52,7 @@ export function Skeleton({
 
   return (
     <div
-      className={cn("relative overflow-hidden", className)}
+      className={cn("relative overflow-hidden bg-muted", className)}
       style={{ ...baseStyles, ...variantStyles[variant], ...style }}
       {...props}
     >
@@ -53,7 +63,6 @@ export function Skeleton({
 
 interface SkeletonTextProps extends React.HTMLAttributes<HTMLDivElement> {
   lines?: number;
-  spacing?: number;
 }
 
 export function SkeletonText({ className, lines = 3, ...props }: SkeletonTextProps) {
@@ -66,25 +75,36 @@ export function SkeletonText({ className, lines = 3, ...props }: SkeletonTextPro
   );
 }
 
+// `showTitle` / `showDescription`, not `title` / `description`.
+//
+// `title?: boolean` is what broke the build: this interface extends
+// React.HTMLAttributes<HTMLDivElement>, which declares `title?: string` (the
+// real HTML tooltip attribute), so narrowing it to boolean is TS2430 —
+// "incorrectly extends… Types of property 'title' are incompatible". Renaming
+// is the fix rather than `Omit<…, "title">`, because a caller that wants a
+// tooltip on a skeleton card should still be able to pass one and get a string.
+// `description` did not conflict (React declares no such attribute) but is
+// renamed with it: a props pair where one member is prefixed and the other is
+// not is the kind of asymmetry that gets "fixed" back later.
 interface SkeletonCardProps extends React.HTMLAttributes<HTMLDivElement> {
-  title?: boolean;
-  description?: boolean;
+  showTitle?: boolean;
+  showDescription?: boolean;
   actions?: number;
   contentLines?: number;
 }
 
 export function SkeletonCard({
   className,
-  title = true,
-  description = true,
+  showTitle = true,
+  showDescription = true,
   actions = 1,
   contentLines = 3,
   ...props
 }: SkeletonCardProps) {
   return (
     <div className={cn("rounded-lg border border-border bg-card p-6 space-y-4", className)} {...props}>
-      {title && <Skeleton variant="text" style={{ width: "40%", height: "1.25rem" }} />}
-      {description && <Skeleton variant="text" style={{ width: "60%", height: "1rem" }} />}
+      {showTitle && <Skeleton variant="text" style={{ width: "40%", height: "1.25rem" }} />}
+      {showDescription && <Skeleton variant="text" style={{ width: "60%", height: "1rem" }} />}
       <SkeletonText lines={contentLines} />
       {actions > 0 && (
         <div className="flex gap-2 pt-2">
@@ -133,7 +153,7 @@ export function SkeletonTable({ columns, rows, className }: SkeletonTableProps) 
 }
 
 interface SkeletonListProps {
-  items: number;
+  items?: number;
   className?: string;
   avatar?: boolean;
   linesPerItem?: number;

@@ -2,7 +2,13 @@ import * as React from "react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "../../lib/utils";
 
-const buttonVariants = cva(
+// EXPORTED deliberately (2026-09-06). It was module-private, and that is a
+// direct cause of the unstyled-button bug fixed in components/ui/motion.tsx:
+// MotionButton could not reuse this recipe, so it rendered a bare
+// <motion.button> with only the caller's layout classes. Anything that renders
+// a button-shaped element that is not this <Button> must compose these classes
+// rather than re-describe them.
+export const buttonVariants = cva(
   "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
   {
     variants: {

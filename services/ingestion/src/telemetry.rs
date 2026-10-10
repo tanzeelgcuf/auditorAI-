@@ -96,7 +96,7 @@ mod tests {
         panic::set_hook(Box::new(move |info| {
             hook_count.store(true, Ordering::SeqCst);
             capture_panic(info); // GlitchTip capture path
-            chained(info);       // default-style stderr print
+            chained(info); // default-style stderr print
         }));
 
         // Panic in a spawned thread: the hook must run there and must NOT

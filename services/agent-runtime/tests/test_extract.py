@@ -393,8 +393,21 @@ def test_production_prompt_anchors_invoice_entity_type():
     et = EXTRACTION_PROMPT_TEMPLATE.split("entity_type:")[1]
     assert et.find("invoice_line_item") < et.find("gl_entry")
 
-def test_production_prompt_defaults_to_invoice():
-    from graph.extract import extract_entities, EXTRACTION_PROMPT_TEMPLATE
-    # No gl_entry default — the fallback is invoice_line_item
-    assert "item.get(\"entity_type\", \"invoice_line_item\")" in open(
-        os.path.join(os.path.dirname(__file__), "..", "graph", "extract.py")).read()
+def test_untyped_rows_keep_the_parser_type():
+    """UPDATED 2026-09-20 — this test used to be
+    test_production_prompt_defaults_to_invoice and pinned the OLD fail-open
+    default: `item.get("entity_type", "invoice_line_item")` fabricated an
+    invoice type for every row the model went silent on (observed live: the
+    GL rows' unclassified batch would have come back as ten invoices). The
+    default now keeps the parser's type — the parser's classification is
+    evidence; a fabricated type is not. Assert the new chain and that the
+    old bare default is gone."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "graph", "extract.py")).read()
+    # The parser's type is consulted before any fallback:
+    assert 'item.get("entity_type") or row.get("entity_type")' in src, (
+        "an untyped row must keep the parser's type, not default to invoice"
+    )
+    # The old fail-open default is gone:
+    assert 'item.get("entity_type", "invoice_line_item")' not in src, (
+        "the bare invoice default fabricated types for unclassified rows"
+    )

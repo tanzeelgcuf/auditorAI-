@@ -214,3 +214,11 @@ class _SequentialPipeline:
 
     async def arun(self, state: GraphState) -> GraphState:
         return self.run(state)
+
+    # ainvoke: the compiled graph's method name. main.py calls ainvoke on
+    # whichever object build_graph returned, so the fallback must expose the
+    # same surface — before this, the fallback had only arun while the
+    # compiled graph had only ainvoke, which is how the first real pipeline
+    # run died on AttributeError (2026-09-19).
+    async def ainvoke(self, state: GraphState) -> GraphState:
+        return self.run(state)

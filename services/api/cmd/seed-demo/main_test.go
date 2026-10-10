@@ -7,10 +7,11 @@ import (
 
 // TestDiscrepancySeverity checks the severity bands match the verification
 // decision graph (services/verification/decision-graphs/gl_reconciliation.json):
-//   info   = variance <= tolerance
-//   low    = tolerance < variance <= 10*tolerance
-//   medium = 10*tolerance < variance <= 100*tolerance
-//   high   = 100*tolerance < variance
+//
+//	info   = variance <= tolerance
+//	low    = tolerance < variance <= 10*tolerance
+//	medium = 10*tolerance < variance <= 100*tolerance
+//	high   = 100*tolerance < variance
 func TestDiscrepancySeverity(t *testing.T) {
 	cases := []struct {
 		name string

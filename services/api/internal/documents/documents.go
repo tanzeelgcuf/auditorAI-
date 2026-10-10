@@ -1,16 +1,20 @@
 package documents
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +26,10 @@ import (
 	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/storage"
 )
 
-const maxUploadSize = 25 * 1024 * 1024 // 25MB per doc 06 §5
+// 25MB. This constant is the one that actually rejects;
+// apps/web/components/upload/dropzone.tsx mirrors it as a client-side pre-check
+// and the two must be changed together.
+const maxUploadSize = 25 * 1024 * 1024
 
 var allowedDocTypes = map[string]string{
 	".pdf":  "invoice", // default; refined at extraction by content
@@ -35,6 +42,201 @@ var allowedDocTypes = map[string]string{
 	".qfx":  "bank_statement",
 }
 
+// refineDocTypeFromHeader classifies a CSV's header row into a doc type and
+// returns "" when the header carries no signal, in which case the caller
+// keeps the extension default. The signals are the ones the repo's own
+// fixtures carry: an account column is the GL signal (both shipped GL
+// headers have it — QuickBooks "Account", Xero "Account Code"), and
+// counterparty/customer/invoice is the invoice signal (the shipped invoice
+// header is "date,amount,description,counterparty,currency" — no account
+// column). The header extraction mirrors fetchColumnMap's idiom
+// (internal/pipeline/coordinator.go) so the two read a header the same way.
+// Guarded against the fixture files themselves in documents_test.go — a
+// re-headed fixture that changes the answer goes red instead of this rule
+// quietly rotting.
+//
+// NOT decided here, named so it is not mistaken for covered: a bank export
+// delivered as CSV (banks arrive as .ofx/.qfx, so this is outside the
+// supported set today) with an "Account Number" column would refine to
+// gl_export — wrong, but the same answer the extension gives today. A bank
+// signal (balance-style columns) would be a guess about exports this repo
+// has no fixture for, so it is not encoded.
+// classifyHeader maps a header row to a doc type; "" means no signal, in
+// which case the caller keeps the extension default. ONE implementation, two
+// extraction paths (CSV text and xlsx workbooks) feed it — so the two paths
+// cannot drift the way two implementations would.
+func classifyHeader(header []string) string {
+	hasAccount := false
+	hasInvoiceSignal := false
+	for _, h := range header {
+		lower := strings.ToLower(h)
+		if strings.Contains(lower, "account") {
+			hasAccount = true
+		}
+		if strings.Contains(lower, "counterparty") || strings.Contains(lower, "customer") ||
+			strings.Contains(lower, "invoice") {
+			hasInvoiceSignal = true
+		}
+	}
+	switch {
+	case hasAccount:
+		return "gl_export"
+	case hasInvoiceSignal:
+		return "invoice"
+	}
+	return ""
+}
+
+func refineDocTypeFromHeader(data []byte) string {
+	var header []string
+	if i := bytes.IndexByte(data, '\n'); i > 0 {
+		first := string(data[:i])
+		header = strings.Split(first, ",")
+		for j := range header {
+			header[j] = strings.TrimSpace(strings.Trim(header[j], `"'`))
+		}
+	}
+	if len(header) == 0 {
+		return ""
+	}
+	return classifyHeader(header)
+}
+
+// xlsxHeaderRow reads the first worksheet's header row from an xlsx (a zip
+// binary) — the "open and validate" the extension-only default skipped. Cell
+// values with t="s" resolve through xl/sharedStrings.xml by index; inline
+// strings carry their text in <is><t>; numeric cells are taken as-is.
+// Returns nil when the workbook cannot be opened or the first sheet has no
+// row, in which case the caller falls back to the CSV text extraction (a
+// .xlsx that is actually CSV text — the shipped sample_gl.xlsx fixture is
+// ASCII, not a zip).
+func xlsxHeaderRow(data []byte) []string {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil
+	}
+	var shared []string
+	for _, f := range zr.File {
+		if f.Name != "xl/sharedStrings.xml" {
+			continue
+		}
+		rc, openErr := f.Open()
+		if openErr != nil {
+			return nil
+		}
+		dec := xml.NewDecoder(rc)
+		inT := false
+		var cur strings.Builder
+		for {
+			tok, terr := dec.Token()
+			if terr != nil {
+				break
+			}
+			switch t := tok.(type) {
+			case xml.StartElement:
+				if t.Name.Local == "t" {
+					inT = true
+					cur.Reset()
+				}
+			case xml.CharData:
+				if inT {
+					cur.Write(t)
+				}
+			case xml.EndElement:
+				if t.Name.Local == "t" {
+					shared = append(shared, cur.String())
+					inT = false
+				}
+			}
+		}
+		rc.Close()
+		break
+	}
+	for _, f := range zr.File {
+		if f.Name != "xl/worksheets/sheet1.xml" {
+			continue
+		}
+		rc, openErr := f.Open()
+		if openErr != nil {
+			return nil
+		}
+		dec := xml.NewDecoder(rc)
+		var header []string
+		rowCount := 0
+		cellIsShared := false
+		inV := false
+		inInlineT := false
+		var cur strings.Builder
+		for {
+			tok, terr := dec.Token()
+			if terr != nil {
+				break
+			}
+			switch t := tok.(type) {
+			case xml.StartElement:
+				switch t.Name.Local {
+				case "row":
+					rowCount++
+					if rowCount > 1 {
+						rc.Close()
+						if len(header) > 0 {
+							return header
+						}
+						return nil
+					}
+				case "c":
+					cellIsShared = false
+					for _, a := range t.Attr {
+						if a.Name.Local == "t" && a.Value == "s" {
+							cellIsShared = true
+						}
+					}
+				case "v":
+					inV = true
+					cur.Reset()
+				case "t":
+					// the inline <t> inside <is>; sharedStrings has its own loop
+					inInlineT = true
+					cur.Reset()
+				}
+			case xml.CharData:
+				if inV || inInlineT {
+					cur.Write(t)
+				}
+			case xml.EndElement:
+				switch t.Name.Local {
+				case "v":
+					inV = false
+					if rowCount == 1 {
+						val := cur.String()
+						if cellIsShared {
+							idx, perr := strconv.Atoi(val)
+							if perr == nil && idx >= 0 && idx < len(shared) {
+								header = append(header, shared[idx])
+							}
+						} else {
+							header = append(header, val)
+						}
+					}
+				case "t":
+					if inInlineT {
+						inInlineT = false
+						if rowCount == 1 {
+							header = append(header, cur.String())
+						}
+					}
+				}
+			}
+		}
+		rc.Close()
+		if len(header) > 0 {
+			return header
+		}
+		return nil
+	}
+	return nil
+}
+
 type Service struct {
 	db       *pgxpool.Pool
 	pipeline *pipeline.EventClient
@@ -43,9 +245,9 @@ type Service struct {
 
 func NewService() *Service { return &Service{} }
 
-func (s *Service) SetDB(db *pgxpool.Pool)             { s.db = db }
+func (s *Service) SetDB(db *pgxpool.Pool)              { s.db = db }
 func (s *Service) SetPipeline(p *pipeline.EventClient) { s.pipeline = p }
-func (s *Service) SetStorage(st *storage.Client)        { s.storage = st }
+func (s *Service) SetStorage(st *storage.Client)       { s.storage = st }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -121,7 +323,52 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Malware scan (ClamAV) before the file enters the pipeline (doc 06 §5).
+	// The extension is a DEFAULT for the structured formats, and for .csv it
+	// is wrong as often as it is right: an invoice delivered as CSV is
+	// recorded gl_export, ingested as GL, and its rows land as gl_entry —
+	// invoice_line_item is 0 for any book whose invoices arrive this way and
+	// the 3-way reconciliation never assembles, with ocr_status='done'
+	// everywhere and no error anywhere. OBSERVED live 2026-09-20:
+	// sample_invoice.csv uploaded twice to the demo book, recorded gl_export
+	// both times; the book's extracted_entities held 50 gl_entry and 20
+	// bank_transaction and 0 invoice_line_item; every link pass refused to
+	// assemble. Refine from the header row — the bytes are in hand HERE,
+	// before the row is written, so the recorded doc_type is correct from
+	// birth rather than corrected after the fact. Mirrors the .pdf line's
+	// documented intent ("refined at extraction by content") and the
+	// ingestion's own FormatDetector (extension first, content to refine).
+	// .xlsx keeps the extension default: a real workbook is a zip binary the
+	// header extraction cannot read (the shipped sample_gl.xlsx fixture is
+	// ASCII text, so it rides the CSV path via the FormatDetector's content
+	// sniff — a real invoice .xlsx is a named gap). OFX/QFX are definitive
+	// bank_statement.
+	switch ext {
+	case ".csv":
+		if refined := refineDocTypeFromHeader(data); refined != "" {
+			if refined != docType {
+				slog.Info("doc_type refined from header", "filename", header.Filename, "was", docType, "now", refined)
+			}
+			docType = refined
+		}
+	case ".xlsx":
+		// A real workbook is a zip binary: open it and read the first
+		// worksheet's header rather than trusting the extension (rule 20). A
+		// .xlsx that is actually CSV text (the shipped sample_gl.xlsx fixture
+		// is ASCII) fails the zip open, so the CSV extraction applies instead —
+		// the same sniff either way, one classifyHeader implementation.
+		refined := ""
+		if workbookHeader := xlsxHeaderRow(data); workbookHeader != nil {
+			refined = classifyHeader(workbookHeader)
+		} else {
+			refined = refineDocTypeFromHeader(data)
+		}
+		if refined != "" && refined != docType {
+			slog.Info("doc_type refined from header", "filename", header.Filename, "was", docType, "now", refined)
+			docType = refined
+		}
+	}
+
+	// Malware scan (ClamAV) before the file enters the pipeline.
 	// Fail closed: if the scanner is unavailable, reject rather than accept unscanned.
 	if err := scanWithClamAV(r.Context(), data); err != nil {
 		if err == errInfected {
@@ -135,7 +382,7 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Content hash for duplicate detection (doc 07 §3)
+	// Content hash for duplicate detection
 	hash := sha256.Sum256(data)
 	contentHash := hex.EncodeToString(hash[:])
 
@@ -145,7 +392,7 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Duplicate check within the same book -> 409 (doc 07 §3)
+	// Duplicate check within the same book -> 409
 	var existingID string
 	err = c.QueryRow(r.Context(),
 		`SELECT id::text FROM source_documents
@@ -216,15 +463,18 @@ func (s *Service) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		"id": docID, "client_book_id": bookID, "filename": header.Filename,
 		"doc_type": docType, "ocr_status": "pending",
 	})
-	// Store idempotent response (non-fatal on failure — retry would reprocess)
-	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
-		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	// Non-fatal for THIS request — the 201 below is already decided. But it is logged,
+	// not discarded: a persistently failing store means every retry re-ingests the
+	// same upload, which is the exact duplicate this header exists to prevent.
+	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
+		slog.Error("idempotency store failed", "error", err, "doc_id", docID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)
 }
 
-// HandlePresignUpload (doc 12 §1) creates a document row + returns a presigned
+// HandlePresignUpload creates a document row + returns a presigned
 // PUT URL. The client uploads bytes directly to storage, then calls confirm.
 func (s *Service) HandlePresignUpload(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -292,7 +542,7 @@ func (s *Service) HandlePresignUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleConfirmUpload (doc 12 §1) verifies bytes landed in storage, computes the
+// HandleConfirmUpload verifies bytes landed in storage, computes the
 // content hash by streaming, then triggers ingestion via NATS.
 func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
@@ -346,7 +596,7 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stream + hash the object for duplicate detection (doc 07 §3).
+	// Stream + hash the object for duplicate detection.
 	data, err := s.storage.StreamObject(r.Context(), storageKey)
 	if err != nil {
 		slog.Error("failed to stream object", "error", err)
@@ -367,7 +617,7 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Malware scan before ingestion (doc 06 §5).
+	// Malware scan before ingestion.
 	if err := scanWithClamAV(r.Context(), data); err != nil {
 		if err == errInfected {
 			writeProblem(w, http.StatusUnprocessableEntity, "https://ai-auditor.dev/errors/malware",
@@ -379,9 +629,27 @@ func (s *Service) HandleConfirmUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// rule 20's class, second instance: HandlePresignUpload records a
+	// caller-specified doc_type that reaches ingestion unrefined — at confirm
+	// the bytes ARE in hand (StreamObject buffers them for hashing), so the
+	// same header-sniff applies HERE. The content is authoritative over the
+	// caller's presign label: classify_entity_type derives the entity type
+	// from doc_type (structured.rs:329), so a wrong label rides the whole
+	// pipeline exactly as the direct path's extension-only default did. The
+	// correction lands in the same UPDATE as the content hash, before the
+	// ingestion trigger carries doc_type onward.
+	if ext := strings.ToLower(path.Ext(storageKey)); ext == ".csv" {
+		if refined := refineDocTypeFromHeader(data); refined != "" {
+			if refined != docType {
+				slog.Info("doc_type refined at confirm", "doc_id", docID, "was", docType, "now", refined)
+			}
+			docType = refined
+		}
+	}
+
 	_, err = c.Exec(r.Context(),
-		`UPDATE source_documents SET content_hash = $1, ocr_status = 'pending' WHERE id = $2`,
-		contentHash, docID)
+		`UPDATE source_documents SET content_hash = $1, ocr_status = 'pending', doc_type = $2 WHERE id = $3`,
+		contentHash, docType, docID)
 	if err != nil {
 		slog.Error("failed to update doc hash", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "update failed")

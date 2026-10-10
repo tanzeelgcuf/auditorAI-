@@ -21,7 +21,9 @@ func dueWindow(sev string) int {
 }
 
 // dueDate approximates the SQL expression
-//   created_at::date + days + 2*(days/7)
+//
+//	created_at::date + days + 2*(days/7)
+//
 // which adds the severity window plus weekend padding for the business-day
 // interpretation. Matches the dashboard's past-due predicate.
 func dueDate(created time.Time, sev string) time.Time {
@@ -35,7 +37,7 @@ func TestDueDateLogic(t *testing.T) {
 		sev  string
 		want time.Time
 	}{
-		{"high", base.AddDate(0, 0, 2)},  // 2bd -> Wed Jan 7
+		{"high", base.AddDate(0, 0, 2)},   // 2bd -> Wed Jan 7
 		{"medium", base.AddDate(0, 0, 9)}, // 7bd -> +7 days + 2 weekend days
 		{"low", base.AddDate(0, 0, 38)},   // 30bd -> +30 + 8
 		{"info", base},                    // no due window

@@ -6,7 +6,11 @@ import { motion } from "framer-motion";
 export interface CitationTarget {
   findingId: string;
   pageNumber: number;
-  bbox: { x: number; y: number; width: number; height: number };
+  // null for structured sources: no page geometry exists. The overlay
+  // returns null when there is nothing to highlight, and the report page
+  // shows a clear "structured export" message instead of a broken-looking
+  // empty box.
+  bbox: { x: number; y: number; width: number; height: number } | null;
 }
 
 interface CitationOverlayProps {
@@ -20,7 +24,10 @@ interface CitationOverlayProps {
  * coordinates map directly to percentage positions.
  */
 export function CitationOverlay({ active, onSelect }: CitationOverlayProps) {
-  if (!active) return null;
+  // A citation with no bbox is a structured source: there is no geometry to
+  // highlight, so render nothing — the report page carries the clear
+  // "structured export" message for this state.
+  if (!active || !active.bbox) return null;
 
   return (
     <motion.div

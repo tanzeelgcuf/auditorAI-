@@ -47,7 +47,7 @@ doc for our eventual formal SOC2 Type II audit.
 |---|---|---|
 | Firm-admin vs staff roles | ✅ | `users.role` + `RequireRole` middleware |
 | Book-assignment scoping | ✅ | `user_book_assignments`; firm_admin auto-gets all books |
-| Optional segregation of duties (preparer ≠ reviewer) | ✅ | `client_books.require_separate_reviewer` (doc 10 §3) |
+| Optional segregation of duties (preparer ≠ reviewer) | ✅ | `client_books.require_separate_reviewer` |
 
 ### CC6.4 — Segregation of duties / CC6.5 — User identification
 | Control | Status | Evidence / Notes |

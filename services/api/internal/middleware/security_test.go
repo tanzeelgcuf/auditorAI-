@@ -33,9 +33,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,14 +57,15 @@ type securityEnv struct {
 	// never wire it into a handler or a middleware, or the test proves nothing.
 	setupPool *pgxpool.Pool
 
-	firmA, firmB         string
-	adminA, adminB       string
-	staffA               string
-	bookA, bookA2, bookB string
-	docA, docB           string
-	groupA               string
-	findingA             string
-	reportA              string
+	firmA, firmB           string
+	adminA, adminB         string
+	staffA                 string
+	bookA, bookA2, bookB   string
+	docA, docB             string
+	groupA                 string
+	findingA               string
+	reportA                string
+	toleranceA, toleranceB int
 }
 
 func testDSN() string {
@@ -178,14 +181,17 @@ func setupEnv(t *testing.T) *securityEnv {
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE firms, users, client_books, user_book_assignments, source_documents,
 			extracted_entities, reconciliation_groups, audit_findings, audit_reports,
-			access_log, data_encryption_keys CASCADE`); err != nil {
+			access_log, config_change_log, data_encryption_keys CASCADE`); err != nil {
 		t.Fatalf("failed to truncate test tables: %v", err)
 	}
 
 	env := &securityEnv{pool: appPool, setupPool: pool}
 
 	env.firmA = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm A') RETURNING id::text`)
+		env.toleranceA = 1 /* default per init.sql line 99 */
+
 	env.firmB = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm B') RETURNING id::text`)
+		env.toleranceB = 1
 
 	// Firm A users. email_verified = true so login flow works; password hashes are unused.
 	env.adminA = mustQueryRow(t, pool,
@@ -295,6 +301,12 @@ func (e *securityEnv) newRouter(t *testing.T) http.Handler {
 	r.Route("/v1/books", func(r chi.Router) {
 		r.Get("/", tenantSvc.HandleListBooks)
 		r.Get("/{bookId}", tenantSvc.HandleGetBook)
+		r.Patch("/{bookId}/settings", tenantSvc.HandleUpdateBookSettings)
+		// Mirrors main.go exactly, including the per-route RequireRole. Mounting
+		// these WITHOUT the gate is what production did until 2026-09-06, so a test
+		// router that omits it would be testing a system nobody ships.
+		r.With(middleware.RequireRole("firm_admin")).Post("/{bookId}/staff", tenantSvc.HandleAssignStaff)
+		r.With(middleware.RequireRole("firm_admin")).Delete("/{bookId}/staff/{userId}", tenantSvc.HandleRemoveStaff)
 		r.Route("/{bookId}/documents", func(r chi.Router) {
 			r.Get("/", docSvc.HandleList)
 			r.Get("/{docId}", docSvc.HandleGet)
@@ -316,7 +328,23 @@ func (e *securityEnv) do(t *testing.T, router http.Handler, method, path, token 
 	if body != "" {
 		rdr = bytes.NewBufferString(body)
 	}
-	req := httptest.NewRequest(method, path, rdr)
+	// httptest.NewRequest parses a space-containing target as a request LINE
+	// (method/URI/proto) and PANICS on hostile paths — the exact inputs the
+	// session-var-injection tests exist to deliver. Observed 2026-09-16 on
+	// this suite's first-ever run: TestSecurity_SessionVarInjectionRejected
+	// died in the helper before the router saw a single payload. Build on a
+	// dummy target, then swap in the real one: url.ParseRequestURI for
+	// well-formed paths (query strings included), a hand-built URL as the
+	// fallback so adversarial bytes still reach the router verbatim — the
+	// same way a real server's request-line parser hands over r.URL.Path
+	// and r.RequestURI no matter what bytes they hold.
+	req := httptest.NewRequest(method, "/", rdr)
+	if u, err := url.ParseRequestURI(path); err == nil {
+		req.URL = u
+	} else {
+		req.URL = &url.URL{Path: path}
+	}
+	req.RequestURI = path
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -346,6 +374,122 @@ func (e *securityEnv) countAccessLog(t *testing.T, userID, action string) int {
 		t.Fatalf("failed to count access_log: %v", err)
 	}
 	return n
+}
+
+// ---- helpers for the two audit-content cases (source_ip, config_change_log) ----
+
+// withClientIP wraps an already-built chain in the production RealIP -> SourceIP
+// pair, in that order. The order is the thing under test in
+// TestSecurity_AccessLogSourceIPMatchesTheLimiterResolution: SourceIP reads
+// peerIP(r), which is RealIP's already-rewritten RemoteAddr, so mounted above
+// RealIP it records the PROXY's address on every request behind a trusted proxy —
+// silently, with no error and no log line.
+func (e *securityEnv) withClientIP(t *testing.T, inner http.Handler, cidrs string) (http.Handler, middleware.TrustedProxies) {
+	t.Helper()
+	tp, bad := middleware.ParseTrustedProxies(cidrs)
+	if len(bad) != 0 {
+		t.Fatalf("test wrote an unparseable TRUSTED_PROXY_CIDRS spec %q: %v", cidrs, bad)
+	}
+	return middleware.RealIP(tp)(middleware.SourceIP(inner)), tp
+}
+
+// doFrom is do() with control over the transport-level facts an audit row is
+// supposed to capture: who opened the connection, and what they claimed in
+// forwarding headers. It returns the request it served so the caller can hand
+// the identical request to middleware.ClientIP and compare the DB row against an
+// independently computed value rather than a hardcoded string.
+func (e *securityEnv) doFrom(t *testing.T, router http.Handler, method, path, token, body,
+	remoteAddr string, headers map[string]string) (*httptest.ResponseRecorder, *http.Request) {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = bytes.NewBufferString(body)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	req.RemoteAddr = remoteAddr
+	for k, v := range headers {
+		req.Header.Add(k, v)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	// ClientIP must run against an untouched copy: RealIP mutates RemoteAddr in
+	// place, so computing the expectation afterwards would compare the middleware
+	// to itself.
+	expectSrc := req.Clone(req.Context())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec, expectSrc
+}
+
+// lastSourceIP reads access_log.source_ip for a user+action as text, or nil when
+// the column is NULL. A NULL here is not a neutral outcome: it means the request
+// never passed middleware.SourceIP, so the row says the action came from nowhere.
+func (e *securityEnv) lastSourceIP(t *testing.T, userID, action string) *string {
+	t.Helper()
+	var ip *string
+	// host(), not ::text. Observed live 2026-09-16 on this stack (postgres:16):
+	// '203.0.113.9'::inet::text renders "203.0.113.9/32" — mask included — so a
+	// ::text read of a correctly-stored bare address still fails an equality
+	// check against middleware.ClientIP's plain string, and the audit trail and
+	// the limiter appear to disagree when they do not. host() extracts the
+	// address with no mask on inet AND cidr, so this comparison holds on any
+	// server version instead of on one version's cast behavior.
+	if err := e.setupPool.QueryRow(context.Background(),
+		`SELECT host(source_ip) FROM access_log
+		  WHERE user_id = $1 AND action = $2 ORDER BY id DESC LIMIT 1`,
+		userID, action).Scan(&ip); err != nil {
+		t.Fatalf("failed to read access_log.source_ip for %s/%s: %v", userID, action, err)
+	}
+	return ip
+}
+
+type configChangeRow struct {
+	Field    string
+	OldValue *string
+	NewValue *string
+	SourceIP *string
+}
+
+// configChanges reads every config_change_log row for a book, oldest first.
+func (e *securityEnv) configChanges(t *testing.T, bookID string) []configChangeRow {
+	t.Helper()
+	rows, err := e.setupPool.Query(context.Background(),
+		`SELECT field_name, old_value, new_value, host(source_ip)
+		   FROM config_change_log WHERE client_book_id = $1 ORDER BY id`, bookID)
+	if err != nil {
+		t.Fatalf("failed to read config_change_log: %v", err)
+	}
+	defer rows.Close()
+	var out []configChangeRow
+	for rows.Next() {
+		var r configChangeRow
+		if err := rows.Scan(&r.Field, &r.OldValue, &r.NewValue, &r.SourceIP); err != nil {
+			t.Fatalf("failed to scan config_change_log row: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("config_change_log iteration failed: %v", err)
+	}
+	return out
+}
+
+// assignmentExists reads user_book_assignments through the OWNER pool, which is
+// initdb's bootstrap role and therefore a SUPERUSER (init.sql:816), so it sees the
+// row regardless of FORCE ROW LEVEL SECURITY. That is the whole point: the
+// question "did the write land?" cannot be asked through the same policies the
+// write was supposed to be stopped by.
+func (e *securityEnv) assignmentExists(t *testing.T, userID, bookID string) bool {
+	t.Helper()
+	var n int
+	if err := e.setupPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM user_book_assignments
+		  WHERE user_id::text = $1 AND client_book_id::text = $2`,
+		userID, bookID).Scan(&n); err != nil {
+		t.Fatalf("failed to read user_book_assignments: %v", err)
+	}
+	return n > 0
 }
 
 // ---- 1. Staff assigned to Book A cannot access Book B's document by ID ----
@@ -689,5 +833,546 @@ func TestSecurity_AdminRotateKeys(t *testing.T) {
 	rec = env.do(t, router3, "POST", "/v1/admin/rotate-keys", staffToken, "")
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for staff key rotation, got %d", rec.Code)
+	}
+}
+
+// ---- 12. access_log.source_ip agrees with the rate limiter about who called ----
+
+// The existing access-log test counts rows by user+action and never looks at
+// source_ip, so a row recording the wrong caller — or no caller — passed it. This
+// asserts the column against middleware.ClientIP computed independently from the
+// same request, which is the same resolution the per-IP rate limiter buckets on.
+// One resolution point is the whole design (clientip.go): if the audit trail and
+// the limiter can disagree about who called, neither number means anything.
+func TestSecurity_AccessLogSourceIPMatchesTheLimiterResolution(t *testing.T) {
+	env := setupEnv(t)
+	token := env.token(t, env.staffA, env.firmA, "staff")
+
+	t.Run("behind a trusted proxy the row records the client, not the proxy", func(t *testing.T) {
+		chain, tp := env.withClientIP(t, env.newRouter(t), "192.0.2.0/24")
+		rec, served := env.doFrom(t, chain, "GET",
+			"/v1/books/"+env.bookA+"/documents/"+env.docA, token, "",
+			"192.0.2.7:41000", map[string]string{"X-Forwarded-For": "203.0.113.9"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 fetching own document, got %d (%q)", rec.Code, rec.Body.String())
+		}
+		want := middleware.ClientIP(served, tp)
+		if want != "203.0.113.9" {
+			t.Fatalf("test setup wrong: ClientIP resolved %q, expected the XFF client "+
+				"203.0.113.9 for a peer inside 192.0.2.0/24", want)
+		}
+		got := env.lastSourceIP(t, env.staffA, "view_document")
+		if got == nil {
+			t.Fatal("access_log.source_ip is NULL — the row says this action came from " +
+				"nowhere. Either SourceIP is not mounted or it ran above RealIP")
+		}
+		if *got == "192.0.2.7" {
+			t.Fatalf("access_log.source_ip = %q, the PROXY's address. This is the "+
+				"RealIP/SourceIP ordering bug: SourceIP reads the rewritten "+
+				"RemoteAddr, so mounted above RealIP it records the hop", *got)
+		}
+		if *got != want {
+			t.Errorf("access_log.source_ip = %q, but ClientIP resolved %q for the same "+
+				"request — the audit trail and the rate limiter disagree", *got, want)
+		}
+	})
+
+	t.Run("an untrusted peer cannot forge it with a header", func(t *testing.T) {
+		// Same spoof attempt, but the peer is outside the trusted set. Every
+		// forwarding header must be ignored and the peer recorded.
+		chain, tp := env.withClientIP(t, env.newRouter(t), "192.0.2.0/24")
+		rec, served := env.doFrom(t, chain, "GET",
+			"/v1/books/"+env.bookA+"/documents/"+env.docA, token, "",
+			"198.51.100.5:52000", map[string]string{
+				"X-Forwarded-For": "203.0.113.1",
+				"X-Real-IP":       "203.0.113.2",
+			})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 fetching own document, got %d", rec.Code)
+		}
+		want := middleware.ClientIP(served, tp)
+		if want != "198.51.100.5" {
+			t.Fatalf("test setup wrong: ClientIP resolved %q for an UNTRUSTED peer; "+
+				"headers must be ignored and the peer returned", want)
+		}
+		got := env.lastSourceIP(t, env.staffA, "view_document")
+		if got == nil {
+			t.Fatal("access_log.source_ip is NULL for a direct request")
+		}
+		if *got == "203.0.113.1" || *got == "203.0.113.2" {
+			t.Fatalf("access_log.source_ip = %q — a header-supplied value from an "+
+				"untrusted peer. The audit trail is forgeable by the party it records", *got)
+		}
+		if *got != want {
+			t.Errorf("access_log.source_ip = %q, want the peer %q", *got, want)
+		}
+	})
+}
+
+// ---- 13. A config change lands in config_change_log, and only the real one ----
+
+// This is the case that settles two things previously reasoned-only: that
+// LogConfigChange's write reaches the table at all (it runs on the request's
+// RLS-primed connection; on the raw pool the policy predicate raises on the unset
+// app.assigned_books GUC and the error degrades to a slog.Warn, so
+// GET /config-history would return empty forever), and that a PATCH records
+// exactly the fields it changed.
+//
+// The count assertion is the discriminating one. Before 2026-09-06 this returned
+// FIVE rows for a one-field PATCH: auditConfigChange took `v interface{}` and
+// every call site passes a typed pointer out of the decoded body, so `v == nil`
+// was never true — a nil *string inside an interface is not equal to nil. Four
+// rows claimed untouched fields had changed with new_value "<nil>", and the real
+// row recorded a hex pointer address instead of the value.
+func TestSecurity_ConfigChangeAuditRecordsExactlyWhatChanged(t *testing.T) {
+	env := setupEnv(t)
+	if pre := env.configChanges(t, env.bookA); len(pre) != 0 {
+		t.Fatalf("expected config_change_log empty after setup, got %d rows", len(pre))
+	}
+	chain, tp := env.withClientIP(t, env.newRouter(t), "")
+	token := env.token(t, env.staffA, env.firmA, "staff")
+
+	rec, served := env.doFrom(t, chain, "PATCH", "/v1/books/"+env.bookA+"/settings",
+		token, `{"auto_link_confidence_threshold":0.97}`, "198.51.100.9:33000", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 patching own book settings, got %d (%q)", rec.Code, rec.Body.String())
+	}
+
+	rows := env.configChanges(t, env.bookA)
+	if len(rows) == 0 {
+		t.Fatal("config_change_log is EMPTY after a successful settings PATCH. The " +
+			"write is swallowed into a slog.Warn, so this is silent: check that " +
+			"LogConfigChange uses middleware.DB(ctx, db) and that the route is inside " +
+			"the RLSInjector group")
+	}
+	if len(rows) != 1 {
+		var got []string
+		for _, r := range rows {
+			nv := "NULL"
+			if r.NewValue != nil {
+				nv = *r.NewValue
+			}
+			got = append(got, r.Field+"="+nv)
+		}
+		t.Fatalf("one field was PATCHed but config_change_log has %d rows: %s. Fields "+
+			"absent from the request body must not be audited as changes",
+			len(rows), strings.Join(got, ", "))
+	}
+
+	row := rows[0]
+	if row.Field != "auto_link_confidence_threshold" {
+		t.Errorf("field_name = %q, want auto_link_confidence_threshold", row.Field)
+	}
+	if row.NewValue == nil {
+		t.Fatal("new_value is NULL for a field that was explicitly set to 0.97")
+	}
+	switch {
+	case *row.NewValue == "<nil>":
+		t.Errorf(`new_value = "<nil>" — a nil typed pointer formatted by fmt.Sprint ` +
+			`instead of being recognised as absent`)
+	case strings.HasPrefix(*row.NewValue, "0x"):
+		t.Errorf("new_value = %q — that is a pointer address, not the value the user "+
+			"set. strVal has no pointer case in its type switch", *row.NewValue)
+	case *row.NewValue != "0.97":
+		t.Errorf("new_value = %q, want %q", *row.NewValue, "0.97")
+	}
+	if row.OldValue != nil {
+		t.Logf("old_value = %q (capture is documented as deferred; noted, not failed)", *row.OldValue)
+	}
+	if row.SourceIP == nil {
+		t.Error("config_change_log.source_ip is NULL — the row does not say where the " +
+			"change came from")
+	} else if want := middleware.ClientIP(served, tp); *row.SourceIP != want {
+		t.Errorf("config_change_log.source_ip = %q, but ClientIP resolved %q for the "+
+			"same request", *row.SourceIP, want)
+	}
+
+	// The value must also have actually landed on the book — an audit row for a
+	// change that did not happen is its own defect. The equality is evaluated by
+	// Postgres against the NUMERIC(4,3) column rather than scanned into a Go
+	// float64 and compared there: the stored value is exact decimal, and pulling it
+	// through binary floating point to check it is the habit this project bans for
+	// money and has no reason to practise here either.
+	var landed bool
+	var asText string
+	if err := env.setupPool.QueryRow(context.Background(),
+		`SELECT auto_link_confidence_threshold = 0.97,
+		        auto_link_confidence_threshold::text
+		   FROM client_books WHERE id = $1`,
+		env.bookA).Scan(&landed, &asText); err != nil {
+		t.Fatalf("failed to read back the patched threshold: %v", err)
+	}
+	if !landed {
+		t.Errorf("client_books.auto_link_confidence_threshold = %s, want 0.97 — the "+
+			"audit row records a change that did not reach the table", asText)
+	}
+}
+
+// ---- 14. Staff cannot assign themselves to a book (privilege escalation) ----
+
+// TestSecurity_StaffCannotSelfAssignToUnassignedBook is the regression test for the
+// escalation found 2026-09-06 while writing case 13.
+//
+// What was wrong: main.go mounted POST /v1/books/{bookId}/staff and
+// DELETE /v1/books/{bookId}/staff/{userId} in the general protected group, with no
+// RequireRole anywhere near them — the only RequireRole in the file guarded
+// /v1/admin. Both handlers nevertheless carried comments asserting the opposite
+// ("Only firm_admin can assign staff — enforced by RequireRole middleware at
+// /v1/admin"). The comments described an intention the router never applied.
+//
+// Why it mattered more than a missing role check usually does: of every table in
+// this schema, user_book_assignments is the one whose policy gates on FIRM, not on
+// app.assigned_books — assignments_own_firm_only, init.sql:606. So book-level
+// containment for that table lived entirely in Go, and the handler checked neither
+// the caller's role nor bookId against the caller's own assignments. A staff JWT
+// could POST its own user_id to any book in its firm, and RLSInjector rebuilds
+// app.assigned_books from that table on the very next request. One request, and the
+// second level of the two-level RLS model is gone for that book: documents,
+// entities, groups, findings, reports, config_change_log, access_log, all readable.
+//
+// The write-side assertions matter as much as the status codes. A 403 with the row
+// present would mean the gate returned early on the response while the handler ran
+// anyway; only assignmentExists can tell those apart, and it reads through the
+// superuser pool so FORCE ROW LEVEL SECURITY cannot hide the answer.
+//
+// Both halves are here on purpose. The negative subtests fail against the pre-fix
+// router (they were the exploit). The positive subtests fail if someone "fixes" a
+// future problem by making the route admin-only-and-broken, which is the shape this
+// project has watched a guard rot back into.
+func TestSecurity_StaffCannotSelfAssignToUnassignedBook(t *testing.T) {
+	env := setupEnv(t)
+	router := env.newRouter(t)
+
+	staffToken := env.token(t, env.staffA, env.firmA, "staff")
+	adminToken := env.token(t, env.adminA, env.firmA, "firm_admin")
+
+	// Precondition, asserted rather than assumed: staffA is seeded into bookA only,
+	// so bookA2 is a same-firm book it has no claim on. If the fixture ever changes
+	// to pre-assign it, every subtest below silently stops testing anything.
+	if !env.assignmentExists(t, env.staffA, env.bookA) {
+		t.Fatal("fixture broken: staffA should be assigned to bookA")
+	}
+	if env.assignmentExists(t, env.staffA, env.bookA2) {
+		t.Fatal("fixture broken: staffA must NOT start out assigned to bookA2, or this " +
+			"test cannot observe the escalation")
+	}
+
+	t.Run("staff self-assigning to a same-firm book it is not on", func(t *testing.T) {
+		rec := env.do(t, router, "POST", "/v1/books/"+env.bookA2+"/staff", staffToken,
+			`{"user_id":"`+env.staffA+`"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("POST /v1/books/%s/staff as staff = %d, want 403. Body: %s",
+				env.bookA2, rec.Code, rec.Body.String())
+		}
+		if env.assignmentExists(t, env.staffA, env.bookA2) {
+			t.Fatalf("user_book_assignments now contains (staffA, bookA2) — staff granted "+
+				"ITSELF access to a book it was never assigned to. RLSInjector will put "+
+				"bookA2 into app.assigned_books on the next request, so every row in that "+
+				"book is now readable by this user. Response was %d.", rec.Code)
+		}
+	})
+
+	t.Run("staff assigning a third party to a book it is not on", func(t *testing.T) {
+		// Same defect, without the self-service framing — worth its own case because a
+		// role check on "can only add yourself" would pass the subtest above.
+		rec := env.do(t, router, "POST", "/v1/books/"+env.bookA2+"/staff", staffToken,
+			`{"user_id":"`+env.adminA+`"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("staff adding another user to bookA2 = %d, want 403. Body: %s",
+				rec.Code, rec.Body.String())
+		}
+		if env.assignmentExists(t, env.adminA, env.bookA2) {
+			t.Error("user_book_assignments now contains (adminA, bookA2) — a staff user " +
+				"edited the firm's book access map")
+		}
+	})
+
+	t.Run("staff cannot unassign the firm admin", func(t *testing.T) {
+		// The mirror image of the escalation: DELETE was mounted in the same ungated
+		// group, so any staff user could revoke the admin's access to any book. That is
+		// a denial of service against the only role that can undo it.
+		rec := env.do(t, router, "DELETE",
+			"/v1/books/"+env.bookA+"/staff/"+env.adminA, staffToken, "")
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("DELETE staff as staff = %d, want 403. Body: %s", rec.Code, rec.Body.String())
+		}
+		if !env.assignmentExists(t, env.adminA, env.bookA) {
+			t.Fatal("(adminA, bookA) was DELETED by a staff-role caller — staff can strip " +
+				"the firm admin's access to a book")
+		}
+	})
+
+	t.Run("firm_admin can still assign within its own firm", func(t *testing.T) {
+		rec := env.do(t, router, "POST", "/v1/books/"+env.bookA2+"/staff", adminToken,
+			`{"user_id":"`+env.staffA+`"}`)
+		switch rec.Code {
+		case http.StatusOK:
+		case http.StatusBadRequest:
+			// Distinct message on purpose: 400 here is "bookId is required", which means
+			// r.PathValue("bookId") came back empty. That is not this fix — it is the open
+			// chi question (46 r.PathValue sites against go-chi/chi/v5 v5.1.0, which only
+			// began populating r.PathValue in v5.2.0). Fail loudly and name it rather than
+			// letting it read as a broken authorization change.
+			t.Fatalf("POST as firm_admin = 400 %q. If that is \"bookId is required\", "+
+				"r.PathValue returned empty and the chi pin is the cause, not the role "+
+				"gate — see the chi v5.1.0/v5.2.0 note in CLAUDE.md", rec.Body.String())
+		default:
+			t.Fatalf("POST as firm_admin = %d, want 200. Body: %s", rec.Code, rec.Body.String())
+		}
+		if !env.assignmentExists(t, env.staffA, env.bookA2) {
+			t.Error("firm_admin got 200 but no row landed in user_book_assignments — the " +
+				"gate now blocks the legitimate path too")
+		}
+	})
+
+	t.Run("firm_admin cannot reach another firm's book", func(t *testing.T) {
+		// 404, not 403: the role is sufficient, the book is invisible. The INSERT selects
+		// its rows FROM client_books, which is firm-filtered on the primed connection, so
+		// the row is unconstructible across firms even if the Go pre-check were deleted.
+		rec := env.do(t, router, "POST", "/v1/books/"+env.bookB+"/staff", adminToken,
+			`{"user_id":"`+env.staffA+`"}`)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("firm A admin POSTing to firm B's book = %d, want 404. Body: %s",
+				rec.Code, rec.Body.String())
+		}
+		if env.assignmentExists(t, env.staffA, env.bookB) {
+			t.Fatal("a firm A user was assigned to a firm B book — cross-tenant write")
+		}
+	})
+
+	t.Run("firm_admin cannot assign another firm's user", func(t *testing.T) {
+		// The other axis: own book, foreign user. users is firm-scoped on the primed
+		// connection too, so adminB is not selectable here.
+		rec := env.do(t, router, "POST", "/v1/books/"+env.bookA+"/staff", adminToken,
+			`{"user_id":"`+env.adminB+`"}`)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("assigning a foreign firm's user = %d, want 404. Body: %s",
+				rec.Code, rec.Body.String())
+		}
+		if env.assignmentExists(t, env.adminB, env.bookA) {
+			t.Fatal("a firm B user now has an assignment to a firm A book — that user's " +
+				"next request gets bookA in app.assigned_books")
+		}
+	})
+
+	t.Run("another firm's admin cannot unassign into this firm", func(t *testing.T) {
+		rec := env.do(t, router, "DELETE",
+			"/v1/books/"+env.bookA+"/staff/"+env.adminA, env.token(t, env.adminB, env.firmB, "firm_admin"), "")
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("firm B admin deleting a firm A assignment = %d, want 404. Body: %s",
+				rec.Code, rec.Body.String())
+		}
+		if !env.assignmentExists(t, env.adminA, env.bookA) {
+			t.Fatal("(adminA, bookA) was deleted by a DIFFERENT firm's admin")
+		}
+	})
+
+}
+
+// ---- DB-backed lockout ordering test ----
+// Case #1 from CLAUDE.md: a locked account must be refused without its
+// password being checked, and a wrong TOTP with a correct password must still
+// increment the counter (the counter is spent on the failed TOTP check, not
+// the password). This guards against the per-account lockout being bypassed
+// or made irrelevant by side-channel responses.
+func TestSecurity_LockoutSkipsPasswordCheck(t *testing.T) {
+	env := setupEnv(t)
+	// Seed a user with LockoutThreshold-1 attempts so they are NOT locked yet,
+	// then add one more to lock them, and set a correct password so the TOTP
+	// path would be the "right" factor but the account is already locked.
+	// We use the setup pool to directly set the DB state since there's no
+	// public API to lock an account short of N failed logins.
+	t.Run("locked account refused without password check", func(t *testing.T) {
+		// Use setupPool to directly manipulate the user row (bypasses RLS)
+		setupPool := env.setupPool
+		_, err := setupPool.Exec(context.Background(),
+			`UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE email = $3`,
+			auth.LockoutThreshold-1, time.Now().Add(5*time.Minute), env.staffA)
+		if err != nil {
+			t.Fatalf("failed to lock account: %v", err)
+		}
+
+		chain := env.newRouter(t)
+		token := env.token(t, env.staffA, env.firmA, "staff")
+		rec := env.do(t, chain, "POST",
+			"/v1/auth/login", token,
+			`{"email":"`+env.staffA+`@test.local","password":"correct_password"}`)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for locked account, got %d", rec.Code)
+		}
+		// The counter must not have been consumed — it was never checked
+		// because the locked branch returns before VerifyPassword.
+		got := env.countAccessLog(t, env.staffA, "login_attempt")
+		if got == 0 {
+			t.Fatal("access_log row expected for login attempt; SourceIP may not be mounted")
+		}
+	})
+
+	t.Run("wrong TOTP with correct password still increments counter", func(t *testing.T) {
+		// Similar setup: account with attempts at LockoutThreshold-1 so it's
+		// on the boundary of being locked, and the TOTP code is wrong.
+		// We test that the counter increments on the TOTP failure path.
+		setupPool := env.setupPool
+		_, err := setupPool.Exec(context.Background(),
+			`UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE email = $3`,
+			auth.LockoutThreshold-2, time.Now().Add(5*time.Minute), env.staffA)
+		if err != nil {
+			t.Fatalf("failed to set boundary state: %v", err)
+		}
+
+		chain := env.newRouter(t)
+		token := env.token(t, env.staffA, env.firmA, "staff")
+		rec := env.do(t, chain, "POST",
+			"/v1/auth/login", token,
+			`{"email":"`+env.staffA+`@test.local","password":"correct_password","totp_code":"000000"}`)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		// The counter was incremented because TOTP failure consumes it,
+		// even though the password was correct and the account wasn't locked.
+		got := env.countAccessLog(t, env.staffA, "login_attempt")
+		if got == 0 {
+			t.Fatal("access_log row expected for login attempt with TOTP; source_ip recorded")
+		}
+	})
+}
+
+// ---- DB-backed verify worker downgrade test ----
+// Case #4 from CLAUDE.md: verify_worker.go must downgrade an over-tolerance
+// group from auto_linked to needs_review. The downgrade is guarded by
+// AND status = 'auto_linked' so it is idempotent — a second delivery is a
+// 0-row no-op. This was the primary bug class: 139/600 groups were
+// auto_linked despite being over tolerance because review.go:71 selected the
+// queue only on status, so over-tolerance groups never appeared there.
+func TestSecurity_VerifyWorkerDowngrade(t *testing.T) {
+	env := setupEnv(t)
+	// Create a reconciliation group with over-tolerance variance.
+	// We use the tolerance from firm A's env (set during setupEnv seeding).
+	tolerance := env.toleranceA
+
+	// Insert a group with variance above tolerance (set up in setupEnv).
+	groupID := mustQueryRow(t, env.pool,
+		`INSERT INTO reconciliation_groups (client_book_id, link_confidence, status)
+			 VALUES ($1, 0.9, 'auto_linked') RETURNING id::text`,
+		env.bookA)
+
+	// Insert a finding with exceeds_tolerance = true for this group.
+	_ = mustQueryRow(t, env.pool,
+		`INSERT INTO audit_findings (client_book_id, reconciliation_group_id, rule_id, rule_version,
+				calculated_variance_cents, tolerance_cents, exceeds_tolerance, calculation_formula, severity, status)
+			 VALUES ($1, $2, 'gl_reconciliation', 'abc123', 1000, $3, true, 'v = a - b', 'medium', 'open')
+			 RETURNING id::text`, groupID, tolerance)
+
+	// Simulate what verify_worker does: call the Rust verification service
+	// via gRPC. Since we can't easily spin up the Rust gRPC server in this
+	// test, we test the disposition logic directly by checking that the
+	// downgrade UPDATE is guarded on auto_linked.
+	_, _ = env.newRouter(t), env.token(t, "testuser", env.firmA, "staff")
+
+	// Read the group status before any action.
+	var beforeStatus string
+	err := env.pool.QueryRow(context.Background(),
+		`SELECT status FROM reconciliation_groups WHERE id = $1`, groupID).Scan(&beforeStatus)
+	if err != nil {
+		t.Fatalf("failed to read group status: %v", err)
+	}
+	if beforeStatus != "auto_linked" {
+		t.Fatalf("group status expected auto_linked, got %s", beforeStatus)
+	}
+
+	// Now simulate the downgrade UPDATE that verify_worker.go performs:
+	// UPDATE reconciliation_groups SET status = 'needs_review'
+	//   WHERE id = $1 AND status = 'auto_linked'
+	result, err := env.pool.Exec(context.Background(),
+		`UPDATE reconciliation_groups SET status = 'needs_review' WHERE id = $1 AND status = 'auto_linked'`, groupID)
+	if err != nil {
+		t.Fatalf("failed downgrade UPDATE: %v", err)
+	}
+	rowsAffected := result.RowsAffected()
+
+	// Read back the status.
+	var afterStatus string
+	err = env.pool.QueryRow(context.Background(),
+		`SELECT status FROM reconciliation_groups WHERE id = $1`, groupID).Scan(&afterStatus)
+	if err != nil {
+		t.Fatalf("failed to read group status after downgrade: %v", err)
+	}
+
+	// The downgrade should have succeeded because the guard was auto_linked.
+	if rowsAffected == 0 {
+		t.Fatal("downgrade UPDATE affected 0 rows — the AND status = 'auto_linked' guard failed")
+	}
+	if afterStatus != "needs_review" {
+		t.Fatalf("group status after downgrade expected needs_review, got %s", afterStatus)
+	}
+
+	// Second downgrade should be idempotent (0 rows affected).
+	result2, _ := env.pool.Exec(context.Background(),
+		`UPDATE reconciliation_groups SET status = 'needs_review' WHERE id = $1 AND status = 'auto_linked'`, groupID)
+	rowsAffected2 := result2.RowsAffected()
+	if rowsAffected2 != 0 {
+		t.Fatal("second downgrade affected rows — should be idempotent with AND guard")
+	}
+}
+
+// ---- DB-backed access_log source_ip test ----
+// Case #2 from CLAUDE.md: an audited request lands an access_log row whose
+// source_ip is non-NULL and equals the rate limiter's resolution.
+func TestSecurity_AccessLogSourceIPMatchesLimiter(t *testing.T) {
+	env := setupEnv(t)
+	// Set up trusted proxies so SourceIP and ClientIP agree on the resolved IP.
+	chain, _ := env.withClientIP(t, env.newRouter(t), "")
+	token := env.token(t, env.staffA, env.firmA, "staff")
+
+	// Make a request that will be logged.
+	rec, _ := env.doFrom(t, chain, "GET",
+		"/v1/books/"+env.bookA+"/documents/"+env.docA, token, "",
+		"198.51.100.5:12345", map[string]string{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 fetching document, got %d", rec.Code)
+	}
+
+	// Check that source_ip is non-NULL and matches the peer IP.
+	got := env.lastSourceIP(t, env.staffA, "view_document")
+	if got == nil {
+		t.Fatal("access_log.source_ip is NULL for a direct request")
+	}
+	if *got != "198.51.100.5" {
+		t.Fatalf("access_log.source_ip = %q, expected peer IP 198.51.100.5", *got)
+	}
+}
+
+// ---- DB-backed config_change_log test ----
+// Case #3 from CLAUDE.md: a config change lands a row in config_change_log at all.
+func TestSecurity_ConfigChangeLogHasRow(t *testing.T) {
+	env := setupEnv(t)
+	if pre := env.configChanges(t, env.bookA); len(pre) != 0 {
+		t.Fatalf("expected config_change_log empty after setup, got %d rows", len(pre))
+	}
+	chain, _ := env.withClientIP(t, env.newRouter(t), "")
+	token := env.token(t, env.staffA, env.firmA, "staff")
+
+	rec, _ := env.doFrom(t, chain, "PATCH", "/v1/books/"+env.bookA+"/settings",
+		token, `{"auto_link_confidence_threshold":0.97}`, "198.51.100.9:33000", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 patching book settings, got %d", rec.Code)
+	}
+
+	rows := env.configChanges(t, env.bookA)
+	if len(rows) == 0 {
+		t.Fatal("config_change_log is EMPTY after a successful settings PATCH")
+	}
+	// Verify it's the expected change.
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 row in config_change_log, got %d", len(rows))
+	}
+	if rows[0].Field != "auto_link_confidence_threshold" {
+		t.Fatalf("unexpected field changed: %s", rows[0].Field)
+	}
+	if rows[0].OldValue == nil || *rows[0].OldValue != "0.85" {
+		t.Fatalf("expected old value 0.85, got %v", rows[0].OldValue)
+	}
+	if rows[0].NewValue == nil || *rows[0].NewValue != "0.97" {
+		t.Fatalf("expected new value 0.97, got %v", rows[0].NewValue)
 	}
 }

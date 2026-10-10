@@ -33,6 +33,13 @@ services:
       # was ./infra/init.sql -> infra/infra/init.sql, which does not exist.
       # Compose would have created a DIRECTORY at that path and mounted it,
       # so postgres started with no schema at all.
+      #
+      # TWO files since 2026-09-06, and the order is load-bearing: the entrypoint
+      # globs this directory lexically, so `00-` runs first, which is required
+      # because init.sql GRANTs to roles the bootstrap creates. The bootstrap is
+      # separate because its psql \getenv meta-commands are not SQL and sqlc
+      # parses init.sql as its schema. Do not rename it to sort after init.sql.
+      - ./00-bootstrap-roles.sql:/docker-entrypoint-initdb.d/00-bootstrap-roles.sql:ro
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"

@@ -54,11 +54,11 @@ export default function ReportViewerPage() {
       {isLoading ? (
         <div className="grid gap-6 lg:grid-cols-2">
           <StaggerContainer staggerChildren={0.04} staggerDelay={0.1}>
-            <SkeletonCard title description contentLines={2} />
-            <SkeletonCard title description contentLines={2} />
-            <SkeletonCard title description contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
+            <SkeletonCard showTitle showDescription contentLines={2} />
           </StaggerContainer>
-          <SkeletonCard title description contentLines={8} />
+          <SkeletonCard showTitle showDescription contentLines={8} />
         </div>
       ) : (
         <div className="grid gap-6 lg:grid-cols-2">
@@ -141,6 +141,12 @@ export default function ReportViewerPage() {
               {!citation && (
                 <p className="mt-2 text-xs text-muted-foreground">
                   Select a finding to highlight its source region in the PDF.
+                </p>
+              )}
+              {citation && !citation.bbox && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  No page region to highlight — this finding&apos;s source is a
+                  structured export, so the data itself is the citation.
                 </p>
               )}
             </div>

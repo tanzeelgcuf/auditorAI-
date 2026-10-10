@@ -1,6 +1,6 @@
 package push
 
-// Mobile push bridge (doc 03 §3.10 / doc 07 §8). High-severity findings page a
+// Mobile push bridge. High-severity findings page a
 // controller via Expo push. Device tokens are registered by the mobile app and
 // stored per-firm; SendFindingAlert fans out to Expo's push service.
 
@@ -20,13 +20,15 @@ import (
 
 const expoPushURL = "https://exp.host/--/api/v2/push/send"
 
-type Service struct {
-	db *pgxpool.Pool
-}
+// Service holds no pool. Every request-scoped statement here runs on the
+// RLS-primed connection from the request context, and the one background function
+// (SendFindingAlert) takes the pool it requires as an explicit sysDB parameter.
+// The removed `db *pgxpool.Pool` field plus SetDB meant the correct pool was a
+// wiring accident rather than a signature — main.go passed the RLS-enforced pool,
+// which is right for the handler and wrong for the background path.
+type Service struct{}
 
 func NewService() *Service { return &Service{} }
-
-func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
 
 func writeProblem(w http.ResponseWriter, status int, typ, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
@@ -62,16 +64,27 @@ func (s *Service) HandleRegisterDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := middleware.GetConn(r.Context())
-	db := c
+	// No fallback to s.db.Acquire(). device_tokens has FORCE RLS and
+	// device_tokens_firm_isolation reads current_setting('app.current_firm') with no
+	// missing_ok and casts it to uuid, so an acquired-but-unprimed connection cannot
+	// write this row — it raises, 42704 if the GUC was never set on that physical
+	// connection or 22P02 on ''::uuid once ReleaseRLSConn (middleware.go:218) has
+	// RESET it. The old fallback made that look handled: it acquired a connection
+	// successfully, so the only symptom would have been the INSERT failing for a
+	// reason the log line below cannot explain. One of four instances of this shape;
+	// the others were settings.go's conn() helper (feeding ~10 sites) and three
+	// handlers in the tenant package.
+	//
+	// OBSERVED: unreachable today. This route is mounted at main.go:500 inside the
+	// group that does r.Use(middleware.RLSInjector(pool)) at main.go:386, so GetConn
+	// is always non-nil here. Fixing it changes no live behaviour; it stops the trap
+	// from firing if the route is ever mounted one group out.
+	db := middleware.GetConn(r.Context())
 	if db == nil {
-		acquired, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer acquired.Release()
-		db = acquired
+		slog.Error("push: no RLS-primed connection; route mounted outside the "+
+			"RLSInjector group", "path", r.URL.Path)
+		writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
+		return
 	}
 
 	_, err := db.Exec(r.Context(),
@@ -89,13 +102,19 @@ func (s *Service) HandleRegisterDevice(w http.ResponseWriter, r *http.Request) {
 
 // SendFindingAlert pages high-severity findings to the firm's registered devices.
 //
-// DEAD CODE as of this commit — grep finds no caller. When it is wired up (the
-// natural producer is pipeline/verify_worker after it writes audit_findings) it
-// must be given the BYPASSRLS sys pool, not s.db: the caller is a background
-// goroutine with no app.current_firm set, so device_tokens' policy predicate
-// would raise. Do not "fix" that by falling back to the request connection —
-// there isn't one.
-func (s *Service) SendFindingAlert(ctx context.Context, firmID, findingID, severity, bookID, summary string) error {
+// DEAD CODE as of this commit — grep finds no caller. The natural producer is
+// pipeline/verify_worker after it writes audit_findings.
+//
+// THE POOL IS PART OF THE CONTRACT, which is why it is a parameter named sysDB
+// rather than a read of s.db. device_tokens carries RLS keyed on
+// current_setting('app.current_firm'), and the only caller this function can have
+// is a background goroutine with no request and therefore no primed connection —
+// so the predicate would raise, not filter. Passing the app pool is the bug this
+// signature is shaped to prevent; there is no request connection to fall back to,
+// and inventing one with Acquire() would be the same trap this file just removed.
+// Made explicit 2026-09-05: it previously read s.db, which is whichever pool
+// SetDB happened to receive (main.go passes the RLS-enforced `pool`).
+func (s *Service) SendFindingAlert(ctx context.Context, sysDB *pgxpool.Pool, firmID, findingID, severity, bookID, summary string) error {
 	if !severityShouldNotify(severity) {
 		return nil // only high severity pages a human
 	}
@@ -105,7 +124,7 @@ func (s *Service) SendFindingAlert(ctx context.Context, firmID, findingID, sever
 		return nil
 	}
 
-	rows, err := s.db.Query(ctx,
+	rows, err := sysDB.Query(ctx,
 		`SELECT token FROM device_tokens WHERE firm_id = $1 AND last_seen_at > now() - interval '90 days'`,
 		firmID)
 	if err != nil {
@@ -148,7 +167,7 @@ func (s *Service) SendFindingAlert(ctx context.Context, firmID, findingID, sever
 	return nil
 }
 
-// severityShouldNotify gates alerts — only high-severity pages a human (doc 03 §3.10).
+// severityShouldNotify gates alerts — only high-severity pages a human.
 func severityShouldNotify(severity string) bool {
 	return severity == "high"
 }

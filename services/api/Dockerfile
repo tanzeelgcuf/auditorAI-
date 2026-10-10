@@ -77,11 +77,33 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # clamdscan is the CLIENT half of ClamAV. The daemon runs as its own compose
 # service; this container needs only the client plus a clamd.conf telling it
-# where that daemon is. Debian has moved clamdscan between the `clamav` and
-# `clamav-daemon` binary packages across releases, so both are installed and the
-# result is asserted below — if clamdscan is not on PATH the image is useless
-# (every upload would 500 on the fail-closed branch) and the build must fail
+# where that daemon is. If clamdscan is not on PATH the image is useless — every
+# upload would be rejected by the fail-closed branch in
+# internal/documents/clamav.go — so the build asserts it below and must fail
 # here, loudly, rather than at 3am in staging.
+#
+# THE ASSERTION FIRED, and this is the CI "Docker Build" failure. Exit 127 was
+# read as apt-get being absent (wrong base-image family). It is not: apt-get
+# exists on debian:bookworm-slim, and apt-get on an unknown package exits 100,
+# not 127. 127 came from `command -v clamdscan` on line 99. Measured, in this
+# environment: `/bin/sh` is dash, and dash's `command -v` on a missing name
+# exits 127 (bash exits 1) — and docker RUN is `/bin/sh -c`. So apt-get
+# SUCCEEDED and clamdscan still was not installed.
+#
+# The reason is a packaging claim in this comment that was simply false. It used
+# to say Debian "has moved clamdscan between the `clamav` and `clamav-daemon`
+# binary packages across releases", so installing both was thought to cover it.
+# Debian splits the ClamAV source into separate binary packages by ROLE:
+# `clamav` ships the command-line scanner (clamscan), `clamav-daemon` ships
+# clamd — and `clamdscan` is its own package. Neither of the two installed here
+# ships the binary this service actually executes (clamav.go:46 invokes
+# clamdscan and nothing else; clamscan is never called).
+#
+# `clamdscan` is added conditionally rather than appended to the list, because
+# there is no apt in the environment this was fixed in: if the package name were
+# wrong, an unconditional entry would trade a 127 for a 100 and prove nothing.
+# `apt-cache show` decides that from the image's own package index, and the
+# `command -v` assertion below is still what passes or fails the build.
 #
 # curl is here for exactly one reason: the compose healthcheck hits
 # /healthz (cmd/server/main.go:205). A distroless-style image has no HTTP client,
@@ -89,12 +111,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # which web and agent-runtime both need it to be.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends \
-      ca-certificates \
-      clamav \
-      clamav-daemon \
-      curl \
-      tzdata; \
+    pkgs="ca-certificates clamav clamav-daemon curl tzdata"; \
+    if apt-cache show clamdscan >/dev/null 2>&1; then \
+      pkgs="$pkgs clamdscan"; \
+    else \
+      echo "note: no separate clamdscan package in this base image's index" >&2; \
+    fi; \
+    apt-get install -y --no-install-recommends $pkgs; \
     rm -rf /var/lib/apt/lists/*; \
     command -v clamdscan; \
     command -v curl
@@ -110,11 +133,13 @@ COPY services/api/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 #
 # /etc/clamav must be writable by the app user: the entrypoint renders
 # clamd.conf at start, and clamdscan reads only that fixed path (clamav.go:46
-# passes no --config-file).
+# passes no --config-file). mkdir -p first — which ClamAV binary package ships
+# that directory is exactly the assumption that produced the 127 above, so this
+# no longer depends on one.
 RUN set -eux; \
     chmod +x /usr/local/bin/docker-entrypoint.sh; \
     command -v typst; \
-    mkdir -p /var/lib/ai-auditor/reports; \
+    mkdir -p /var/lib/ai-auditor/reports /etc/clamav; \
     useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin app; \
     chown -R app:app /var/lib/ai-auditor; \
     chown -R app:app /etc/clamav

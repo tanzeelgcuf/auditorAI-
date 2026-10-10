@@ -89,6 +89,11 @@ pub struct ReconciliationOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionGraph {
+    /// The rule's stable identity, REQUIRED — a graph without one fails at
+    /// load, the same strictness as the bands: no fallback fabricates the id
+    /// from the filename (the fallback is the anti-pattern that kept the
+    /// unused-graph bug invisible, rule 15).
+    rule_id: String,
     nodes: Vec<GraphNode>,
     // `edges` is deliberately NOT modelled. serde ignores unknown keys, so the
     // JSON keeps its edges and Zen tooling keeps working; this evaluator resolves
@@ -172,10 +177,19 @@ impl Operand {
                         let k = ta.konst.checked_mul(tb.konst).ok_or_else(|| {
                             ZenError::LoadError(format!("constant overflow in '{}'", raw))
                         })?;
-                        Ok(Operand { tol_coeff: 0, konst: k })
+                        Ok(Operand {
+                            tol_coeff: 0,
+                            konst: k,
+                        })
                     }
-                    (1, 0) => Ok(Operand { tol_coeff: tb.konst, konst: 0 }),
-                    (0, 1) => Ok(Operand { tol_coeff: ta.konst, konst: 0 }),
+                    (1, 0) => Ok(Operand {
+                        tol_coeff: tb.konst,
+                        konst: 0,
+                    }),
+                    (0, 1) => Ok(Operand {
+                        tol_coeff: ta.konst,
+                        konst: 0,
+                    }),
                     _ => Err(ZenError::LoadError(format!(
                         "'{}' is not linear in {} (at most one {} factor)",
                         raw, TOLERANCE_IDENT, TOLERANCE_IDENT
@@ -192,10 +206,16 @@ impl Operand {
 
     fn atom(tok: &str) -> Result<Self, ZenError> {
         if tok == TOLERANCE_IDENT {
-            return Ok(Operand { tol_coeff: 1, konst: 0 });
+            return Ok(Operand {
+                tol_coeff: 1,
+                konst: 0,
+            });
         }
         tok.parse::<i64>()
-            .map(|n| Operand { tol_coeff: 0, konst: n })
+            .map(|n| Operand {
+                tol_coeff: 0,
+                konst: n,
+            })
             .map_err(|_| {
                 ZenError::LoadError(format!(
                     "'{}' is neither an integer nor the identifier {}",
@@ -310,9 +330,9 @@ fn parse_range(expr: &str) -> Result<(Bound, Bound), ZenError> {
         )));
     }
     let interior = &t[1..t.len() - 1];
-    let (lo_s, hi_s) = interior.split_once("..").ok_or_else(|| {
-        ZenError::LoadError(format!("range '{}' has no '..' separator", expr))
-    })?;
+    let (lo_s, hi_s) = interior
+        .split_once("..")
+        .ok_or_else(|| ZenError::LoadError(format!("range '{}' has no '..' separator", expr)))?;
 
     let lo = if lo_s.trim().is_empty() {
         Bound::Unbounded
@@ -437,7 +457,10 @@ fn compile(graph: &DecisionGraph) -> Result<Vec<CompiledRule>, ZenError> {
 /// original code had a fallback (an `else` arm returning "high"), and a fallback
 /// is precisely what let a graph with no rules at all still return an answer.
 fn validate_coverage(rules: &[CompiledRule]) -> Result<(), ZenError> {
-    let zero = Operand { tol_coeff: 0, konst: 0 };
+    let zero = Operand {
+        tol_coeff: 0,
+        konst: 0,
+    };
     let first = rules
         .first()
         .ok_or_else(|| ZenError::LoadError("no rules to validate".to_string()))?;
@@ -502,10 +525,12 @@ fn validate_coverage(rules: &[CompiledRule]) -> Result<(), ZenError> {
 // ---------------------------------------------------------------------------
 
 pub struct RuleEngine {
-    /// Recorded on every gRPC result alongside `rule_version`. Currently the
-    /// graph FILE PATH (main.rs passes --decision-graph-path straight through),
-    /// which is a known weakness tracked separately: a path is not a stable
-    /// rule identity across deployments.
+    /// Recorded on every gRPC result alongside `rule_version`. Read FROM the
+    /// graph's own `rule_id` field — a deliberately chosen stable identity, NOT
+    /// derived from the filename: renaming the file used to change the recorded
+    /// id on every historical finding that cited it. The two are different
+    /// axes: rule_id is identity (stable across renames and redeployments),
+    /// rule_version is content (a hash that changes when the policy changes).
     pub rule_id: String,
     /// SHA-256 prefix of the graph JSON. Now an honest provenance claim: the
     /// bands compiled from that exact byte sequence are the bands that produced
@@ -536,7 +561,10 @@ impl RuleEngine {
             .map_err(|e| ZenError::LoadError(format!("parse error: {}", e)))?;
         let rules = compile(&graph)?;
         Ok(RuleEngine {
-            rule_id: name.to_string(),
+            // FROM THE GRAPH, not the `name` argument: the name is the file
+            // path, and a path is not a stable rule identity across
+            // deployments or renames.
+            rule_id: graph.rule_id,
             rule_version,
             rules,
         })
@@ -578,8 +606,12 @@ impl RuleEngine {
         )))
     }
 
-    /// Number of compiled bands. Lets a test assert the table was actually
-    /// compiled, rather than only that loading returned Ok.
+    /// Number of compiled bands. Asserted by tests so "loaded" means
+    /// "compiled into bands" and not merely Ok, and logged at startup by
+    /// main.rs so an operator sees the count without decoding describe().
+    /// (2026-09-17: wiring it into the boot log also ended the bin-target
+    /// dead_code warning — per this module's header, by wiring, not by
+    /// silencing.)
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
@@ -625,7 +657,7 @@ mod tests {
 
     fn graph_with(rules: &[String]) -> String {
         format!(
-            r#"{{"nodes":[
+            r#"{{"rule_id":"test_graph","nodes":[
                 {{"id":"in","type":"inputNode","name":"request"}},
                 {{"id":"t","type":"decisionTableNode","name":"Tolerance Evaluation",
                   "content":{{"rules":[{}]}}}},
@@ -725,9 +757,31 @@ mod tests {
     /// variance 5 / tolerance 1. That test passed. It could only pass because
     /// the graph was never consulted, and it is the clearest single piece of
     /// evidence the bug existed.
+    /// A graph with no rule_id fails at load — the strictness added 2026-10-03:
+    /// rule_id is REQUIRED, read from the graph rather than derived from the
+    /// filename, and no fallback fabricates it (the fallback is the anti-pattern
+    /// that kept the unused-graph bug invisible). A rename of the graph file
+    /// must not change the recorded identity of any historical finding.
+    #[test]
+    fn test_graph_without_rule_id_must_not_load() {
+        let result = RuleEngine::from_json(r#"{"nodes":[],"edges":[]}"#, "empty");
+        match result {
+            Err(ZenError::LoadError(m)) => assert!(
+                m.contains("rule_id"),
+                "error should name the missing rule_id, got: {}",
+                m
+            ),
+            Err(other) => panic!("expected LoadError, got {:?}", other),
+            Ok(_) => panic!("a graph without rule_id must not load"),
+        }
+    }
+
     #[test]
     fn test_empty_graph_must_not_load() {
-        let result = RuleEngine::from_json(r#"{"nodes":[],"edges":[]}"#, "empty");
+        // The graph carries rule_id so this test tests the MISSING DECISION
+        // TABLE, not the missing rule_id — that is its own test below.
+        let result =
+            RuleEngine::from_json(r#"{"rule_id":"empty-test","nodes":[],"edges":[]}"#, "empty");
         match result {
             Err(ZenError::LoadError(m)) => assert!(
                 m.contains("decisionTableNode"),
@@ -847,8 +901,8 @@ mod tests {
 
     #[test]
     fn test_real_decision_graph_loads_and_compiles() {
-        let engine = RuleEngine::new(&real_graph_path())
-            .expect("the shipped decision graph must compile");
+        let engine =
+            RuleEngine::new(&real_graph_path()).expect("the shipped decision graph must compile");
         assert_eq!(engine.rule_version.len(), 16);
         assert!(engine.rule_id.contains("gl_reconciliation"));
         assert_eq!(
@@ -889,33 +943,54 @@ mod tests {
     fn test_operand_forms() {
         assert_eq!(
             Operand::parse("0").expect("int"),
-            Operand { tol_coeff: 0, konst: 0 }
+            Operand {
+                tol_coeff: 0,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("250").expect("int"),
-            Operand { tol_coeff: 0, konst: 250 }
+            Operand {
+                tol_coeff: 0,
+                konst: 250
+            }
         );
         assert_eq!(
             Operand::parse("tolerance_cents").expect("ident"),
-            Operand { tol_coeff: 1, konst: 0 }
+            Operand {
+                tol_coeff: 1,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("tolerance_cents*10").expect("ident*n"),
-            Operand { tol_coeff: 10, konst: 0 }
+            Operand {
+                tol_coeff: 10,
+                konst: 0
+            }
         );
         assert_eq!(
             Operand::parse("100*tolerance_cents").expect("n*ident"),
-            Operand { tol_coeff: 100, konst: 0 }
+            Operand {
+                tol_coeff: 100,
+                konst: 0
+            }
         );
         // Whitespace is not significant.
         assert_eq!(
             Operand::parse(" tolerance_cents * 5 ").expect("spaced"),
-            Operand { tol_coeff: 5, konst: 0 }
+            Operand {
+                tol_coeff: 5,
+                konst: 0
+            }
         );
         // Two constants fold.
         assert_eq!(
             Operand::parse("5*2").expect("n*n"),
-            Operand { tol_coeff: 0, konst: 10 }
+            Operand {
+                tol_coeff: 0,
+                konst: 10
+            }
         );
     }
 

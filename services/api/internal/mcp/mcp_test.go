@@ -21,11 +21,22 @@ package mcp
 // failed the CHECK constraint as a bare 500 "insert failed".
 //
 // WHY THESE TESTS NEED NO DATABASE, and why that is the assertion rather than a
-// convenience: validation runs before the handler touches s.db. NewService()
-// leaves db nil, so if the whitelist were removed these requests would reach
-// s.db.Acquire and panic on a nil pool instead of returning 400. Reaching the DB
-// at all is therefore observable here, which is what testValidStatusReachesDB
-// relies on.
+// convenience: validation runs before the handler resolves a connection, and the
+// resolution point now FAILS CLOSED with an observable response. A request built
+// by httptest.NewRequest carries no connKey in its context, so
+// middleware.GetConn returns nil and s.primed() answers 500 with detail
+// "no db conn". An accepted request therefore stops at exactly that point and
+// says so, which is what TestValidStatusReachesConnResolution asserts.
+//
+// Corrected 2026-09-05, and the reason it needed correcting is worth keeping:
+// this block used to say "NewService() leaves db nil, so ... these requests
+// would reach s.db.Acquire and panic on a nil pool", and the acceptance test
+// recovered that panic. That premise died when the four GetConn-or-Acquire
+// fallbacks in mcp.go were collapsed into s.primed() and the db field was
+// deleted — there is no s.db and nothing panics. The test still PASSED, because
+// it only checked "not 400", so nothing went red to announce that its stated
+// mechanism no longer existed. Asserting the 500 and its detail replaces an
+// absence-of-400 with a positive observation.
 
 import (
 	"bytes"
@@ -105,7 +116,7 @@ func TestCreateEntityLinkRejectsRatherThanCoercing(t *testing.T) {
 	}
 }
 
-// TestCreateEntityLinkRequiresBankAndGL — doc 09: a group need not have all
+// TestCreateEntityLinkRequiresBankAndGL — a group need not have all
 // three legs (bank+GL only is valid for deposits and fees), but invoice-only is
 // not a reconciliation of anything.
 func TestCreateEntityLinkRequiresBankAndGL(t *testing.T) {
@@ -130,27 +141,40 @@ func TestCreateEntityLinkRejectsMalformedBody(t *testing.T) {
 	}
 }
 
-// TestValidStatusReachesDB pins the whitelist from the other side: the two
-// machine statuses must NOT be rejected. With no pool wired, getting past
-// validation means reaching s.db.Acquire on a nil pool, which panics — so the
-// panic is the evidence of acceptance, and a 400 is the failure. Recovered here
-// rather than in the handler, because in production the pool is never nil.
-func TestValidStatusReachesDB(t *testing.T) {
+// TestValidStatusReachesConnResolution pins the whitelist from the other side:
+// the two machine statuses, and the empty default, must NOT be rejected.
+//
+// The evidence of acceptance is a 500 with detail "no db conn" — s.primed()
+// finding no RLS-primed connection in the request context. That is a positive
+// observation, not merely the absence of a 400: it proves the body decoded, the
+// bank+GL requirement passed, the status whitelist admitted the value, and the
+// very next thing the handler reached was the single connection-resolution
+// point. Any other code or detail means the request stopped somewhere else.
+//
+// Expect three "mcp: no RLS-primed connection" lines on stderr from primed()'s
+// slog.Error while this test runs. They are the mechanism, not a failure.
+func TestValidStatusReachesConnResolution(t *testing.T) {
 	for _, status := range []string{"auto_linked", "needs_review", ""} {
 		label := status
 		if label == "" {
 			label = "(unset, defaults to needs_review)"
 		}
-		func() {
-			defer func() {
-				// Expected: nil pool. Nothing to assert about the panic itself.
-				_ = recover()
-			}()
-			rec := postLink(t, `{"bank_ids":["b1"],"gl_ids":["g1"],"status":"`+status+`"}`)
-			if rec.Code == http.StatusBadRequest {
-				t.Errorf("status %s was rejected by the whitelist: %s",
-					label, problemDetail(t, rec))
-			}
-		}()
+		rec := postLink(t, `{"bank_ids":["b1"],"gl_ids":["g1"],"status":"`+status+`"}`)
+		if rec.Code == http.StatusBadRequest {
+			t.Errorf("status %s was rejected by the whitelist: %s",
+				label, problemDetail(t, rec))
+			continue
+		}
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("status %s: got HTTP %d, want 500 from s.primed() — an accepted "+
+				"request must stop at the connection-resolution point, and this one "+
+				"stopped somewhere else", label, rec.Code)
+			continue
+		}
+		if detail := problemDetail(t, rec); detail != "no db conn" {
+			t.Errorf("status %s: detail = %q, want \"no db conn\"; a different 500 "+
+				"means the request failed past the resolution point, so this test is "+
+				"no longer observing what it claims to", label, detail)
+		}
 	}
 }

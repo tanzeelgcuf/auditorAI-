@@ -28,9 +28,9 @@ pub fn init_glitchtip() {
             .release(release)
             .traces_sample_rate(0.0) // errors only; tracing stays in OTel
             .default_integrations(false); // panic handling wired manually below
-        // Guard flushes queued events on drop. Forgetting keeps the client alive
-        // for the process lifetime (flush then happens via install_panic_hook's
-        // explicit client.flush before the process dies on panic).
+                                          // Guard flushes queued events on drop. Forgetting keeps the client alive
+                                          // for the process lifetime (flush then happens via install_panic_hook's
+                                          // explicit client.flush before the process dies on panic).
         std::mem::forget(sentry::init(options));
     });
 }
@@ -109,9 +109,7 @@ mod tests {
             .default_integrations(false); // must not install its own panic hook
         let transport = Arc::new(TestTransport::default());
         let collect = transport.clone();
-        sentry::Hub::current().bind_client(Some(Arc::new(
-            options.transport(transport).into(),
-        )));
+        sentry::Hub::current().bind_client(Some(Arc::new(options.transport(transport).into())));
 
         let hook_fired = Arc::new(AtomicBool::new(false));
         let hook_count = hook_fired.clone();

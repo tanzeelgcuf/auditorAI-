@@ -1,12 +1,12 @@
 // services/verification/src/grpc/mod.rs
-use tonic::{Request, Response, Status};
-use uuid::Uuid;
 use std::sync::Arc;
 
 use rust_decimal::prelude::*;
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use crate::decimal_math;
-use crate::zen::{RuleEngine, ReconciliationInput};
+use crate::zen::{ReconciliationInput, RuleEngine};
 
 #[allow(clippy::unwrap_used)]
 pub mod verification_service {
@@ -15,11 +15,11 @@ pub mod verification_service {
 
 use verification_service::{
     verification_service_server::VerificationService,
-    ReconciliationRequest as GrpcReconciliationRequest,
-    ReconciliationResult as GrpcReconciliationResult,
     BatchReconciliationRequest as GrpcBatchReconciliationRequest,
     BatchReconciliationResult as GrpcBatchReconciliationResult,
-    GroupResult as GrpcGroupResult,
+    GroupReconciliation as GrpcGroupReconciliation, GroupResult as GrpcGroupResult,
+    ReconciliationRequest as GrpcReconciliationRequest,
+    ReconciliationResult as GrpcReconciliationResult,
 };
 
 pub struct VerificationServiceImpl {
@@ -31,48 +31,64 @@ impl VerificationServiceImpl {
         Self { rule_engine }
     }
 
+    // tonic::Status exceeds clippy's 128-byte result_large_err threshold, and
+    // it is the error type this whole file returns — the trait impls are
+    // exempt only because tonic fixes their signatures. Boxing it would change
+    // every caller for zero benefit; allowed with that reason stated.
+    #[allow(clippy::result_large_err)]
     fn evaluate_single_group(
         &self,
-        inv_total_cents: i64,
-        bank_total_cents: i64,
-        gl_total_cents: i64,
-        tolerance_cents: i32,
-        group_id: &str,
-        has_invoice: bool,
-        has_bank: bool,
-        has_gl: bool,
+        group: &GrpcGroupReconciliation,
     ) -> Result<GrpcGroupResult, Status> {
+        // The proto message IS the argument list. Nine spread parameters hit
+        // clippy::too_many_arguments (observed 2026-09-17, clippy 1.97; CI
+        // runs -D warnings), and passing the message instead of unpacking it
+        // at the call site keeps the data shape honest: batch_evaluate's loop
+        // body is now one line.
+        let inv_total_cents = group.invoice_total_cents;
+        let bank_total_cents = group.bank_total_cents;
+        let gl_total_cents = group.gl_total_cents;
+        let tolerance_cents = group.tolerance_cents;
+        let group_id = group.group_id.as_str();
+        let has_invoice = group.has_invoice;
+        let has_bank = group.has_bank;
+        let has_gl = group.has_gl;
         // Convert to Decimal for arithmetic. Absent legs (has_X = false) are
         // excluded from variance — comparing an absent leg as 0 would inflate
         // |0-bank| to the full bank amount and flag balanced 2-leg groups.
         let inv_group = if has_invoice {
             vec![rust_decimal::Decimal::from_i64(inv_total_cents)
                 .ok_or_else(|| Status::invalid_argument("inv_total_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let bank_group = if has_bank {
             vec![rust_decimal::Decimal::from_i64(bank_total_cents)
                 .ok_or_else(|| Status::invalid_argument("bank_total_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let gl_group = if has_gl {
             vec![rust_decimal::Decimal::from_i64(gl_total_cents)
                 .ok_or_else(|| Status::invalid_argument("gl_total_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let inv_dec = inv_group.first().copied().unwrap_or_default();
         let bank_dec = bank_group.first().copied().unwrap_or_default();
         let gl_dec = gl_group.first().copied().unwrap_or_default();
 
         // Compute variance only over PRESENT legs.
-        let variances = decimal_math::compute_three_way_variance(
-            &inv_group,
-            &bank_group,
-            &gl_group,
-        ).map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
+        let variances =
+            decimal_math::compute_three_way_variance(&inv_group, &bank_group, &gl_group)
+                .map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
 
         // Find max variance across the present-leg comparisons.
         let max_variance = variances.iter().copied().fold(Decimal::ZERO, Decimal::max);
 
         // Convert max variance to cents for severity evaluation
-        let variance_cents = max_variance.to_i64()
+        let variance_cents = max_variance
+            .to_i64()
             .ok_or_else(|| Status::internal("variance conversion overflow"))?;
 
         // Evaluate against tolerance
@@ -125,36 +141,41 @@ impl VerificationService for VerificationServiceImpl {
 
         // Convert to rust_decimal for processing. A leg is included only when
         // the caller marks it present (has_invoice/has_bank/has_gl) — an absent
-        // leg (e.g. invoice on a bank+GL-only deposit group, doc 09) must not
+        // leg (e.g. invoice on a bank+GL-only deposit group) must not
         // be compared as 0, or |0-bank| flags a balanced 2-leg group.
         let invoice_group = if req.has_invoice {
             vec![rust_decimal::Decimal::from_i64(req.invoice_amount_cents)
                 .ok_or_else(|| Status::invalid_argument("invoice_amount_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let bank_group = if req.has_bank {
             vec![rust_decimal::Decimal::from_i64(req.bank_amount_cents)
                 .ok_or_else(|| Status::invalid_argument("bank_amount_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let gl_group = if req.has_gl {
             vec![rust_decimal::Decimal::from_i64(req.gl_amount_cents)
                 .ok_or_else(|| Status::invalid_argument("gl_amount_cents overflow"))?]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let invoice_amt = invoice_group.first().copied().unwrap_or_default();
         let bank_amt = bank_group.first().copied().unwrap_or_default();
         let gl_amt = gl_group.first().copied().unwrap_or_default();
 
         // Compute variance only over PRESENT legs.
-        let variances = decimal_math::compute_three_way_variance(
-            &invoice_group,
-            &bank_group,
-            &gl_group,
-        ).map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
+        let variances =
+            decimal_math::compute_three_way_variance(&invoice_group, &bank_group, &gl_group)
+                .map_err(|e| Status::internal(format!("variance computation failed: {}", e)))?;
 
         // The max variance across the computed comparisons
         let max_variance = variances.iter().copied().fold(Decimal::ZERO, Decimal::max);
 
         // Convert to cents for severity evaluation
-        let variance_cents = max_variance.to_i64()
+        let variance_cents = max_variance
+            .to_i64()
             .ok_or_else(|| Status::internal("variance conversion overflow"))?;
 
         // Evaluate against tolerance using the compiled decision-graph bands.
@@ -199,17 +220,8 @@ impl VerificationService for VerificationServiceImpl {
 
         let mut results: Vec<GrpcGroupResult> = Vec::with_capacity(req.groups.len());
 
-        for group in req.groups {
-            let result = self.evaluate_single_group(
-                group.invoice_total_cents,
-                group.bank_total_cents,
-                group.gl_total_cents,
-                group.tolerance_cents,
-                &group.group_id,
-                group.has_invoice,
-                group.has_bank,
-                group.has_gl,
-            )?;
+        for group in &req.groups {
+            let result = self.evaluate_single_group(group)?;
             results.push(result);
         }
 
@@ -288,7 +300,10 @@ mod tests {
         let svc = VerificationServiceImpl::new(engine);
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10000, 10000, 10000, 1,
+            10000,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 0);
@@ -315,7 +330,10 @@ mod tests {
         // variance = 1 cent, tolerance = 10 => info (within tolerance)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10001, 10000, 10000, 10,
+            10001,
+            10000,
+            10000,
+            10,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 1);
@@ -330,7 +348,10 @@ mod tests {
         // variance = 2 cents, tolerance = 1 => low
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10002, 10000, 10000, 1,
+            10002,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "low");
@@ -344,7 +365,10 @@ mod tests {
         // variance = 15 cents, tolerance = 1 => medium (10 < 15 <= 100)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10015, 10000, 10000, 1,
+            10015,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "medium");
@@ -358,7 +382,10 @@ mod tests {
         // variance = 150 cents, tolerance = 1 => high (> 100)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10150, 10000, 10000, 1,
+            10150,
+            10000,
+            10000,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "high");
@@ -373,7 +400,10 @@ mod tests {
         // t=1, t*10=10, t*100=100. 50 > 10 and 50 <= 100 => medium
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10000, 10000, 10050, 1,
+            10000,
+            10000,
+            10050,
+            1,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 50);
@@ -384,10 +414,7 @@ mod tests {
     async fn test_reconciliation_invalid_uuid() {
         let engine = test_engine();
         let svc = VerificationServiceImpl::new(engine);
-        let req = tonic::Request::new(make_req(
-            "not-a-uuid",
-            10000, 10000, 10000, 1,
-        ));
+        let req = tonic::Request::new(make_req("not-a-uuid", 10000, 10000, 10000, 1));
         let result = svc.evaluate_reconciliation(req).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -399,10 +426,7 @@ mod tests {
         let svc = VerificationServiceImpl::new(engine);
         // All three differ: inv=100, bank=95, gl=90
         // vib=5, igl=10, bgl=5 => max = 10
-        let req = tonic::Request::new(make_req(
-            &Uuid::new_v4().to_string(),
-            100, 95, 90, 1,
-        ));
+        let req = tonic::Request::new(make_req(&Uuid::new_v4().to_string(), 100, 95, 90, 1));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.variance_cents, 10);
     }
@@ -505,7 +529,10 @@ mod tests {
         // Same input but with different tolerance (passed at runtime, not compile-time)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10050, 10000, 10000, 10,
+            10050,
+            10000,
+            10000,
+            10,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         // variance=50, tolerance=10 => low (10<50<=100)
@@ -514,7 +541,10 @@ mod tests {
         // With tolerance=100, variance=50 => info (within tolerance)
         let req = tonic::Request::new(make_req(
             &Uuid::new_v4().to_string(),
-            10050, 10000, 10000, 100,
+            10050,
+            10000,
+            10000,
+            100,
         ));
         let resp = svc.evaluate_reconciliation(req).await.unwrap().into_inner();
         assert_eq!(resp.severity, "info");

@@ -1,4 +1,4 @@
-// Package email sends transactional mail through Resend (doc 12 §4).
+// Package email sends transactional mail through Resend.
 // Provider sits behind EmailSender so it can be swapped without touching call
 // sites. Uses Resend's REST API directly (one endpoint) — no SDK dependency.
 package email

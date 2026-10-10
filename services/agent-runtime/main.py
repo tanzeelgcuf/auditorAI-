@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import structlog
+import sys
 import sentry_sdk
 from typing import Optional
 
@@ -56,7 +57,15 @@ async def process_batch(client, graph, mcp, batch_event: dict):
         "entities": pending,
     }
 
-    result = await graph.arun(state)
+    # ainvoke, not arun: the COMPILED LangGraph graph exposes ainvoke/invoke;
+    # arun exists only on the _SequentialPipeline fallback (graph_def.py).
+    # Wherever langgraph is importable — i.e., every real deployment — arun
+    # raised AttributeError and every batch failed permanently (observed live
+    # 2026-09-19, the first real pipeline run: 5 retries, then the event died).
+    # The 88 passing tests never saw this because they exercised the fallback,
+    # not the compiled graph — the exact "green suite that never ran the real
+    # path" pattern.
+    result = await graph.ainvoke(state)
     groups = result.get("groups", [])
     logger.info(
         "batch complete",
@@ -187,6 +196,27 @@ async def _retry_or_drop(msg, attempt: int) -> None:
         await msg.ack()
 
 
+async def _ack_with_retry(msg, what: str = "ack") -> None:
+    """Ack failures used to kill the consumer silently: the exception
+    propagated out of the async-for, gather failed, and main() waited on the
+    stop event forever — a zombie process with a dead pipeline whose only
+    trace was a GC-time "Task exception was never retrieved". Retry transient
+    transport failures with a short backoff; if the connection is truly gone
+    the retries fail fast and the exception re-raises, which main() turns into
+    a loud exit so a supervisor or the operator sees it and restarts.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            return await msg.ack()
+        except Exception as e:  # noqa: BLE001 - retry any transport error
+            last_exc = e
+            logger.warning(what + " failed, retrying", attempt=attempt, error=str(e))
+            await asyncio.sleep(0.5 * attempt)
+    assert last_exc is not None, "raise is only reachable after a failed attempt"
+    raise RuntimeError(f"{what} failed after 3 attempts") from last_exc
+
+
 async def run_consumer():
     """Subscribe to NATS JetStream and process batches."""
     try:
@@ -203,8 +233,48 @@ async def run_consumer():
     # The EXTRACTION/LINK streams are owned/created by services/api. Creating a
     # competing stream would fail with "subjects overlap"; bind consumers to the
     # existing streams instead (each is a WorkQueue with its single consumer).
-    ext_sub = await js.subscribe("entity.extraction.requested")
-    link_sub = await js.subscribe("link.requested")
+    # AckWait MUST cover the slowest handler. The LLM round trip took 66s
+    # (observed live 2026-09-19: glm-5.3-flash over NIM, one 10-entity batch);
+    # the default 30s expired mid-call and the event was REDELIVERED while the
+    # first attempt was still running — a duplicate LLM call burned quota on
+    # the same batch. 120s covers the 90s adapter timeout plus margin, and
+    # max_deliver makes the SERVER enforce the same bound _retry_or_drop
+    # applies. Both subscriptions get the same latency profile and the same
+    # AckWait. This mirrors the Go consumers' AckWait 2min sizing
+    # (services/api/internal/pipeline/coordinator.go) — same reason, both
+    # halves.
+    #
+    # filter_subject is set EXPLICITLY, not relied on implicitly. nats-py's
+    # subscribe() sets filter_subject from the subject when the config omits
+    # it — verified live 2026-09-20: a consumer created with a config carrying
+    # no filter_subject was stored by the server as
+    # filter='entity.extraction.requested', and a link.requested marker
+    # published afterwards was NOT received by it. So this is a contract pin
+    # against nats-py version drift (requirements.txt bounds nats-py>=2.7.0,
+    # not an exact pin), NOT a bug fix — an earlier draft of this comment
+    # claimed the missing filter caused link.requested events to be delivered
+    # to the EXTRACTION consumer, and that claim was falsified by the same
+    # reproduction test (the pre-fix consumer was correctly filtered all
+    # along; the "batch event missing required fields" lines in the 2026-09-20
+    # logs were this handler correctly rejecting malformed events published to
+    # entity.extraction.requested itself — client_book_id present, batch_id
+    # absent, a payload no version of this repo's Go code publishes). The Go
+    # coordinator's filter_subject IS load-bearing — its consumer took every
+    # subject on the DOCUMENTS stream and acked (deleted) events meant for
+    # nobody's benefit (coordinator.go:99-106). One config per subscription,
+    # not a shared instance, so the two filters cannot share state. Pinned by
+    # tests/test_consumer_filter.py.
+    from nats.js.api import ConsumerConfig
+
+    def _consumer_config(filter_subject: str) -> ConsumerConfig:
+        return ConsumerConfig(
+            ack_wait=120,
+            max_deliver=MAX_DELIVERY_ATTEMPTS,
+            filter_subject=filter_subject,
+        )
+
+    ext_sub = await js.subscribe("entity.extraction.requested", config=_consumer_config("entity.extraction.requested"))
+    link_sub = await js.subscribe("link.requested", config=_consumer_config("link.requested"))
     logger.info("nats consumer ready", url=NATS_URL)
 
     from ollama_adapter import make_llm_client
@@ -214,7 +284,7 @@ async def run_consumer():
     from mcp_client import MCPClient
     mcp = MCPClient(API_MCP_URL)
 
-    async def consume(sub, handler):
+    async def consume(sub, handler, publish_link_after=False):
         try:
             async for msg in sub.messages:
                 try:
@@ -224,7 +294,7 @@ async def run_consumer():
                     # pointless and a nak would loop forever.
                     logger.error("undecodable event, dropping", error=str(e))
                     sentry_sdk.capture_exception(e)
-                    await msg.ack()
+                    await _ack_with_retry(msg)
                     continue
 
                 try:
@@ -247,12 +317,34 @@ async def run_consumer():
                     sentry_sdk.capture_exception(e)  # GlitchTip (no-op when DSN unset)
                     await _retry_or_drop(msg, attempt)
                 else:
-                    await msg.ack()
+                    # rule 5: the follow-up publish is part of THIS event's
+                    # work, and the previous order (ack, then publish) lost it —
+                    # a publish failure left the event already acked, so nothing
+                    # retried the book-wide link pass, which is the exact
+                    # unlinked-trio state publish_link_after exists to fix (the
+                    # coordinator's own link.requested fires BEFORE LLM
+                    # classification — observed live 2026-09-19/20: the LLM
+                    # takes 40-70s per batch, so that trigger always ran on
+                    # unclassified types — making this post-classification
+                    # trigger the only one). Publish FIRST: a failure leaves the
+                    # event unacked and redelivering, and a redelivery is safe —
+                    # a fully-successful prior attempt leaves the re-run's
+                    # pending-entity set empty (HandleGetPendingEntities filters
+                    # entities already in groups), so no duplicates. The
+                    # book-wide pass is deterministic (no LLM) and cheap to
+                    # re-run. Only on EXTRACTION events — link.requested ->
+                    # process_link -> publish again would be an infinite loop.
+                    if publish_link_after and event.get("client_book_id"):
+                        await js.publish(
+                            "link.requested",
+                            json.dumps({"client_book_id": event["client_book_id"]}).encode(),
+                        )
+                    await _ack_with_retry(msg)
         finally:
             await nc.drain()
 
     await asyncio.gather(
-        consume(ext_sub, process_batch),
+        consume(ext_sub, process_batch, publish_link_after=True),
         consume(link_sub, process_link),
     )
 
@@ -287,8 +379,22 @@ async def main():
         loop.add_signal_handler(sig, _on_signal)
 
     consumer = asyncio.create_task(run_consumer())
-    await stop.wait()
-    consumer.cancel()
+    stop_wait = asyncio.create_task(stop.wait())
+    # Wait on EITHER the stop event or the consumer task. The previous
+    # `await stop.wait()` turned a consumer crash into a zombie process:
+    # the pipeline was dead, main() kept running, and the only trace of the
+    # death was a GC-time "Task exception was never retrieved" — the
+    # fail-silent outcome the ack-before-work class exists to prevent, one
+    # layer up.
+    done, _ = await asyncio.wait({consumer, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+    stop_wait.cancel()
+    if consumer in done and not consumer.cancelled():
+        exc = consumer.exception()
+        if exc is not None:
+            logger.error("consumer task crashed - exiting so the failure is visible", error=str(exc))
+            sys.exit(1)
+    if stop_wait in done:
+        consumer.cancel()
     logger.info("agent-runtime stopped")
 
 

@@ -29,6 +29,15 @@
 services:
   postgres:
     image: postgres:16
+    # WAL archiving for point-in-time recovery (added 2026-10-05). Without it a
+    # restore returns to the last base backup only. archive_command copies every
+    # completed WAL segment to the wal_archive volume; the restore-to-a-point-
+    # in-time procedure is documented in OPS_RUNBOOK.md and must be tested once
+    # (base backup, change, lose, restore, confirm).
+    command: >
+      postgres
+      -c archive_mode=on
+      -c archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
     environment:
       POSTGRES_DB: ai_auditor
       POSTGRES_USER: auditor
@@ -43,8 +52,18 @@ services:
       SYS_DB_PASSWORD: ${SYS_DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - wal_archive:/wal_archive
+      # TWO files, and the order is load-bearing. The postgres entrypoint globs
+      # /docker-entrypoint-initdb.d/* in lexical order, so `00-bootstrap-roles.sql`
+      # runs before `init.sql` — which is required, because init.sql's GRANTs and
+      # its final self-check both assume auditor_app/auditor_sys already exist.
+      # The bootstrap is a separate file because it uses psql meta-commands
+      # (\getenv) that sqlc's PostgreSQL parser cannot read; see that file's
+      # header. Do NOT rename it to sort after init.sql.
+      #
       # ./init.sql == infra/init.sql. Runs ONLY on an empty data volume; after
       # the first `up`, schema changes need a migration or a volume reset.
+      - ./00-bootstrap-roles.sql:/docker-entrypoint-initdb.d/00-bootstrap-roles.sql:ro
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U auditor -d ai_auditor"]
@@ -498,6 +517,7 @@ services:
 
 volumes:
   postgres_data:
+  wal_archive: # archived WAL segments for point-in-time recovery
   qdrant_data:
   letsencrypt:
   minio_data:

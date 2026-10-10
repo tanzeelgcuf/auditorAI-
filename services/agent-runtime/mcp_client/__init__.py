@@ -1,5 +1,5 @@
 # services/agent-runtime/mcp_client/__init__.py
-# MCP client — calls services/api's internal MCP tools (doc 05 §3).
+# MCP client — calls services/api's internal MCP tools.
 
 import os
 import structlog
@@ -12,7 +12,7 @@ logger = structlog.get_logger()
 class MCPClient:
     """HTTP client for services/api's MCP tool server.
 
-    Tools exposed (per docs 05 §3):
+    Tools exposed:
     - get_pending_entities(client_book_id)
     - create_entity_link(invoice_ids, bank_ids, gl_ids, confidence, status)
     - flag_for_review(entity_link_id, reason)
@@ -23,7 +23,7 @@ class MCPClient:
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or os.getenv("API_MCP_URL", "http://api:8080")).rstrip("/")
         self.api_key = api_key or os.getenv("API_INTERNAL_KEY", "")
-        # Internal MCP auth (doc 05 §3): shared secret on X-Internal-Key, not a
+        # Internal MCP auth: shared secret on X-Internal-Key, not a
         # user JWT. The API's InternalAuth middleware resolves client_book_id ->
         # firm from the body.
         self.client = httpx.AsyncClient(
@@ -55,7 +55,7 @@ class MCPClient:
         status: str = "needs_review",
     ) -> Dict[str, Any]:
         """Create one reconciliation group. Arrays (a group can have multiple
-        entities per leg); bank and gl are required (doc 09)."""
+        entities per leg); bank and gl are required."""
         return await self._post("create_entity_link", {
             "invoice_ids": invoice_ids,
             "bank_ids": bank_ids,
@@ -80,7 +80,7 @@ class MCPClient:
         Called after the LangGraph link node. Each group with >=1 bank and >=1 GL
         leg is written via create_entity_link; the API publishes
         verification.requested on creation, so the verify worker evaluates it.
-        Groups without bank+gl legs are skipped (not persistable, doc 09) and are
+        Groups without bank+gl legs are skipped (not persistable) and are
         NOT counted as failures.
 
         WHY THIS RAISES NOW. Every per-group failure used to be caught here and

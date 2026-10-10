@@ -137,7 +137,7 @@ func (e *EventClient) RequestExtraction(ctx context.Context, clientBookID, batch
 // RequestVerification publishes a verify request for a reconciliation group.
 func (e *EventClient) RequestVerification(ctx context.Context, groupID, clientBookID string) error {
 	payload, err := json.Marshal(map[string]string{
-		"group_id":        groupID,
+		"group_id":       groupID,
 		"client_book_id": clientBookID,
 	})
 	if err != nil {

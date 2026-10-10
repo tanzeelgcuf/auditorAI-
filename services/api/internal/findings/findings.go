@@ -29,7 +29,7 @@ type Service struct {
 	// verification, not writing, is what this service needs it for. May be nil
 	// when storage.New() failed at startup; HandleAddAttachment answers 503.
 	storage *storage.Client
-	// Notifier delivers report.generated webhook events (doc 07 §7). Injected by
+	// Notifier delivers report.generated webhook events. Injected by
 	// main.go to avoid an import cycle (webhooks imports nothing from findings).
 	Notifier ReportNotifier
 }
@@ -103,21 +103,21 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type findingRow struct {
-		ID                     string    `json:"id"`
-		ClientBookID           string    `json:"client_book_id"`
-		ReconciliationGroupID  string    `json:"reconciliation_group_id"`
-		RuleID                 string    `json:"rule_id"`
-		RuleVersion            string    `json:"rule_version"`
-		CalculatedVarianceCents int64    `json:"calculated_variance_cents"`
-		ToleranceCents         int64     `json:"tolerance_cents"`
-		ExceedsTolerance       bool      `json:"exceeds_tolerance"`
-		CalculationFormula     string    `json:"calculation_formula"`
-		Severity               string    `json:"severity"`
-		Status                 string    `json:"status"`
-		PreparedBy             *string   `json:"prepared_by"`
-		ReviewedBy             *string   `json:"reviewed_by"`
-		ReviewedAt             time.Time `json:"reviewed_at"`
-		CreatedAt              time.Time `json:"created_at"`
+		ID                      string    `json:"id"`
+		ClientBookID            string    `json:"client_book_id"`
+		ReconciliationGroupID   string    `json:"reconciliation_group_id"`
+		RuleID                  string    `json:"rule_id"`
+		RuleVersion             string    `json:"rule_version"`
+		CalculatedVarianceCents int64     `json:"calculated_variance_cents"`
+		ToleranceCents          int64     `json:"tolerance_cents"`
+		ExceedsTolerance        bool      `json:"exceeds_tolerance"`
+		CalculationFormula      string    `json:"calculation_formula"`
+		Severity                string    `json:"severity"`
+		Status                  string    `json:"status"`
+		PreparedBy              *string   `json:"prepared_by"`
+		ReviewedBy              *string   `json:"reviewed_by"`
+		ReviewedAt              time.Time `json:"reviewed_at"`
+		CreatedAt               time.Time `json:"created_at"`
 	}
 
 	var out []findingRow
@@ -197,7 +197,7 @@ func (s *Service) HandleUpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If resolving, set reviewed_by/reviewed_at unless already reviewed (doc 10 §3)
+	// If resolving, set reviewed_by/reviewed_at unless already reviewed
 	if req.Status == "resolved" {
 		var reviewedBy *string
 		_ = c.QueryRow(r.Context(),
@@ -441,10 +441,13 @@ func (s *Service) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 		"id": reportID, "client_book_id": bookID,
 		"period_start": req.PeriodStart, "period_end": req.PeriodEnd,
 		"generated_at": time.Now().Format(time.RFC3339),
-		"finding_ids": findingIDs, "pdf_storage_key": pdfKey,
+		"finding_ids":  findingIDs, "pdf_storage_key": pdfKey,
 	})
-	middleware.StoreIdempotentResponse(r.Context(), s.db, userID,
-		r.Header.Get("Idempotency-Key"), http.StatusCreated, body)
+	if err := middleware.StoreIdempotentResponse(r.Context(), s.db, http.StatusCreated, body); err != nil {
+		// The response below is already decided; this only means a retry of this
+		// request will regenerate the report instead of replaying it.
+		slog.Error("idempotency store failed", "error", err, "report_id", reportID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write(body)
@@ -491,7 +494,7 @@ func (s *Service) HandleGetReport(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleGetCitation returns the exact source region (document, page, bbox) that
-// produced a finding — the product's core trust mechanism (doc 04/05).
+// produced a finding — the product's core trust mechanism.
 func (s *Service) HandleGetCitation(w http.ResponseWriter, r *http.Request) {
 	reportID := r.PathValue("reportId")
 	findingID := r.PathValue("findingId")

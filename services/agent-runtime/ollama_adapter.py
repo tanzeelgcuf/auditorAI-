@@ -25,7 +25,13 @@ class OllamaMessagesAdapter:
         # Explicit timeout: a stuck Ollama call (huge book prompt) must fail
         # fast and let the batch be retried, not hang the consumer forever.
         # Default OpenAI client timeout is unbounded-ish for generation.
-        self._client = OpenAI(base_url=base_url or OLLAMA_URL, api_key="ollama", timeout=90.0)  # key ignored locally
+        #
+        # The key is env-driven: a local Ollama ignores it (any non-empty
+        # string passes), while a real OpenAI-compatible endpoint requires
+        # the real one. Hardcoded "ollama" only worked while the sole
+        # endpoint was a local server.
+        api_key = os.getenv("OPENAI_API_KEY", "ollama")
+        self._client = OpenAI(base_url=base_url or OLLAMA_URL, api_key=api_key, timeout=90.0)
         self._model = model or OLLAMA_MODEL
 
     @property

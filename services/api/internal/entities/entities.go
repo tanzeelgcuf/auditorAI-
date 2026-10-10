@@ -95,22 +95,22 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type entity struct {
-		ID                  string    `json:"id"`
-		ClientBookID        string    `json:"client_book_id"`
-		SourceDocumentID    string    `json:"source_document_id"`
-		EntityType          string    `json:"entity_type"`
-		EntitySubtype       string    `json:"entity_subtype"`
-		AmountCents         int64     `json:"amount_cents"`
-		Currency            string    `json:"currency"`
-		TransactionDate     string    `json:"transaction_date"`
-		Counterparty        string    `json:"counterparty"`
-		Description         string    `json:"description"`
-		GLAccountCode       string    `json:"gl_account_code"`
-		PageNumber          int       `json:"page_number"`
-		BBox                map[string]float64 `json:"bbox"`
-		ExtractionConfidence float64  `json:"extraction_confidence"`
-		SourceFormat        string    `json:"source_format"`
-		ExtractedAt         time.Time `json:"extracted_at"`
+		ID                   string             `json:"id"`
+		ClientBookID         string             `json:"client_book_id"`
+		SourceDocumentID     string             `json:"source_document_id"`
+		EntityType           string             `json:"entity_type"`
+		EntitySubtype        string             `json:"entity_subtype"`
+		AmountCents          int64              `json:"amount_cents"`
+		Currency             string             `json:"currency"`
+		TransactionDate      string             `json:"transaction_date"`
+		Counterparty         string             `json:"counterparty"`
+		Description          string             `json:"description"`
+		GLAccountCode        string             `json:"gl_account_code"`
+		PageNumber           int                `json:"page_number"`
+		BBox                 map[string]float64 `json:"bbox"`
+		ExtractionConfidence float64            `json:"extraction_confidence"`
+		SourceFormat         string             `json:"source_format"`
+		ExtractedAt          time.Time          `json:"extracted_at"`
 	}
 
 	var out []entity
