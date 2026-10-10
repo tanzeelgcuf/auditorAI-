@@ -11,6 +11,9 @@ __pycache__/
 dist/
 build/
 *.exe
+# Go test binaries — `go test -c` drops an executable next to the package
+# (observed 2026-10-09: a 30MB middleware.test swept in by git add -A)
+*.test
 
 # Environment
 .env
