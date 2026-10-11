@@ -14,6 +14,8 @@ build/
 # Go test binaries — `go test -c` drops an executable next to the package
 # (observed 2026-10-09: a 30MB middleware.test swept in by git add -A)
 *.test
+# `go build -o api ./cmd/server` from the repo's own docs leaves this here
+services/api/api
 
 # Environment
 .env

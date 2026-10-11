@@ -188,10 +188,10 @@ func setupEnv(t *testing.T) *securityEnv {
 	env := &securityEnv{pool: appPool, setupPool: pool}
 
 	env.firmA = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm A') RETURNING id::text`)
-		env.toleranceA = 1 /* default per init.sql line 99 */
+	env.toleranceA = 1 /* default per init.sql line 99 */
 
 	env.firmB = mustQueryRow(t, pool, `INSERT INTO firms (name) VALUES ('Firm B') RETURNING id::text`)
-		env.toleranceB = 1
+	env.toleranceB = 1
 
 	// Firm A users. email_verified = true so login flow works; password hashes are unused.
 	env.adminA = mustQueryRow(t, pool,

@@ -37,7 +37,7 @@ services:
     command: >
       postgres
       -c archive_mode=on
-      -c archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      -c archive_command='test ! -f /wal_archive/%f && cp %p /wal_archive/%f'
     environment:
       POSTGRES_DB: ai_auditor
       POSTGRES_USER: auditor
