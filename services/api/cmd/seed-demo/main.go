@@ -15,6 +15,7 @@ import (
 	"github.com/brianvoe/gofakeit/v7"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tanzeelgcuf/ai-auditor/services/api/internal/auth"
 )
 
 // AmountDiscrepancy describes one deliberately planted 3-way discrepancy.
@@ -122,12 +123,35 @@ func main() {
 	}
 
 	// Demo staff user (idempotent) — required FK target for source_documents.
+	//
+	// The password is a REAL argon2id hash since 2026-09-18. The sentinel
+	// '!demo-not-a-real-hash!' this row used to carry could never
+	// authenticate (HandleLogin's argon2 verify rejects the malformed
+	// format), so the demo account was a row that could not log in —
+	// useless for end-to-end runs and for signing into the UI. DEMO_PASSWORD
+	// (default below) is the login credential. DO UPDATE, not DO NOTHING: a
+	// re-seed must replace any sentinel hash left by an older run. This
+	// command is DEMO-ONLY and must never touch production — the header
+	// warning stands.
+	demoPassword := os.Getenv("DEMO_PASSWORD")
+	if demoPassword == "" {
+		demoPassword = "demo-pass-1234"
+	}
+	hash, err := auth.HashPassword(demoPassword)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seed-demo: hash password: %v\n", err)
+		os.Exit(1)
+	}
 	demoUserID := uuid.MustParse("00000000-0000-0000-0000-00000000d3b0")
+	// email_verified = true, and re-seeds UPDATE it too: HandleLogin refuses
+	// unverified accounts with 403 (a real gate — observed live 2026-09-18,
+	// the first login attempt failed on exactly this), and the demo account
+	// is a verified account by construction.
 	_, err = pool.Exec(ctx, `
-		INSERT INTO users (id, firm_id, email, password_hash, role)
-		VALUES ($1, $2, 'demo@ai-auditor.dev', '!demo-not-a-real-hash!', 'firm_admin')
-		ON CONFLICT (email) DO NOTHING`,
-		demoUserID, firmID)
+		INSERT INTO users (id, firm_id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'demo@ai-auditor.dev', $3, 'firm_admin', true)
+		ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, email_verified = true`,
+		demoUserID, firmID, hash)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seed-demo: demo user: %v\n", err)
 		os.Exit(1)

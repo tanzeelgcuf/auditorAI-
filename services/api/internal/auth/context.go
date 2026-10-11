@@ -71,7 +71,7 @@ func RoleFrom(ctx context.Context) string {
 // "" is a legitimate answer and callers must persist it as SQL NULL rather than
 // as the string "" — an audit row that claims the request came from nowhere is
 // worse than one that admits it does not know. Every INSERT that stores this
-// uses NULLIF($n, '')::inet for exactly that reason.
+// uses NULLIF($n, ”)::inet for exactly that reason.
 func SourceIPFrom(ctx context.Context) string {
 	if v, ok := ctx.Value(SourceIPKey).(string); ok {
 		return v

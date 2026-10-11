@@ -1,9 +1,11 @@
-use super::{ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest, ProcessDocumentResponse, BoundingBox};
+use super::{
+    BoundingBox, ExtractedEntity, OcrBackend, OcrError, ProcessDocumentRequest,
+    ProcessDocumentResponse,
+};
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct DoctrRequest {
@@ -24,11 +26,14 @@ struct DoctrPage {
     blocks: Vec<DoctrBlock>,
 }
 
+// The sidecar's wire contract carries per-block geometry and confidence; this
+// consumer reads only the lines. Unread fields are DELETED from the DTOs
+// rather than kept as dead struct weight: serde ignores extra JSON keys, so
+// the response still parses, and the struct now states exactly what this
+// code consumes.
 #[derive(Debug, Deserialize)]
 struct DoctrBlock {
-    geometry: [[f32; 2]; 4],
     lines: Vec<DoctrLine>,
-    confidence: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,40 +43,38 @@ struct DoctrLine {
     confidence: f32,
 }
 
+// Same contract note: line_text joins the word VALUES; the sidecar's per-word
+// geometry/confidence are left unmodelled.
 #[derive(Debug, Deserialize)]
 struct DoctrWord {
     value: String,
-    confidence: f32,
-    geometry: [[f32; 2]; 4],
 }
 
 pub struct DoctrBackend {
     client: Client,
     base_url: String,
-    s3_client: Arc<aws_sdk_s3::Client>,
-    bucket: String,
 }
 
 impl DoctrBackend {
-    pub async fn new(sidecar_url: &str) -> Result<Self, OcrError> {
+    // Sync since 2026-09-17: the s3_client/bucket fields were deleted — never
+    // read, because the SIDECAR downloads from S3 itself keyed by
+    // storage_key; the backend only needs an HTTP client and its URL. With
+    // them went the only await in the constructor.
+    pub fn new(sidecar_url: &str) -> Result<Self, OcrError> {
         let client = Client::new();
-
-        let s3_client = Arc::new(crate::ocr::structured::build_s3_client().await);
-        let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
 
         Ok(Self {
             client,
             base_url: sidecar_url.trim_end_matches('/').to_string(),
-            s3_client,
-            bucket,
         })
     }
 
-    fn generate_presigned_url(&self, key: &str) -> Result<String, OcrError> {
-        Ok(format!("{}/{}", self.base_url.replace("ocr-sidecar:8000", "minio:9000"), key))
-    }
-
-    fn normalize_bbox(&self, geometry: [[f32; 2]; 4], page_width: f32, page_height: f32) -> BoundingBox {
+    fn normalize_bbox(
+        &self,
+        geometry: [[f32; 2]; 4],
+        page_width: f32,
+        page_height: f32,
+    ) -> BoundingBox {
         let xs: Vec<f32> = geometry.iter().map(|p| p[0]).collect();
         let ys: Vec<f32> = geometry.iter().map(|p| p[1]).collect();
 
@@ -88,7 +91,10 @@ impl DoctrBackend {
         }
     }
 
-    fn classify_entity_type(&self, text: &str, doc_type: &str) -> String {
+    // The unused `text` parameter is gone (first real clippy run, 2026-09-17):
+    // classification never read it — the sidecar already filtered what
+    // reaches this call, and the type depends only on the document kind.
+    fn classify_entity_type(&self, doc_type: &str) -> String {
         match doc_type {
             "invoice" => "invoice_line_item",
             "bank_statement" => "bank_transaction",
@@ -205,7 +211,8 @@ impl DoctrBackend {
                     // date separator.
                     let before = i.checked_sub(1).map(|j| chars[j]).unwrap_or(' ');
                     let after = chars.get(slice_end).copied().unwrap_or(' ');
-                    let is_date_char = |c: char| c.is_ascii_digit() || c == '/' || c == '-' || c == '.';
+                    let is_date_char =
+                        |c: char| c.is_ascii_digit() || c == '/' || c == '-' || c == '.';
                     if !is_date_char(before) && !is_date_char(after) {
                         return Some(d);
                     }
@@ -238,7 +245,11 @@ impl DoctrBackend {
     /// Generalizes across real layouts: QBO exports and firm invoices put dates
     /// in varied positions (header, side, near the total). Proximity + label
     /// preference is the general rule; this invoice's exact layout is not baked in.
-    fn attach_date(amount_text: &str, amount_y: f32, block_lines: &[(String, f32)]) -> Option<NaiveDate> {
+    fn attach_date(
+        amount_text: &str,
+        amount_y: f32,
+        block_lines: &[(String, f32)],
+    ) -> Option<NaiveDate> {
         if let Some(d) = Self::extract_date(amount_text) {
             return Some(d);
         }
@@ -283,9 +294,23 @@ impl DoctrBackend {
     /// of the document header, not a fixed offset.
     fn attach_counterparty(amount_text: &str, block_lines: &[(String, f32)]) -> Option<String> {
         let skip = [
-            "invoice", "amount", "qty", "description", "total", "date", "due",
-            "bill to", "customer", "po box", "service", "payment terms",
-            "unit price", "memo", "amt", "subtotal", "balance",
+            "invoice",
+            "amount",
+            "qty",
+            "description",
+            "total",
+            "date",
+            "due",
+            "bill to",
+            "customer",
+            "po box",
+            "service",
+            "payment terms",
+            "unit price",
+            "memo",
+            "amt",
+            "subtotal",
+            "balance",
         ];
         for (text, _) in block_lines {
             let t = text.trim();
@@ -314,11 +339,14 @@ impl DoctrBackend {
 
 #[async_trait]
 impl OcrBackend for DoctrBackend {
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError> {
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError> {
         // The sidecar downloads the object itself via storage_key (S3-compatible).
         let resp = self
             .client
-            .post(&format!("{}/ocr/process", self.base_url))
+            .post(format!("{}/ocr/process", self.base_url))
             .json(&DoctrRequest {
                 storage_key: request.storage_key.clone(),
                 doc_type: request.doc_type.clone(),
@@ -328,7 +356,9 @@ impl OcrBackend for DoctrBackend {
             .map_err(|e| OcrError::SidecarError(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(OcrError::ProcessingFailed(resp.text().await.unwrap_or_default()));
+            return Err(OcrError::ProcessingFailed(
+                resp.text().await.unwrap_or_default(),
+            ));
         }
 
         let doctr_resp: DoctrResponse = resp
@@ -356,12 +386,13 @@ impl OcrBackend for DoctrBackend {
 
                     if let Some(amount) = DoctrBackend::extract_amount(&text) {
                         let bbox = self.normalize_bbox(line.geometry, page.width, page.height);
-                        let date = DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
+                        let date =
+                            DoctrBackend::attach_date(&text, line.geometry[0][1], &block_lines);
 
                         let counterparty = DoctrBackend::attach_counterparty(&text, &block_lines);
 
                         entities.push(ExtractedEntity {
-                            entity_type: self.classify_entity_type(&text, &request.doc_type),
+                            entity_type: self.classify_entity_type(&request.doc_type),
                             amount_cents: amount,
                             currency: "USD".to_string(),
                             transaction_date: date,
@@ -370,7 +401,7 @@ impl OcrBackend for DoctrBackend {
                             gl_account_code: None,
                             transaction_ref: None,
                             page_number: page.page_number,
-                            bbox,
+                            bbox: Some(bbox),
                             confidence: line.confidence,
                             source_format: "ocr".to_string(),
                         });
@@ -381,12 +412,7 @@ impl OcrBackend for DoctrBackend {
 
         Ok(ProcessDocumentResponse { entities })
     }
-
-    fn name(&self) -> &'static str {
-        "docTR"
-    }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -435,15 +461,15 @@ mod tests {
             ("$150.00", 0.30),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     #[test]
     fn no_date_in_block_yields_none() {
-        let lines = block(&[
-            ("Consulting services", 0.20),
-            ("$150.00", 0.30),
-        ]);
+        let lines = block(&[("Consulting services", 0.20), ("$150.00", 0.30)]);
         assert_eq!(DoctrBackend::attach_date("$150.00", 0.30, &lines), None);
     }
 
@@ -456,7 +482,10 @@ mod tests {
             ("$150.00", 0.30),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.30, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     #[test]
@@ -468,7 +497,10 @@ mod tests {
             ("$150.00", 0.32),
         ]);
         let d = DoctrBackend::attach_date("$150.00", 0.32, &lines);
-        assert_eq!(d, Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()));
+        assert_eq!(
+            d,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap())
+        );
     }
 
     // ---- counterparty (vendor) attachment ----
@@ -504,10 +536,7 @@ mod tests {
 
     #[test]
     fn counterparty_none_when_only_boilerplate() {
-        let lines = block(&[
-            ("INVOICE", 0.08),
-            ("Total: $150.00", 0.20),
-        ]);
+        let lines = block(&[("INVOICE", 0.08), ("Total: $150.00", 0.20)]);
         let cp = DoctrBackend::attach_counterparty("Total: $150.00", &lines);
         assert_eq!(cp, None);
     }

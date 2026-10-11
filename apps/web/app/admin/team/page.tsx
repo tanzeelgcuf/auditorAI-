@@ -35,9 +35,9 @@ export default function TeamPage() {
           <CardContent>
             {isLoading ? (
               <StaggerContainer staggerChildren={0.04}>
-                <SkeletonCard title description contentLines={1} />
-                <SkeletonCard title description contentLines={1} />
-                <SkeletonCard title description contentLines={1} />
+                <SkeletonCard showTitle showDescription contentLines={1} />
+                <SkeletonCard showTitle showDescription contentLines={1} />
+                <SkeletonCard showTitle showDescription contentLines={1} />
               </StaggerContainer>
             ) : books.length === 0 ? (
               <div className="py-8 text-center text-muted-foreground">

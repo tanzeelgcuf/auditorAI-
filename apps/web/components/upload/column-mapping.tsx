@@ -9,6 +9,29 @@ import { MotionDiv, StaggerContainer, MotionButton } from "../../components/ui/m
 
 // Detected column names (from the file header row), target field set, and an
 // initially auto-suggested column_map. Live on the upload page + remap flow.
+//
+// `Record<string, string>` is CORRECT and is deliberately not widened to
+// `Record<string, string | undefined>`. The reported error was on the select's
+// setState below, which produced `string | undefined`; the two candidate fixes
+// were "widen the type" or "stop producing undefined", and the chain of custody
+// decides it. In this codebase an unmapped target field is the EMPTY STRING,
+// present in the map — not an absent key and not undefined:
+//
+//   - lib/hooks.ts:167-171 `suggestColumnMap` sets all 7 TARGET_FIELDS
+//     unconditionally, and `suggestField` returns "" (hooks.ts:163) when no
+//     header matches. The initial state therefore already holds "" values.
+//   - `<option value="">— not mapped —</option>` (below) yields "", and
+//     `mappedCount` counts `Object.values(map).filter(Boolean)` — that line only
+//     makes sense for present-but-falsy values.
+//   - the wire type has no nullable slot to widen into: proto
+//     `map<string, string>` (genproto/ingestion/ingestion.pb.go:32) and Rust
+//     `HashMap<String, String>` (services/ingestion/src/ocr/mod.rs:41).
+//     `services/ingestion/src/ocr/structured.rs:296` is
+//     `if let Some(v) = data.get(source)`, so an "" source simply misses and
+//     contributes no field — the sentinel is already handled downstream.
+//
+// Widening the TS type would have typechecked while making the wire format
+// depend on `JSON.stringify` silently dropping undefined-valued keys.
 type ColumnMap = Record<string, string>;
 
 interface ColumnMappingProps {
@@ -97,7 +120,11 @@ export function ColumnMapping({
                       <select
                         value={map[field] ?? ""}
                         onChange={(e) =>
-                          setMap((m) => ({ ...m, [field]: e.target.value || undefined }))
+                          // `e.target.value` is already "" for the not-mapped
+                          // option. This used to be `e.target.value || undefined`,
+                          // which is the only line in the file that treated
+                          // unmapped as undefined rather than "".
+                          setMap((m) => ({ ...m, [field]: e.target.value }))
                         }
                         disabled={submitting}
                         className="w-full h-10 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 disabled:pointer-events-none appearance-none bg-no-repeat bg-right pr-10"

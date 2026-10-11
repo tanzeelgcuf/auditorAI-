@@ -40,7 +40,7 @@ def test_persist_groups_writes_valid_groups():
 
 def test_persist_groups_skips_no_legs_and_keeps_bank_gl():
     m = FakeMCP()
-    # bank+GL-only group is persistable (deposits/fees — doc 09); multi-bank ok
+    # bank+GL-only group is persistable (deposits/fees); multi-bank ok
     ok = ReconciliationGroup(
         client_book_id=BOOK,
         bank_entity_ids=[UUID("b"*32), UUID("d"*32)],

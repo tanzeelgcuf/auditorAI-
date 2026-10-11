@@ -1,6 +1,6 @@
 package billing
 
-// Stripe billing — subscription per firm (docs 06 §9 tiers). v1 keeps billing
+// Stripe billing — subscription per firm. v1 keeps billing
 // simple: flat per-firm subscription via Stripe Checkout, webhook syncs status.
 
 import (
@@ -432,7 +432,6 @@ func (s *Service) writeSubscriptionState(r *http.Request, w http.ResponseWriter,
 	return true
 }
 
-//
 // Two reasons this is not the old unbounded loop. First, this endpoint is now
 // public (cmd/server/main.go) — anything on the internet can POST to it, and the
 // body is read into memory BEFORE the signature is checked, because HMAC

@@ -1,6 +1,6 @@
 package pipeline
 
-// Coordinator — the missing bridge in the document pipeline (doc 12 §1).
+// Coordinator — the missing bridge in the document pipeline.
 //
 //   document.uploaded ──> ingestion gRPC (parse OFX/CSV/PDF) ──> extracted_entities
 //        ──> entity.extraction.requested ──> agent-runtime (link/classify)
@@ -37,12 +37,12 @@ var ErrNoIngestion = errors.New("no ingestion connection")
 const maxDeliveryAttempts = 5
 
 type Coordinator struct {
-	nc          *nats.Conn
-	db          *pgxpool.Pool
-	storage     *storage.Client
+	nc           *nats.Conn
+	db           *pgxpool.Pool
+	storage      *storage.Client
 	ingestionURL string
-	ingestion   ingestionpb.IngestionServiceClient
-	js          jetstream.JetStream
+	ingestion    ingestionpb.IngestionServiceClient
+	js           jetstream.JetStream
 }
 
 func NewCoordinator(natsURL, ingestionURL string, db *pgxpool.Pool, st *storage.Client) (*Coordinator, error) {
@@ -145,6 +145,14 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		}
 		msg, err := cons.Next()
 		if err != nil {
+			// Same class as verify_worker.go's loop, fixed the same way: an
+			// empty-stream fetch timeout is the normal steady state and must
+			// not warn every cycle (observed live 2026-09-18: the WARN wall
+			// was indistinguishable from a failure and got the server killed).
+			// Only a non-timeout error is abnormal.
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, jetstream.ErrNoMessages) {
+				continue
+			}
 			slog.Warn("coordinator consumer error", "error", err)
 			time.Sleep(1 * time.Second)
 			continue
@@ -256,7 +264,7 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	// Fetch the book's CSV column mapping (doc 08 §1) so structured formats parse
+	// Fetch the book's CSV column mapping so structured formats parse
 	// with the correct header mapping, not an empty one. The mapping is chosen
 	// by matching the file's actual header row against each stored mapping's
 	// source columns — a firm may hold multiple exports (QBO, Xero, custom)
@@ -266,11 +274,11 @@ func (c *Coordinator) handleUploaded(ctx context.Context, msg jetstream.Msg) {
 
 	// Call ingestion gRPC: it parses the bytes into structured entities.
 	resp, err := c.ingestion.ProcessDocument(ctx, &ingestionpb.ProcessDocumentRequest{
-		DocumentId:    ev.DocumentID,
-		ClientBookId:  ev.ClientBookID,
-		StorageKey:    ev.StorageKey,
-		DocType:       ev.DocType,
-		ColumnMap:     columnMap,
+		DocumentId:   ev.DocumentID,
+		ClientBookId: ev.ClientBookID,
+		StorageKey:   ev.StorageKey,
+		DocType:      ev.DocType,
+		ColumnMap:    columnMap,
 	})
 	if err != nil {
 		c.fail(ctx, msg, ev.DocumentID, "ingestion_grpc", err)
@@ -422,17 +430,20 @@ func nullableDate(s string) *time.Time {
 }
 
 // bboxJSON renders an entity's OCR geometry as the JSON stored in the bbox
-// column, or "{}" when absent. The column was previously hardcoded '{}' — the
-// sidecar produces real coordinates but they were dropped here, so citations
-// pointed at nothing (traceability gap, Round 7).
+// column, or "" when absent — bound as NULLIF($n,”)::jsonb, so an absent
+// message stores SQL NULL, not "{}". A zero box (or an empty object) asserted
+// a region that does not exist; NULL admits "no geometry", the source_ip
+// pattern (rule 13). The column was previously hardcoded '{}' — the sidecar
+// produces real coordinates but they were dropped here, so citations pointed
+// at nothing (traceability gap, Round 7).
 func bboxJSON(e *ingestionpb.ExtractedEntity) string {
 	if e.Bbox == nil {
-		return "{}"
+		return ""
 	}
 	if b, err := json.Marshal(e.Bbox); err == nil {
 		return string(b)
 	}
-	return "{}"
+	return ""
 }
 
 // persistEntities writes a document's parsed entities in ONE transaction, and is
@@ -502,7 +513,7 @@ func (c *Coordinator) persistEntities(ctx context.Context, bookID, docID string,
 				(client_book_id, source_document_id, entity_type, amount_cents, transaction_date,
 				 counterparty, description, gl_account_code, transaction_ref, page_number, bbox, extraction_confidence, source_format)
 			 VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), NULLIF($9,''),
-			 	$10, $13, $11, $12)`,
+			 	$10, NULLIF($13,'')::jsonb, $11, $12)`,
 			bookID, docID, e.EntityType, e.AmountCents, txnDate,
 			e.Counterparty, e.Description, e.GlAccountCode, e.TransactionRef,
 			e.PageNumber, e.Confidence, e.SourceFormat, bboxJSON(e))

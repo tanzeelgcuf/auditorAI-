@@ -75,6 +75,21 @@ MUST_STRIP = {
 # cancellation is the SHUTDOWN signal, so stripping it would be actively wrong —
 # it would keep a draining process writing after it was told to stop.
 ALLOWLIST = {
+    "services/api/internal/connectors/sync.go::HandleSync": (
+        "The last_synced_at progress timestamp. The sync's idempotency rests "
+        "on the external_ref dedupe (the unique partial index), not on this "
+        "column; a stale timestamp changes nothing about whether a re-sync "
+        "duplicates legs."
+    ),
+    "services/api/internal/auth/auth.go::denyToken": (
+        "DB-backed JWT denylist. denyToken's INSERT error is RETURNED (the "
+        "denial is the only record of the revocation — losing it silently "
+        "would leave a long-lived token valid, fail-open), so the only "
+        "remaining logged write in this function is the lazy EXPIRED-ROW "
+        "cleanup, which is hygiene: the refresh's own signature check rejects "
+        "an expired token before this list is consulted, so the loss is "
+        "harmless."
+    ),
     "services/api/internal/notify/notify.go::runOnce": (
         "Background reminder sweep. Started once as `go notify.Run(ctx, ...)` from "
         "cmd/server/main.go:129 on the server root context; no HTTP client can "

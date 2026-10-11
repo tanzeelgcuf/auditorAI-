@@ -6,7 +6,11 @@ import { motion } from "framer-motion";
 import { Upload, Loader2, AlertCircle, FileText, Image, FileSpreadsheet } from "lucide-react";
 
 const ACCEPTED = [".pdf", ".png", ".jpg", ".jpeg", ".csv", ".xlsx", ".ofx", ".qfx"];
-const MAX_SIZE = 25 * 1024 * 1024; // 25MB per doc 06 §5
+// 25MB, and it must stay equal to maxUploadSize in
+// services/api/internal/documents/documents.go. This is a client-side pre-check
+// only — the server is what actually rejects, so a drift here shows up as an
+// upload that the browser accepts and the API 413s.
+const MAX_SIZE = 25 * 1024 * 1024;
 
 interface DropzoneProps {
   onFiles: (files: File[]) => void;

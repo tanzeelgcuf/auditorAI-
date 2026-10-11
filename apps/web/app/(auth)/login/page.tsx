@@ -30,6 +30,15 @@ export default function LoginPage() {
       setTokens(result.access_token, result.refresh_token);
       router.replace("/dashboard");
     } catch (err) {
+      // firm_admin without an enrolled second factor (after the grace login)
+      // is blocked with 403 enrollment-required; the redirect to the
+      // enrollment flow IS the response's purpose — not a dismissible error
+      // banner.
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("required for your role")) {
+        router.replace("/settings");
+        return;
+      }
       setError(err instanceof Error ? err.message : "Login failed");
     }
   }

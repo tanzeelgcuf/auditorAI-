@@ -178,14 +178,14 @@ func TestLoginSelectAndScanAgree(t *testing.T) {
 	body := handleLoginBody(t)
 	sel := indexOrFail(t, body, "SELECT id, firm_id", "the login SELECT has changed shape")
 	from := indexOrFail(t, body, "FROM users WHERE email = $1", "the login query changed")
-	cols := splitTopLevel(body[sel+len("SELECT"):from])
+	cols := splitTopLevel(body[sel+len("SELECT") : from])
 
 	scan := indexOrFail(t, body, ".Scan(", "the login row is never scanned")
 	end := strings.Index(body[scan:], ")\n")
 	if end < 0 {
 		t.Fatal("could not find the end of the Scan argument list")
 	}
-	args := splitTopLevel(body[scan+len(".Scan("):scan+end])
+	args := splitTopLevel(body[scan+len(".Scan(") : scan+end])
 
 	if len(cols) != len(args) {
 		t.Fatalf("the login SELECT has %d columns (%v) and Scan has %d targets (%v): pgx scans "+

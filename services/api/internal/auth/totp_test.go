@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
 
@@ -58,8 +59,18 @@ func TestRFC6238HelperAgreesWithLibrary(t *testing.T) {
 	// fail for an unrelated-looking reason.
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	code := rfc6238Code(t, testSecret, now)
-	if !totp.Validate(code, testSecret) {
-		t.Fatalf("hand-rolled RFC 6238 code %q rejected by totp.Validate — the two implementations disagree", code)
+	// ValidateCustom, not totp.Validate: Validate reads time.Now() internally,
+	// so a code minted for this fixed `now` compared against the live clock can
+	// only agree on the literal day the fixture was chosen. That is not a
+	// hypothetical — this test failed exactly that way on 2026-09-16, twelve
+	// days after its fixture date, on the first go test run ever. Same opts as
+	// CheckSecondFactor: Period 30, Skew 1, 6 digits.
+	if ok, err := totp.ValidateCustom(code, testSecret, now, totp.ValidateOpts{
+		Digits: otp.DigitsSix,
+		Period: 30,
+		Skew:   1,
+	}); err != nil || !ok {
+		t.Fatalf("hand-rolled RFC 6238 code %q rejected by the library at the same instant — the two implementations disagree (err=%v)", code, err)
 	}
 }
 

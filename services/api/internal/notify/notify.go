@@ -1,4 +1,4 @@
-// Package notify runs the proactive reminder job (doc 10 §7): every interval
+// Package notify runs the proactive reminder job: every interval
 // it finds reconciliation periods sitting in pending_close whose open document
 // requests are older than 5 days, bumps the reminder counter, and logs each
 // reminder. Requests that accumulate 3+ reminders surface as "stale" on the

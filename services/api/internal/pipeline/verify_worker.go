@@ -102,6 +102,15 @@ func (w *VerifyWorker) Run(ctx context.Context) error {
 		}
 		msg, err := cons.Next()
 		if err != nil {
+			// An empty-stream fetch timeout is the NORMAL steady state — an
+			// idle queue is not a failure, and warning about it every cycle
+			// trains the operator to ignore this exact line (observed live
+			// 2026-09-18: ~100 identical WARNs in an hour of idle queue, and
+			// the server got killed over the noise). Only a non-timeout error
+			// is abnormal; log those loud and back off.
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, jetstream.ErrNoMessages) {
+				continue
+			}
 			slog.Warn("verify worker consumer error", "error", err)
 			time.Sleep(1 * time.Second)
 			continue

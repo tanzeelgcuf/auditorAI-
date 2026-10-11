@@ -47,7 +47,7 @@ export default function DashboardPage() {
           </p>
         </div>
         <MotionButton
-          variant="scaleIn"
+          motionVariant="scaleIn"
           onClick={() => setShowNewBook((v) => !v)}
           className="gap-2"
         >

@@ -12,12 +12,14 @@ import {
   Users,
   ClipboardList,
   BarChart3,
+  KeyRound,
   LogOut,
 } from "lucide-react";
 import { MotionLink, MotionDiv, StaggerContainer } from "../../components/ui/motion";
 
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/settings", label: "Account", icon: KeyRound },
 ];
 
 const BOOK_NAV = [

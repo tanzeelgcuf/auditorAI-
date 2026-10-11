@@ -1,21 +1,24 @@
-use crate::ocr::{
-    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError,
-    ProcessDocumentRequest,
-};
 use std::sync::Arc;
 
 use async_nats::jetstream::Context as JetStream;
 use tonic::{Request, Response, Status};
 
+use crate::ocr::{
+    DetectedFormat, ExtractedEntity, FormatDetector, OcrBackend, OcrError, ProcessDocumentRequest,
+};
+
+// The generated proto code contains unwrap()s (prost/tonic emit them for
+// well-known-type handling); main.rs's #![deny(clippy::unwrap_used)] reaches
+// into includes, so the deny is lifted for exactly this block — the same
+// precedent as services/verification/src/grpc/mod.rs:11.
+#[allow(clippy::unwrap_used)]
 pub mod ingestion_service {
     tonic::include_proto!("ingestion");
 }
 
 use ingestion_service::{
-    ingestion_service_server::IngestionService,
-    BoundingBox as GrpcBoundingBox,
-    ExtractedEntity as GrpcExtractedEntity,
-    ProcessDocumentRequest as GrpcProcessRequest,
+    ingestion_service_server::IngestionService, BoundingBox as GrpcBoundingBox,
+    ExtractedEntity as GrpcExtractedEntity, ProcessDocumentRequest as GrpcProcessRequest,
     ProcessDocumentResponse as GrpcProcessResponse,
 };
 
@@ -33,8 +36,6 @@ fn is_image_or_pdf(path: &str) -> bool {
 
 fn ocr_error_to_status(e: OcrError) -> Status {
     match e {
-        OcrError::NotFound(msg) => Status::not_found(msg),
-        OcrError::UnsupportedFormat(msg) => Status::invalid_argument(msg),
         OcrError::ProcessingFailed(msg) => Status::internal(msg),
         OcrError::S3Error(msg) => Status::internal(format!("storage error: {msg}")),
         OcrError::SidecarError(msg) => Status::unavailable(format!("sidecar unavailable: {msg}")),
@@ -44,7 +45,6 @@ fn ocr_error_to_status(e: OcrError) -> Status {
 
 pub struct IngestionServiceImpl {
     ocr_backend: Arc<dyn OcrBackend>,
-    structured_backends: std::collections::HashMap<String, Arc<dyn OcrBackend>>,
     js: JetStream,
     s3_client: Arc<aws_sdk_s3::Client>,
     bucket: String,
@@ -55,64 +55,44 @@ impl IngestionServiceImpl {
         let s3_client = Arc::new(crate::ocr::structured::build_s3_client().await);
         let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "ai-auditor".to_string());
 
-        let mut structured = std::collections::HashMap::new();
-        structured.insert(
-            "csv".to_string(),
-            Arc::new(crate::ocr::structured::CsvParser::new(
-                std::collections::HashMap::new(),
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-        structured.insert(
-            "xlsx".to_string(),
-            Arc::new(crate::ocr::structured::XlsxParser::new(
-                std::collections::HashMap::new(),
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-        structured.insert(
-            "ofx".to_string(),
-            Arc::new(crate::ocr::structured::OfxParser::new(
-                s3_client.clone(),
-                bucket.clone(),
-            )) as Arc<dyn OcrBackend>,
-        );
-
+        // structured_backends was deleted 2026-09-17: never read —
+        // process_document constructs a PER-REQUEST parser so the book's
+        // column_map applies, so this prebuilt empty-map trio was dead weight
+        // built on every boot.
         Self {
             ocr_backend,
-            structured_backends: structured,
             js,
             s3_client,
             bucket,
         }
     }
 
-    fn backend_key(format: DetectedFormat) -> Option<&'static str> {
-        match format {
-            DetectedFormat::Csv => Some("csv"),
-            DetectedFormat::Xlsx => Some("xlsx"),
-            DetectedFormat::Ofx => Some("ofx"),
-            DetectedFormat::Ocr => None,
-        }
-    }
+    // backend_key was deleted 2026-09-17: zero call sites — process_document
+    // routes by constructing the per-request backend directly in its match
+    // arms, so this format->string map was a parallel taxonomy nothing read.
 
     fn convert_entity(e: &ExtractedEntity) -> GrpcExtractedEntity {
         GrpcExtractedEntity {
             entity_type: e.entity_type.clone(),
             amount_cents: e.amount_cents,
             currency: e.currency.clone(),
-            transaction_date: e.transaction_date.map(|d| d.to_string()).unwrap_or_default(),
+            transaction_date: e
+                .transaction_date
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
             counterparty: e.counterparty.clone().unwrap_or_default(),
             description: e.description.clone().unwrap_or_default(),
             gl_account_code: e.gl_account_code.clone().unwrap_or_default(),
             page_number: e.page_number,
-            bbox: Some(GrpcBoundingBox {
-                x: e.bbox.x as f64,
-                y: e.bbox.y as f64,
-                width: e.bbox.width as f64,
-                height: e.bbox.height as f64,
+            // None passes through as an absent message: a structured source
+            // has no geometry, and the API stores SQL NULL (the source_ip
+            // pattern) instead of a zero box asserting a region that doesn't
+            // exist.
+            bbox: e.bbox.map(|b| GrpcBoundingBox {
+                x: b.x as f64,
+                y: b.y as f64,
+                width: b.width as f64,
+                height: b.height as f64,
             }),
             confidence: e.confidence as f64,
             source_format: e.source_format.clone(),
@@ -165,17 +145,29 @@ impl IngestionService for IngestionServiceImpl {
         }
 
         // Route to backend. Structured formats use a per-request backend so the
-        // book's CSV column mapping (doc 08 §1) is applied; OCR uses the singleton.
+        // book's CSV column mapping is applied; OCR uses the singleton.
         let response = match format {
             DetectedFormat::Csv => {
                 let backend = crate::ocr::structured::CsvParser::new(
-                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                    process_req.column_map.clone(),
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
             DetectedFormat::Xlsx => {
                 let backend = crate::ocr::structured::XlsxParser::new(
-                    process_req.column_map.clone(), self.s3_client.clone(), self.bucket.clone());
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                    process_req.column_map.clone(),
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
             DetectedFormat::Ofx => {
                 // OFX is structured (STMTTRN blocks), NOT OCR. It was falling
@@ -183,12 +175,19 @@ impl IngestionService for IngestionServiceImpl {
                 // Not Found — the structured ofx parser was never routed to.
                 // Prompt B wiring-first catch.
                 let backend = crate::ocr::structured::OfxParser::new(
-                    self.s3_client.clone(), self.bucket.clone());
-                backend.process(&process_req).await.map_err(ocr_error_to_status)?
+                    self.s3_client.clone(),
+                    self.bucket.clone(),
+                );
+                backend
+                    .process(&process_req)
+                    .await
+                    .map_err(ocr_error_to_status)?
             }
-            _ => {
-                self.ocr_backend.process(&process_req).await.map_err(ocr_error_to_status)?
-            }
+            _ => self
+                .ocr_backend
+                .process(&process_req)
+                .await
+                .map_err(ocr_error_to_status)?,
         };
 
         let entities: Vec<GrpcExtractedEntity> =
@@ -201,7 +200,10 @@ impl IngestionService for IngestionServiceImpl {
             "entity_count": entities.len(),
             "status": "completed"
         });
-        let _ = self.js.publish("ingestion.completed", event.to_string().into()).await;
+        let _ = self
+            .js
+            .publish("ingestion.completed", event.to_string().into())
+            .await;
 
         Ok(Response::new(GrpcProcessResponse { entities }))
     }
@@ -225,12 +227,30 @@ mod tests {
 
     #[test]
     fn test_format_detection() {
-        assert_eq!(FormatDetector::from_extension("test.pdf"), DetectedFormat::Ocr);
-        assert_eq!(FormatDetector::from_extension("test.csv"), DetectedFormat::Csv);
-        assert_eq!(FormatDetector::from_extension("test.ofx"), DetectedFormat::Ofx);
-        assert_eq!(FormatDetector::from_extension("test.xlsx"), DetectedFormat::Xlsx);
-        assert_eq!(FormatDetector::from_extension("test.xls"), DetectedFormat::Xlsx);
-        assert_eq!(FormatDetector::from_extension("test.qfx"), DetectedFormat::Ofx);
+        assert_eq!(
+            FormatDetector::from_extension("test.pdf"),
+            DetectedFormat::Ocr
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.csv"),
+            DetectedFormat::Csv
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.ofx"),
+            DetectedFormat::Ofx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.xlsx"),
+            DetectedFormat::Xlsx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.xls"),
+            DetectedFormat::Xlsx
+        );
+        assert_eq!(
+            FormatDetector::from_extension("test.qfx"),
+            DetectedFormat::Ofx
+        );
     }
 
     #[test]
@@ -253,12 +273,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_error_to_status_not_found() {
-        let e = OcrError::NotFound("doc missing".into());
-        let s = ocr_error_to_status(e);
-        assert_eq!(s.code(), tonic::Code::NotFound);
-    }
+    // test_error_to_status_not_found was deleted 2026-09-17 with the variant
+    // it pinned: OcrError::NotFound was never constructed anywhere, so the
+    // test asserted a mapping nothing could ever exercise.
 
     #[test]
     fn test_error_to_status_sidecar() {

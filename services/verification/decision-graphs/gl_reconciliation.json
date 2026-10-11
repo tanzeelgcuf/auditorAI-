@@ -1,4 +1,5 @@
 {
+  "rule_id": "gl_reconciliation",
   "nodes": [
     {
       "id": "input",
@@ -11,12 +12,24 @@
       "name": "Tolerance Evaluation",
       "content": {
         "inputs": [
-          { "id": "variance_cents", "field": "variance_cents" },
-          { "id": "tolerance_cents", "field": "tolerance_cents" }
+          {
+            "id": "variance_cents",
+            "field": "variance_cents"
+          },
+          {
+            "id": "tolerance_cents",
+            "field": "tolerance_cents"
+          }
         ],
         "outputs": [
-          { "id": "severity", "field": "severity" },
-          { "id": "exceeds_tolerance", "field": "exceeds_tolerance" }
+          {
+            "id": "severity",
+            "field": "severity"
+          },
+          {
+            "id": "exceeds_tolerance",
+            "field": "exceeds_tolerance"
+          }
         ],
         "rules": [
           {
@@ -49,7 +62,15 @@
     }
   ],
   "edges": [
-    { "id": "e1", "sourceId": "input", "targetId": "variance-check" },
-    { "id": "e2", "sourceId": "variance-check", "targetId": "output" }
+    {
+      "id": "e1",
+      "sourceId": "input",
+      "targetId": "variance-check"
+    },
+    {
+      "id": "e2",
+      "sourceId": "variance-check",
+      "targetId": "output"
+    }
   ]
 }

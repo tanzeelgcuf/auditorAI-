@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedEntity {
-    pub entity_type: String,           // "invoice_line_item", "bank_transaction", "gl_entry"
+    pub entity_type: String, // "invoice_line_item", "bank_transaction", "gl_entry"
     pub amount_cents: i64,
     pub currency: String,
     pub transaction_date: Option<chrono::NaiveDate>,
@@ -19,14 +19,18 @@ pub struct ExtractedEntity {
     pub gl_account_code: Option<String>,
     pub transaction_ref: Option<String>, // source ref (e.g. GL "Num", OFX "FITID")
     pub page_number: i32,
-    pub bbox: BoundingBox,
-    pub confidence: f32,               // 0.0 - 1.0
-    pub source_format: String,         // "ocr" or "structured"
+    // None for structured sources (CSV/OFX/XLSX): there is no page geometry,
+    // and a zero box asserted a region that does not exist — an admission of
+    // "no geometry" beats a confident wrong value, the same reasoning as the
+    // source_ip NULL pattern (rule 13).
+    pub bbox: Option<BoundingBox>,
+    pub confidence: f32,       // 0.0 - 1.0
+    pub source_format: String, // "ocr" or "structured"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
-    pub x: f32,      // 0.0 - 1.0
+    pub x: f32, // 0.0 - 1.0
     pub y: f32,
     pub width: f32,
     pub height: f32,
@@ -36,7 +40,7 @@ pub struct BoundingBox {
 pub struct ProcessDocumentRequest {
     pub document_id: Uuid,
     pub storage_key: String,
-    pub doc_type: String,  // "invoice", "bank_statement", "gl_export"
+    pub doc_type: String, // "invoice", "bank_statement", "gl_export"
     pub client_book_id: Uuid,
     pub column_map: std::collections::HashMap<String, String>, // per-book CSV mapping
 }
@@ -48,10 +52,10 @@ pub struct ProcessDocumentResponse {
 
 #[derive(Debug, Error)]
 pub enum OcrError {
-    #[error("document not found: {0}")]
-    NotFound(String),
-    #[error("unsupported format: {0}")]
-    UnsupportedFormat(String),
+    // NotFound and UnsupportedFormat were deleted 2026-09-17: never
+    // constructed anywhere in the crate — the sidecar path reports
+    // ProcessingFailed, and unknown extensions route to OCR by design.
+    // Variants nothing can produce are dead enum arms.
     #[error("OCR processing failed: {0}")]
     ProcessingFailed(String),
     #[error("S3 error: {0}")]
@@ -64,8 +68,12 @@ pub enum OcrError {
 
 #[async_trait]
 pub trait OcrBackend: Send + Sync {
-    fn name(&self) -> &'static str;
-    async fn process(&self, request: &ProcessDocumentRequest) -> Result<ProcessDocumentResponse, OcrError>;
+    // The `name()` method was deleted 2026-09-17: zero callers crate-wide.
+    // An identifier with no consumer is a label nobody reads.
+    async fn process(
+        &self,
+        request: &ProcessDocumentRequest,
+    ) -> Result<ProcessDocumentResponse, OcrError>;
 }
 
 // ── Format detection ──
@@ -106,11 +114,9 @@ impl FormatDetector {
         DetectedFormat::Ocr
     }
 
-    pub fn detect(path: &str, content: &[u8]) -> DetectedFormat {
-        let ext = Self::from_extension(path);
-        if ext != DetectedFormat::Ocr {
-            return ext;
-        }
-        Self::from_content(content)
-    }
+    // detect() was deleted 2026-09-17: zero callers — process_document calls
+    // from_extension/from_content separately precisely BECAUSE it must skip
+    // content-sniffing for definitive OCR media types (is_image_or_pdf); this
+    // convenience wrapper would have sniffed a stray comma in a PDF binary
+    // into CSV had anything ever called it.
 }

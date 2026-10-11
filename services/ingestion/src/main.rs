@@ -1,16 +1,25 @@
 // services/ingestion/src/main.rs
 #![deny(clippy::unwrap_used)]
-
+// mod bbox was deleted 2026-09-17 along with src/bbox/: a parallel
+// BoundingBox implementation with zero references — the parsers use
+// ocr::BoundingBox — dead since the day it was written.
 mod grpc;
-mod preprocess;
 mod ocr;
-mod bbox;
+// Cargo.toml has always SAID the preprocessing stages are "compiled only
+// under the feature", but `mod preprocess;` was unconditional, so the no-op
+// placeholder pipeline compiled as dead code into every default build —
+// 8+ of the 21 warnings observed 2026-09-17. Gating the mod makes the
+// documented intent real: default builds contain no preprocessing code at
+// all. Remove the gate the day a real implementation is wired into the OCR
+// path.
+#[cfg(feature = "enhance")]
+mod preprocess;
 mod telemetry;
-
+use clap::Parser;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
-use clap::Parser;
 
 use crate::grpc::ingestion_service::ingestion_service_server::IngestionServiceServer;
 use crate::grpc::IngestionServiceImpl;
@@ -22,7 +31,11 @@ struct Args {
     #[arg(long, env = "GRPC_ADDR", default_value = "[::]:50051")]
     grpc_addr: String,
 
-    #[arg(long, env = "OCR_SIDECAR_URL", default_value = "http://ocr-sidecar:8000")]
+    #[arg(
+        long,
+        env = "OCR_SIDECAR_URL",
+        default_value = "http://ocr-sidecar:8000"
+    )]
     ocr_sidecar_url: String,
 
     #[arg(long, env = "NATS_URL", default_value = "nats://nats:4222")]
@@ -44,10 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting ingestion service on {}", args.grpc_addr);
 
-    // Initialize OCR backend (docTR sidecar)
-    let ocr_backend: Arc<dyn OcrBackend> = Arc::new(
-        crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url).await?
-    );
+    // Initialize OCR backend (docTR sidecar). new() is sync since 2026-09-17 —
+    // its only await went away with the dead S3 fields.
+    let ocr_backend: Arc<dyn OcrBackend> =
+        Arc::new(crate::ocr::DoctrBackend::new(&args.ocr_sidecar_url)?);
 
     // Initialize NATS connection (async-nats, the maintained successor client)
     let nc = async_nats::connect(&args.nats_url).await?;
@@ -57,7 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svc = IngestionServiceImpl::new(ocr_backend, js).await;
 
     // Start gRPC server
-    let addr = args.grpc_addr.parse()?;
+    // SocketAddr::from_str rejects "localhost:50051" with AddrParseError(Socket)
+    // — observed live 2026-09-22 on both Rust services: a natural env value,
+    // and the same value the API's Go side resolves without complaint. Parse
+    // via ToSocketAddrs instead, which resolves the hostname; the first
+    // resolved address is taken, and an unresolvable value still fails loudly.
+    let addr = args
+        .grpc_addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or("GRPC_ADDR resolved to no addresses")?;
     Server::builder()
         .add_service(IngestionServiceServer::new(svc))
         .serve(addr)

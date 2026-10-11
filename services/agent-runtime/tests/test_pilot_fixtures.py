@@ -1,7 +1,7 @@
 # services/agent-runtime/tests/test_pilot_fixtures.py
 # Pilot validation harness — runs the synthetic fixtures from
 # services/ingestion/test_fixtures/ through the real cross-linking algorithm
-# (doc 06 §8). Offline: no LLM, no network, no DB.
+# Offline: no LLM, no network, no DB.
 
 import csv
 import os

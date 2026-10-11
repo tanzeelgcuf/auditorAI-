@@ -33,6 +33,34 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// primed returns the RLS-primed request connection, or false after logging and
+// writing a 500.
+//
+// No Acquire() fallback: reviewSvc.SetDB(pool) at main.go:219 is the
+// RLS-ENFORCED app pool, so the connection Acquire() returned had no
+// app.current_firm set, and reconciliation_groups /
+// reconciliation_group_members / extracted_entities all carry policies that cast
+// current_setting(...) to uuid with no missing_ok — the statement raises rather
+// than filtering.
+//
+// The pool field stays, unlike mcp.go's: RecordAccess (review.go:167) and the
+// middleware.DB call at :189 both still need it.
+//
+// OBSERVED: unreachable today. All four review routes (main.go:436-439) are in
+// the group that does r.Use(middleware.RLSInjector(pool)), so GetConn is
+// non-nil. REASONED from the route table; not executed.
+func (s *Service) primed(w http.ResponseWriter, r *http.Request) (middleware.Querier, bool) {
+	if c := middleware.GetConn(r.Context()); c != nil {
+		return c, true
+	}
+	slog.Error("review: no RLS-primed connection; route is mounted outside the "+
+		"RLSInjector group and every statement here would raise",
+		"path", r.URL.Path, "method", r.Method)
+	writeProblem(w, http.StatusInternalServerError,
+		"https://ai-auditor.dev/errors/internal", "no db conn")
+	return nil, false
+}
+
 func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	bookID := r.PathValue("bookId")
 	if bookID == "" || !contains(middleware.GetAssignedBooks(r.Context()), bookID) {
@@ -45,15 +73,9 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 		status = "needs_review"
 	}
 
-	c := middleware.GetConn(r.Context())
-	if c == nil {
-		c2, err := s.db.Acquire(r.Context())
-		if err != nil {
-			writeProblem(w, http.StatusInternalServerError, "https://ai-auditor.dev/errors/internal", "no db conn")
-			return
-		}
-		defer c2.Release()
-		c = c2
+	c, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	rows, err := c.Query(r.Context(),

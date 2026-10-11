@@ -1,6 +1,6 @@
 package webhooks
 
-// Webhook delivery engine (doc 07 §7) — delivers finding.created and
+// Webhook delivery engine — delivers finding.created and
 // report.generated events to firm-subscribed endpoints with HMAC-SHA256
 // signatures, retry with backoff, and auto-disable after repeated failures.
 
@@ -30,13 +30,13 @@ func (s *Service) SetDB(db *pgxpool.Pool) { s.db = db }
 
 // Subscription mirrors a row of webhook_subscriptions (fields needed for delivery).
 type Subscription struct {
-	ID                 string
-	FirmID             string
-	TargetURL          string
-	EventTypes         []string
-	SigningSecret      string
+	ID                  string
+	FirmID              string
+	TargetURL           string
+	EventTypes          []string
+	SigningSecret       string
 	ConsecutiveFailures int
-	Enabled            bool
+	Enabled             bool
 }
 
 // NotifyFindingCreated delivers the finding.created event to matching subscriptions.

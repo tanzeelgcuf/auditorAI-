@@ -1,6 +1,6 @@
 package humanoverride
 
-// Doc 11 (Round 5) — human override capability. When the automation gets it
+// Human override capability. When the automation gets it
 // wrong, a reviewer can: create an entity manually, split/merge a group, and
 // tag entities. Config mutations get audited. All history preserved (no deletes).
 
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -315,7 +316,7 @@ func (s *Service) HandleMergeGroups(w http.ResponseWriter, r *http.Request) {
 // current_setting('app.assigned_books') with no missing_ok, and this codebase
 // sets no database-level or role-level default for that GUC — so on an unprimed
 // pool connection the predicate raises on the unset parameter, and on a recycled
-// one that has been RESET it evaluates against '' and the INSERT violates the
+// one that has been RESET it evaluates against ” and the INSERT violates the
 // policy. Either way the statement errors, the error degrades to slog.Warn, and
 // GET /v1/books/{bookId}/config-history returns an empty list forever. The only
 // call site (tenant.go:318, inside HandleUpdateBookSettings) runs under
@@ -342,9 +343,37 @@ func LogConfigChange(ctx context.Context, db *pgxpool.Pool, bookID, userID, fiel
 	}
 }
 
+// strVal renders an audited value for config_change_log's TEXT columns, or nil
+// for "absent" — which the INSERT turns into SQL NULL.
+//
+// The reflect hop is load-bearing, not defensive decoration. `v == nil` is true
+// only for an UNTYPED nil. A nil `*string` arriving through an `interface{}`
+// parameter carries a type descriptor, so it is not equal to nil by that test,
+// and it used to fall through to the default branch where fmt.Sprint formatted
+// it as the literal text "<nil>" — an audit row asserting a change to "<nil>".
+// A NON-nil pointer was worse: no case in the switch matches `*string`, so
+// fmt.Sprint printed the pointer and the row recorded a hex address like
+// "0xc000123456" instead of the value. tenant.go's five call sites passed
+// exactly these, which is how the config audit trail came to invent four
+// changes per real change and mis-record the real one.
+//
+// The call site is now generic and dereferences before calling (see
+// tenant.auditConfigChange), so this hop is the second half of that fix rather
+// than the whole of it: this function is the only thing between an audited value
+// and the column, every caller reaches it through an `interface{}` parameter,
+// and the next one will not remember the trap. Both halves, per CLAUDE.md — a
+// fix only at the call site lets the class back in through a new caller.
 func strVal(v interface{}) *string {
 	if v == nil {
 		return nil
+	}
+	// Unwrap one pointer level: a nil pointer means "absent", a non-nil one means
+	// "audit what it points at" — never the address it happens to live at.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		v = rv.Elem().Interface()
 	}
 	var s string
 	switch t := v.(type) {
@@ -397,10 +426,12 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// source_ip is cast to text in SQL, matching the changed_by::text idiom on the
-	// line below rather than introducing a pgx inet codec question, and COALESCEd
-	// so the Scan target stays a plain string: rows written before 2026-09-05, and
-	// any row whose request never passed middleware.SourceIP, hold NULL.
+	// source_ip is read with host() — observed live 2026-09-16 (postgres:16),
+	// '203.0.113.9'::inet::text renders "203.0.113.9/32", so ::text would hand
+	// every client a CIDR-shaped address for what is a host address; host()
+	// extracts the bare address on inet and cidr alike. COALESCE keeps the Scan
+	// target a plain string: rows written before 2026-09-05, and any row whose
+	// request never passed middleware.SourceIP, hold NULL.
 	//
 	// Column order here is load-bearing. rows.Scan binds BY POSITION and the loop
 	// below `continue`s on a Scan error, so appending a column to the SELECT
@@ -409,7 +440,7 @@ func (s *Service) HandleConfigHistory(w http.ResponseWriter, r *http.Request) {
 	// lists against each other.
 	rows, err := c.Query(r.Context(),
 		`SELECT field_name, COALESCE(old_value,''), COALESCE(new_value,''), changed_by::text, changed_at,
-		        COALESCE(source_ip::text,'')
+		        COALESCE(host(source_ip),'')
 		 FROM config_change_log WHERE client_book_id = $1 ORDER BY changed_at DESC LIMIT 100`, bookID)
 	if err != nil {
 		slog.Error("config history query failed", "error", err)

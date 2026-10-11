@@ -1,4 +1,4 @@
-// InternalAuth tests — internal key auth for MCP tools (doc 05 §3).
+// InternalAuth tests — internal key auth for MCP tools.
 package middleware
 
 import (
@@ -15,8 +15,9 @@ func TestInternalAuthRequiresKeyHeader(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	// nil pool is fine — the missing-header path rejects before any DB use.
-	h := InternalAuth(nil)(next)
+	// nil pools are fine — every case below (missing header, wrong key, unset
+	// key) rejects above the body/book-resolution code that reads the pool.
+	h := InternalAuth(nil, nil)(next)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/mcp/tools/x", nil)
 	h.ServeHTTP(rec, req)
@@ -30,7 +31,7 @@ func TestInternalAuthRejectsWrongKey(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := InternalAuth(nil)(next)
+	h := InternalAuth(nil, nil)(next)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/mcp/tools/x", nil)
 	req.Header.Set("X-Internal-Key", "wrong")
@@ -45,7 +46,7 @@ func TestInternalAuthDisabledWhenNoKeyConfigured(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := InternalAuth(nil)(next)
+	h := InternalAuth(nil, nil)(next)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/mcp/tools/x", nil)
 	req.Header.Set("X-Internal-Key", "anything")

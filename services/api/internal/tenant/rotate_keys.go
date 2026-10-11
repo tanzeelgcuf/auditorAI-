@@ -11,7 +11,7 @@ import (
 // HandleRotateKeys (POST /v1/admin/rotate-keys, firm_admin) rotates the firm's
 // data encryption key: a new key reference is activated and prior active keys
 // are moved to 'rotating' so ciphertext can be re-encrypted before retirement
-// (doc 05 §5). The key_ref is a storage reference (KMS id / envelope key path);
+// The key_ref is a storage reference (KMS id / envelope key path);
 // the key material itself never passes through the API.
 func (s *Service) HandleRotateKeys(w http.ResponseWriter, r *http.Request) {
 	firmID := middleware.GetFirmID(r.Context())
@@ -20,17 +20,13 @@ func (s *Service) HandleRotateKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := middleware.GetConn(r.Context())
-	db := conn
-	if db == nil {
-		c, err := s.db.Acquire(r.Context())
-		if err != nil {
-			slog.Error("failed to acquire connection", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		defer c.Release()
-		db = c
+	// s.primed, not GetConn-or-Acquire: data_encryption_keys carries RLS
+	// (init.sql:721-723) and dek_firm_isolation casts current_setting to uuid, so a
+	// connection this process never primed raises rather than filtering. See the
+	// comment on Service.primed in tenant.go for the observed reachability.
+	db, ok := s.primed(w, r)
+	if !ok {
+		return
 	}
 
 	keyID := uuid.NewString()
